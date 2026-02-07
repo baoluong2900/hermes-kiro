@@ -126,6 +126,9 @@ type AccountInfo struct {
 	TrialExpiresAt    int64
 }
 
+// Version 当前版本号
+const Version = "1.0.0"
+
 var (
 	cfg     *Config
 	cfgLock sync.RWMutex

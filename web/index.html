@@ -834,6 +834,7 @@
                     <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
                 </div>
                 <span class="badge badge-success" id="statusBadge" data-i18n="status.running"></span>
+                <span class="badge badge-info" id="versionBadge" style="cursor:pointer" onclick="checkUpdate(true)"></span>
             </div>
         </div>
         <div class="stats-grid">
@@ -871,7 +872,7 @@
             <div class="card">
                 <div class="card-header">
                     <span class="card-title" data-i18n="accounts.title"></span>
-                    <div class="card-actions"><button class="btn btn-primary btn-sm" onclick="showModal('add')"
+                    <div class="card-actions"><button class="btn btn-secondary btn-sm" onclick="showExportModal()" data-i18n="accounts.export"></button><button class="btn btn-primary btn-sm" onclick="showModal('add')"
                             data-i18n="accounts.add"></button></div>
                 </div>
                 <div id="accountsList"></div>
@@ -887,8 +888,8 @@
                         <span data-i18n="settings.enableApiKey"></span>
                     </label>
                 </div>
-                <div class="form-group"><label>API Key</label><input type="text" id="apiKeyInput"
-                        data-i18n-placeholder="settings.apiKeyPlaceholder"></div>
+                <div class="form-group"><label>API Key</label><div style="display:flex;gap:8px;align-items:stretch"><input type="text" id="apiKeyInput" style="flex:1"
+                        data-i18n-placeholder="settings.apiKeyPlaceholder"><button class="btn btn-sm btn-secondary" onclick="generateApiKey()" data-i18n="settings.generateApiKey"></button></div></div>
                 <button class="btn btn-primary" onclick="saveSettings()" data-i18n="common.save"></button>
             </div>
             <div class="card">
@@ -973,6 +974,20 @@
             <div id="detailBody"></div>
         </div>
     </div>
+    <div id="exportModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><span class="modal-title" data-i18n="export.title"></span><button
+                    class="modal-close" onclick="closeExportModal()">&times;</button></div>
+            <div id="exportBody"></div>
+        </div>
+    </div>
+    <div id="updateModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><span class="modal-title" data-i18n="update.title"></span><button
+                    class="modal-close" onclick="closeUpdateModal()">&times;</button></div>
+            <div id="updateBody"></div>
+        </div>
+    </div>
     <script>
         const i18n = {
             zh: {
@@ -1021,6 +1036,7 @@
                 'settings.apiSettings': 'API 设置',
                 'settings.enableApiKey': '启用 API Key 验证',
                 'settings.apiKeyPlaceholder': '留空则不验证',
+                'settings.generateApiKey': '随机生成',
                 'settings.thinkingSettings': 'Thinking 模式设置',
                 'settings.thinkingSuffix': '触发后缀',
                 'settings.thinkingSuffixHint': '模型名称加此后缀即启用思考模式，如 claude-sonnet-4.5-thinking',
@@ -1129,7 +1145,7 @@
                 'credentials.social': 'Social (AWS Builder ID / Google / GitHub)',
                 'credentials.idc': 'IAM Identity Center (企业 SSO)',
                 'credentials.jsonError': 'JSON 格式错误',
-                'credentials.batchHint': '支持单个对象或 JSON 数组格式批量导入。必填: refreshToken。可选: provider (BuilderId/Enterprise/Github/Google), clientId, clientSecret',
+                'credentials.batchHint': '支持单个对象、JSON 数组或 Kiro Account Manager 导出格式批量导入。必填: refreshToken。可选: provider (BuilderId/Enterprise/Github/Google), clientId, clientSecret',
                 'common.save': '保存设置',
                 'common.saved': '保存',
                 'common.copy': '复制',
@@ -1138,7 +1154,25 @@
                 'common.back': '返回',
                 'common.add': '添加',
                 'common.failed': '失败',
-                'common.saveFailed': '保存失败'
+                'common.saveFailed': '保存失败',
+                'accounts.export': '导出',
+                'export.title': '导出账号',
+                'export.selectAll': '全选',
+                'export.deselectAll': '取消全选',
+                'export.selected': '已选 {0} 个',
+                'export.downloadJson': '下载 JSON',
+                'export.showJson': '显示 JSON',
+                'export.copyJson': '复制 JSON',
+                'export.copied': '已复制到剪贴板',
+                'export.noSelection': '请至少选择一个账号',
+                'update.title': '版本更新',
+                'update.current': '当前版本',
+                'update.latest': '最新版本',
+                'update.newVersion': '发现新版本',
+                'update.upToDate': '已是最新版本',
+                'update.checkFailed': '检查更新失败',
+                'update.goDownload': '前往下载',
+                'update.changelog': '更新内容'
             },
             en: {
                 'login.subtitle': 'Enter admin password to login',
@@ -1180,6 +1214,7 @@
                 'settings.apiSettings': 'API Settings',
                 'settings.enableApiKey': 'Enable API Key Verification',
                 'settings.apiKeyPlaceholder': 'Leave empty to disable',
+                'settings.generateApiKey': 'Generate',
                 'settings.thinkingSettings': 'Thinking Mode Settings',
                 'settings.thinkingSuffix': 'Trigger Suffix',
                 'settings.thinkingSuffixHint': 'Add this suffix to model name to enable thinking mode, e.g. claude-sonnet-4.5-thinking',
@@ -1284,7 +1319,7 @@
                 'credentials.social': 'Social (AWS Builder ID / Google / GitHub)',
                 'credentials.idc': 'IAM Identity Center (Enterprise SSO)',
                 'credentials.jsonError': 'Invalid JSON format',
-                'credentials.batchHint': 'Supports single object or JSON array for batch import. Required: refreshToken. Optional: provider (BuilderId/Enterprise/Github/Google), clientId, clientSecret',
+                'credentials.batchHint': 'Supports single object, JSON array, or Kiro Account Manager export format. Required: refreshToken. Optional: provider (BuilderId/Enterprise/Github/Google), clientId, clientSecret',
                 'common.save': 'Save Settings',
                 'common.saved': 'Saved',
                 'common.copy': 'Copy',
@@ -1293,7 +1328,25 @@
                 'common.back': 'Back',
                 'common.add': 'Add',
                 'common.failed': 'Failed',
-                'common.saveFailed': 'Save failed'
+                'common.saveFailed': 'Save failed',
+                'accounts.export': 'Export',
+                'export.title': 'Export Accounts',
+                'export.selectAll': 'Select All',
+                'export.deselectAll': 'Deselect All',
+                'export.selected': '{0} selected',
+                'export.downloadJson': 'Download JSON',
+                'export.showJson': 'Show JSON',
+                'export.copyJson': 'Copy JSON',
+                'export.copied': 'Copied to clipboard',
+                'export.noSelection': 'Please select at least one account',
+                'update.title': 'Version Update',
+                'update.current': 'Current',
+                'update.latest': 'Latest',
+                'update.newVersion': 'New version available',
+                'update.upToDate': 'Up to date',
+                'update.checkFailed': 'Update check failed',
+                'update.goDownload': 'Download',
+                'update.changelog': 'Changelog'
             }
         };
         let currentLang = localStorage.getItem('kiro_lang') || 'zh';
@@ -1361,10 +1414,12 @@
             document.getElementById('mainPage').classList.remove('hidden');
         }
         async function loadData() {
-            await Promise.all([loadStats(), loadAccounts(), loadSettings()]);
+            await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
             document.getElementById('claudeEndpoint').textContent = baseUrl + '/v1/messages';
             document.getElementById('openaiEndpoint').textContent = baseUrl + '/v1/chat/completions';
             document.getElementById('modelsEndpoint').textContent = baseUrl + '/v1/models';
+            // 自动检查更新
+            setTimeout(() => checkUpdate(false), 2000);
         }
         async function loadStats() {
             const res = await fetch('/admin/api/status', { headers: { 'X-Admin-Password': password } });
@@ -1596,12 +1651,23 @@
             const d = await res.json();
             if (d.success) { alert(t('settings.endpointSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
+        function generateApiKey() {
+            const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+            let key = 'sk-';
+            for (let i = 0; i < 32; i++) key += chars.charAt(Math.floor(Math.random() * chars.length));
+            document.getElementById('apiKeyInput').value = key;
+        }
         async function saveSettings() {
+            const requireApiKey = document.getElementById('requireApiKey').checked;
+            const apiKeyInput = document.getElementById('apiKeyInput');
+            if (requireApiKey && !apiKeyInput.value.trim()) {
+                generateApiKey();
+            }
             await fetch('/admin/api/settings', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ requireApiKey: document.getElementById('requireApiKey').checked, apiKey: document.getElementById('apiKeyInput').value })
+                body: JSON.stringify({ requireApiKey, apiKey: apiKeyInput.value })
             });
-            alert(t('common.saved'));
+            alert(t('detail.saved'));
         }
         async function changePassword() {
             const newPwd = document.getElementById('newPassword').value;
@@ -1746,30 +1812,59 @@
             const payload = { refreshToken: tokenData.refreshToken, accessToken: tokenData.accessToken || '', clientId: clientData?.clientId || '', clientSecret: clientData?.clientSecret || '', authMethod: authMethod, provider: provider };
             const res = await fetch('/admin/api/auth/credentials', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify(payload) });
             const d = await res.json();
-            if (d.success) { closeModal(); loadAccounts(); loadStats(); alert(t('local.importSuccess') + ': ' + (d.account?.email || d.account?.id)); }
+            if (d.success) { closeModal(); loadAccounts(); loadStats(); alert(t('local.importSuccess') + ': ' + (d.account?.email || d.account?.id)); autoRefreshNewAccount(d.account?.id); }
             else alert(t('common.failed') + ': ' + d.error);
         }
         async function importCredentials() {
             try {
                 const json = JSON.parse(document.getElementById('credJson').value.trim());
-                const items = Array.isArray(json) ? json : [json];
-                let success = 0, failed = 0, errors = [];
+                // 兼容 Kiro Account Manager 导出格式 {version, accounts: [...]}
+                let items;
+                if (json.accounts && Array.isArray(json.accounts)) {
+                    // AccountExportData 格式，从 accounts[].credentials 提取
+                    items = json.accounts.map(a => {
+                        const c = a.credentials || {};
+                        return {
+                            refreshToken: c.refreshToken || a.refreshToken,
+                            clientId: c.clientId || a.clientId,
+                            clientSecret: c.clientSecret || a.clientSecret,
+                            region: c.region || a.region,
+                            // 不传 accessToken，强制后端用 refreshToken 刷新获取新 token
+                            authMethod: c.authMethod || a.authMethod,
+                            provider: c.provider || a.provider || a.idp
+                        };
+                    });
+                } else {
+                    items = Array.isArray(json) ? json : [json];
+                }
+                let success = 0, failed = 0, errors = [], newIds = [];
                 for (const item of items) {
                     if (!item.refreshToken) { failed++; errors.push('missing refreshToken'); continue; }
-                    // 根据是否包含 clientId/clientSecret 判断认证方式
-                    const hasClientCredentials = !!(item.clientId && item.clientSecret);
-                    const authMethod = hasClientCredentials ? 'idc' : 'social';
-                    const payload = { refreshToken: item.refreshToken, clientId: item.clientId || '', clientSecret: item.clientSecret || '', authMethod: authMethod, provider: item.provider || 'BuilderId' };
+                    // 映射 authMethod: IdC/idc -> idc, social -> social
+                    let authMethod = item.authMethod || '';
+                    if (item.clientId && item.clientSecret) {
+                        authMethod = 'idc';
+                    } else if (!authMethod || authMethod === 'social') {
+                        authMethod = 'social';
+                    } else {
+                        authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
+                    }
+                    // 映射 provider
+                    let provider = item.provider || '';
+                    if (!provider && authMethod === 'social') provider = 'Google';
+                    if (!provider && authMethod === 'idc') provider = 'BuilderId';
+                    const payload = { refreshToken: item.refreshToken, accessToken: item.accessToken || '', clientId: item.clientId || '', clientSecret: item.clientSecret || '', authMethod: authMethod, provider: provider, region: item.region || 'us-east-1' };
                     try {
                         const res = await fetch('/admin/api/auth/credentials', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify(payload) });
                         const d = await res.json();
-                        if (d.success) success++; else { failed++; errors.push(d.error || 'unknown'); }
+                        if (d.success) { success++; if (d.account?.id) newIds.push(d.account.id); } else { failed++; errors.push(d.error || 'unknown'); }
                     } catch { failed++; errors.push('request failed'); }
                 }
                 closeModal(); loadAccounts(); loadStats();
                 let msg = t('sso.importSuccess', success);
                 if (failed > 0) msg += t('sso.importPartial', failed);
                 alert(msg);
+                newIds.forEach(id => autoRefreshNewAccount(id));
             } catch (e) { alert(t('credentials.jsonError')); }
         }
         async function importSsoToken() {
@@ -1782,6 +1877,7 @@
                 let msg = t('sso.importSuccess', count);
                 if (errCount > 0) msg += t('sso.importPartial', errCount);
                 alert(msg);
+                if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
             } else alert(t('common.failed') + ': ' + d.error);
         }
         let builderIdSession = '';
@@ -1806,6 +1902,7 @@
                 if (d.completed) {
                     closeModal(); loadAccounts(); loadStats();
                     alert(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+                    autoRefreshNewAccount(d.account?.id);
                 } else if (d.success && !d.completed) {
                     document.getElementById('builderIdStatus').textContent = t('builderid.waiting');
                     pollBuilderIdAuth(d.interval || interval);
@@ -1825,7 +1922,7 @@
             if (iamSession) {
                 const res = await fetch('/admin/api/auth/iam-sso/complete', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify({ sessionId: iamSession, callbackUrl: document.getElementById('iamCallback').value }) });
                 const d = await res.json();
-                if (d.success) { closeModal(); loadAccounts(); loadStats(); alert(t('builderid.success') + ': ' + (d.account?.email || d.account?.id)); }
+                if (d.success) { closeModal(); loadAccounts(); loadStats(); alert(t('builderid.success') + ': ' + (d.account?.email || d.account?.id)); autoRefreshNewAccount(d.account?.id); }
                 else alert(t('common.failed') + ': ' + d.error);
             } else {
                 const res = await fetch('/admin/api/auth/iam-sso/start', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify({ startUrl: document.getElementById('iamStartUrl').value, region: document.getElementById('iamRegion').value }) });
@@ -1839,6 +1936,167 @@
             }
         }
         setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
+
+        // ==================== 版本检查 ====================
+        let currentVersion = '';
+        async function loadVersion() {
+            try {
+                const res = await fetch('/admin/api/version', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                currentVersion = d.version || '';
+                document.getElementById('versionBadge').textContent = 'v' + currentVersion;
+            } catch (e) { }
+        }
+
+        async function checkUpdate(manual) {
+            try {
+                const res = await fetch('https://raw.githubusercontent.com/Quorinex/Kiro-Go/main/version.json?t=' + Date.now());
+                if (!res.ok) throw new Error('Fetch failed');
+                const d = await res.json();
+                const latestVersion = (d.version || '').replace(/^v/, '');
+                if (latestVersion && latestVersion !== currentVersion && compareVersions(latestVersion, currentVersion) > 0) {
+                    showUpdateModal(latestVersion, d.download || 'https://github.com/Quorinex/Kiro-Go', d.changelog || '');
+                } else if (manual) {
+                    alert(t('update.upToDate') + ' (v' + currentVersion + ')');
+                }
+            } catch (e) {
+                if (manual) alert(t('update.checkFailed'));
+            }
+        }
+
+        function compareVersions(a, b) {
+            const pa = a.split('.').map(Number);
+            const pb = b.split('.').map(Number);
+            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                const na = pa[i] || 0, nb = pb[i] || 0;
+                if (na > nb) return 1;
+                if (na < nb) return -1;
+            }
+            return 0;
+        }
+
+        function showUpdateModal(version, url, changelog) {
+            const body = document.getElementById('updateBody');
+            body.innerHTML =
+                '<div style="text-align:center;margin-bottom:20px">' +
+                '<div style="font-size:48px;margin-bottom:12px">🎉</div>' +
+                '<p style="font-size:16px;font-weight:600;color:#7c3aed">' + t('update.newVersion') + '</p>' +
+                '</div>' +
+                '<div class="detail-grid" style="margin-bottom:16px">' +
+                '<div class="detail-item"><div class="detail-label">' + t('update.current') + '</div><div class="detail-value">v' + currentVersion + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('update.latest') + '</div><div class="detail-value" style="color:#16a34a">v' + version + '</div></div>' +
+                '</div>' +
+                (changelog ? '<div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;margin-bottom:8px">' + t('update.changelog') + '</div><div style="background:#f8fafc;padding:12px;border-radius:8px;font-size:12px;max-height:200px;overflow-y:auto;white-space:pre-wrap;line-height:1.6">' + escapeHtml(changelog) + '</div></div>' : '') +
+                '<div style="text-align:center"><a href="' + url + '" target="_blank" class="btn btn-primary" style="text-decoration:none;display:inline-block">' + t('update.goDownload') + '</a></div>';
+            document.getElementById('updateModal').classList.add('active');
+        }
+
+        function closeUpdateModal() { document.getElementById('updateModal').classList.remove('active'); }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // ==================== 导出功能 ====================
+        let exportSelectedIds = new Set();
+
+        function showExportModal() {
+            if (accountsData.length === 0) { alert(t('accounts.empty')); return; }
+            exportSelectedIds = new Set(accountsData.map(a => a.id));
+            renderExportModal();
+            document.getElementById('exportModal').classList.add('active');
+        }
+
+        function closeExportModal() { document.getElementById('exportModal').classList.remove('active'); }
+
+        function renderExportModal() {
+            const body = document.getElementById('exportBody');
+            const allSelected = exportSelectedIds.size === accountsData.length;
+            body.innerHTML =
+                '<div style="margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">' +
+                '<span style="font-size:13px;color:#64748b">' + t('export.selected', exportSelectedIds.size) + '</span>' +
+                '<button class="btn btn-sm btn-secondary" onclick="toggleExportSelectAll()">' + (allSelected ? t('export.deselectAll') : t('export.selectAll')) + '</button>' +
+                '</div>' +
+                '<div style="max-height:300px;overflow-y:auto;margin-bottom:16px">' +
+                accountsData.map(a => {
+                    const checked = exportSelectedIds.has(a.id) ? 'checked' : '';
+                    return '<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;cursor:pointer;margin-bottom:4px;background:' + (exportSelectedIds.has(a.id) ? '#f0f4ff' : '#f8fafc') + '">' +
+                        '<input type="checkbox" ' + checked + ' onchange="toggleExportAccount(\'' + a.id + '\')" style="width:16px;height:16px">' +
+                        '<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (a.email || a.id.substring(0, 12) + '...') + '</div>' +
+                        '<div style="font-size:11px;color:#64748b">' + formatAuthMethod(a.provider || a.authMethod) + ' · ' + (a.subscriptionType || 'FREE') + '</div></div>' +
+                        '</label>';
+                }).join('') +
+                '</div>' +
+                '<div id="exportJsonPreview" class="hidden" style="margin-bottom:12px"><textarea id="exportJsonText" readonly style="width:100%;min-height:150px;max-height:300px;font-family:monospace;font-size:11px;background:#f8fafc;resize:vertical"></textarea></div>' +
+                '<div class="modal-footer" style="flex-wrap:wrap">' +
+                '<button class="btn btn-secondary" onclick="closeExportModal()">' + t('common.cancel') + '</button>' +
+                '<button class="btn btn-secondary" onclick="exportShowJson()">' + t('export.showJson') + '</button>' +
+                '<button class="btn btn-secondary" onclick="exportCopyJson()">' + t('export.copyJson') + '</button>' +
+                '<button class="btn btn-primary" onclick="exportDownloadJson()">' + t('export.downloadJson') + '</button>' +
+                '</div>';
+        }
+
+        function toggleExportAccount(id) {
+            if (exportSelectedIds.has(id)) exportSelectedIds.delete(id);
+            else exportSelectedIds.add(id);
+            renderExportModal();
+        }
+
+        function toggleExportSelectAll() {
+            if (exportSelectedIds.size === accountsData.length) exportSelectedIds.clear();
+            else exportSelectedIds = new Set(accountsData.map(a => a.id));
+            renderExportModal();
+        }
+
+        async function getExportData() {
+            if (exportSelectedIds.size === 0) { alert(t('export.noSelection')); return null; }
+            const res = await fetch('/admin/api/export', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ ids: Array.from(exportSelectedIds) })
+            });
+            return await res.json();
+        }
+
+        async function exportShowJson() {
+            const data = await getExportData();
+            if (!data) return;
+            const preview = document.getElementById('exportJsonPreview');
+            const textarea = document.getElementById('exportJsonText');
+            preview.classList.remove('hidden');
+            textarea.value = JSON.stringify(data, null, 2);
+        }
+
+        async function exportCopyJson() {
+            const data = await getExportData();
+            if (!data) return;
+            await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+            alert(t('export.copied'));
+        }
+
+        async function exportDownloadJson() {
+            const data = await getExportData();
+            if (!data) return;
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'kiro-accounts-' + new Date().toISOString().slice(0, 10) + '.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // ==================== 添加账号后自动刷新 ====================
+        async function autoRefreshNewAccount(accountId) {
+            try {
+                await fetch('/admin/api/accounts/' + accountId + '/refresh', {
+                    method: 'POST', headers: { 'X-Admin-Password': password }
+                });
+            } catch (e) { }
+            loadAccounts();
+        }
     </script>
 </body>
 

@@ -18,6 +18,10 @@
 - 🎛️ **Web 管理面板** - 便捷的账号管理
 - 🔑 **多种认证方式** - AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
 - 📊 **用量追踪** - 监控请求数、Token、Credits
+- 📦 **账号导入导出** - 兼容 Kiro Account Manager 格式
+- 🔄 **动态模型列表** - 自动从 Kiro API 同步并缓存
+- 🔔 **版本更新检测** - 自动提醒新版本
+- 🌐 **中英双语** - 管理面板支持中文 / 英文
 
 ## 快速开始
 
@@ -215,6 +219,7 @@ curl http://localhost:8080/v1/messages \
 ```
 Kiro-Go/
 ├── main.go              # 入口
+├── version.json         # 版本信息（用于更新检测）
 ├── config/              # 配置管理
 ├── pool/                # 账号池 & 负载均衡
 ├── proxy/               # API 处理 & Kiro 客户端

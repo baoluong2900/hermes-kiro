@@ -18,6 +18,10 @@ Convert Kiro accounts to OpenAI / Anthropic compatible API service.
 - 🎛️ **Web Admin Panel** - Easy account management
 - 🔑 **Multiple Auth Methods** - AWS Builder ID, IAM Identity Center (Enterprise SSO), SSO Token, Local Cache, Credentials
 - 📊 **Usage Tracking** - Monitor requests, tokens, and credits
+- 📦 **Account Export/Import** - Compatible with Kiro Account Manager format
+- 🔄 **Dynamic Model List** - Auto-synced from Kiro API with caching
+- 🔔 **Version Update Check** - Automatic new version notification
+- 🌐 **i18n** - Chinese / English admin panel
 
 ## Quick Start
 
@@ -215,6 +219,7 @@ Configure thinking mode in the Admin Panel under **Settings > Thinking Mode Sett
 ```
 Kiro-Go/
 ├── main.go              # Entry point
+├── version.json         # Version info for update check
 ├── config/              # Configuration management
 ├── pool/                # Account pool & load balancing
 ├── proxy/               # API handlers & Kiro client
