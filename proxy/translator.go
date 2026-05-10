@@ -23,7 +23,7 @@ var modelMapOrdered = []modelMapping{
 	{"claude-sonnet-4-6", "claude-sonnet-4.6"},
 	{"claude-sonnet-4.6", "claude-sonnet-4.6"},
 	{"claude-opus-4-7", "claude-opus-4-7"},
-    {"claude-opus-4.7", "claude-opus-4-7"},
+	{"claude-opus-4.7", "claude-opus-4-7"},
 	{"claude-haiku-4-5", "claude-haiku-4.5"},
 	{"claude-haiku-4.5", "claude-haiku-4.5"},
 	{"claude-opus-4-5", "claude-opus-4.5"},
@@ -46,6 +46,7 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
 const minimalFallbackUserContent = "."
+const toolResultsContinuationPrefix = "Tool results:"
 
 // ParseModelAndThinking 解析模型名称，返回实际模型和是否启用 thinking
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
@@ -134,9 +135,17 @@ type ClaudeResponse struct {
 	Usage        ClaudeUsage          `json:"usage"`
 }
 
+type ClaudeCacheCreationUsage struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens,omitempty"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens,omitempty"`
+}
+
 type ClaudeUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int                       `json:"input_tokens"`
+	OutputTokens             int                       `json:"output_tokens"`
+	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
+	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -176,7 +185,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				userMsg := KiroUserInputMessage{
 					Content: content,
 					// ModelID: modelID,
-					Origin:  origin,
+					Origin: origin,
 				}
 				if len(images) > 0 {
 					userMsg.Images = images
@@ -201,16 +210,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// 确保 history 以 user 开始
-	if len(history) > 0 && history[0].AssistantResponseMessage != nil {
-		history = append([]KiroHistoryMessage{{
-			UserInputMessage: &KiroUserInputMessage{
-				Content: "Begin conversation",
-				// ModelID: modelID,
-				Origin:  origin,
-			},
-		}}, history...)
-	}
+	history = trimLeadingAssistantHistory(history)
 
 	// 构建最终内容
 	finalContent := ""
@@ -237,8 +237,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		// ModelID: modelID,
-		Origin:  origin,
-		Images:  currentImages,
+		Origin: origin,
+		Images: currentImages,
 	}
 
 	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
@@ -616,8 +616,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 					UserInputMessage: &KiroUserInputMessage{
 						Content: content,
 						// ModelID: modelID,
-						Origin:  origin,
-						Images:  images,
+						Origin: origin,
+						Images: images,
 					},
 				})
 			}
@@ -662,7 +662,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 						UserInputMessage: &KiroUserInputMessage{
 							Content: buildToolResultsContinuation(currentToolResults),
 							// ModelID: modelID,
-							Origin:  origin,
+							Origin: origin,
 							UserInputMessageContext: &UserInputMessageContext{
 								ToolResults: currentToolResults,
 							},
@@ -699,8 +699,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		// ModelID: modelID,
-		Origin:  origin,
-		Images:  currentImages,
+		Origin: origin,
+		Images: currentImages,
 	}
 
 	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
@@ -832,11 +832,25 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 		return minimalFallbackUserContent
 	}
 
-	joined := strings.Join(parts, "\n\n")
+	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
 	if len(joined) > 4000 {
 		return joined[:4000]
 	}
 	return joined
+}
+
+func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
+	idx := 0
+	for idx < len(history) && history[idx].AssistantResponseMessage != nil {
+		idx++
+	}
+	if idx == 0 {
+		return history
+	}
+	if idx >= len(history) {
+		return nil
+	}
+	return history[idx:]
 }
 
 func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
@@ -849,15 +863,7 @@ func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
 			return strings.TrimSpace(text)
 		}
 		if len(toolResults) > 0 {
-			return buildToolResultsContinuation(toolResults)
-		}
-	}
-
-	for _, msg := range messages {
-		if strings.TrimSpace(msg.Role) != "" {
-			if text := extractOpenAIMessageText(msg.Content); strings.TrimSpace(text) != "" {
-				return strings.TrimSpace(text)
-			}
+			continue
 		}
 	}
 
@@ -875,23 +881,30 @@ func firstOpenAIConversationAnchor(messages []OpenAIMessage) string {
 		}
 	}
 
-	for _, msg := range messages {
-		text := extractOpenAIMessageText(msg.Content)
-		if strings.TrimSpace(text) != "" {
-			return strings.TrimSpace(text)
-		}
-	}
-
 	return ""
 }
 
 func buildConversationID(modelID, systemPrompt, anchor string) string {
 	anchor = strings.TrimSpace(anchor)
-	if anchor == "" {
+	if isSyntheticConversationAnchor(anchor) {
 		return uuid.New().String()
 	}
 	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+}
+
+func isSyntheticConversationAnchor(anchor string) bool {
+	if strings.TrimSpace(anchor) == "" {
+		return true
+	}
+
+	normalized := strings.ToLower(strings.Join(strings.Fields(anchor), " "))
+	switch normalized {
+	case ".", "begin conversation", "please analyze the attached image.", strings.ToLower(minimalFallbackUserContent):
+		return true
+	default:
+		return false
+	}
 }
 
 func extractOpenAITextPart(part map[string]interface{}) (string, bool) {

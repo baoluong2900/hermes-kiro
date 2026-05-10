@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"kiro-api-proxy/auth"
-	"kiro-api-proxy/config"
-	"kiro-api-proxy/pool"
+	"kiro-go/auth"
+	"kiro-go/config"
+	"kiro-go/pool"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +33,7 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	promptCache     *promptCacheTracker
 }
 
 type thinkingStreamSource int
@@ -61,6 +62,77 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
+func validateClaudeRequestShape(req *ClaudeRequest) string {
+	if len(req.Messages) == 0 {
+		return "messages must not be empty"
+	}
+
+	hasUserContext := false
+	lastRole := ""
+	for _, msg := range req.Messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		lastRole = role
+		if role != "user" {
+			continue
+		}
+
+		text, images, toolResults := extractClaudeUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0) != "" || len(toolResults) > 0 {
+			hasUserContext = true
+		}
+	}
+
+	if lastRole == "assistant" {
+		return "assistant-prefill final message is not supported; last message must be user"
+	}
+	if !hasUserContext {
+		return "at least one non-empty user message is required"
+	}
+	return ""
+}
+
+func validateOpenAIRequestShape(req *OpenAIRequest) string {
+	if len(req.Messages) == 0 {
+		return "messages must not be empty"
+	}
+
+	hasNonSystem := false
+	hasUserContext := false
+	lastRole := ""
+	for _, msg := range req.Messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		if role != "system" {
+			hasNonSystem = true
+			lastRole = role
+		}
+
+		if role != "user" {
+			continue
+		}
+		text, images := extractOpenAIUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0) != "" {
+			hasUserContext = true
+		}
+	}
+
+	if !hasNonSystem {
+		return "at least one non-system message is required"
+	}
+	if lastRole == "assistant" {
+		return "assistant-prefill final message is not supported; last message must be user or tool"
+	}
+	if !hasUserContext {
+		return "at least one non-empty user message is required"
+	}
+	return ""
+}
+
 func NewHandler() *Handler {
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
@@ -73,6 +145,7 @@ func NewHandler() *Handler {
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
+		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -268,36 +341,20 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
+	if len(cached) == 0 {
+		h.refreshModelsCache()
+		h.modelsCacheMu.RLock()
+		cached = h.cachedModels
+		h.modelsCacheMu.RUnlock()
+	}
 
 	thinkingSuffix := config.GetThinkingConfig().Suffix
 
-	var models []map[string]interface{}
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
-	} else {
-		// fallback 静态列表
-		models = []map[string]interface{}{
-			buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-			buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-opus-4.6", "anthropic", true),
-			buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-	        buildModelInfo("claude-opus-4-7", "anthropic", true),
-            buildModelInfo("claude-opus-4-7"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-			buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-sonnet-4", "anthropic", true),
-			buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-haiku-4.5", "anthropic", true),
-			buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-opus-4.5", "anthropic", true),
-			buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
-		}
+	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	if len(models) == 0 {
+		models = fallbackAnthropicModels(thinkingSuffix)
 	}
+
 	// 添加别名模型
 	models = append(models,
 		buildModelInfo("auto", "kiro-proxy", true),
@@ -310,6 +367,43 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   models,
 	})
+	return
+}
+
+func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
+	if len(cached) == 0 {
+		return nil
+	}
+
+	models := make([]map[string]interface{}, 0, len(cached)*2)
+	if len(cached) > 0 {
+		for _, m := range cached {
+			supportsImage := modelSupportsImage(m.InputTypes)
+			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
+			// 自动生成 thinking 变体
+			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+		}
+	}
+	return models
+}
+
+func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
+	return []map[string]interface{}{
+		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
+		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.6", "anthropic", true),
+		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4-7", "anthropic", true),
+		buildModelInfo("claude-opus-4-7"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
+		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-4", "anthropic", true),
+		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-haiku-4.5", "anthropic", true),
+		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.5", "anthropic", true),
+		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+	}
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -357,29 +451,104 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
 func (h *Handler) refreshModelsCache() {
-	account := h.pool.GetNext()
-	if account == nil {
+	accounts := config.GetEnabledAccounts()
+	if len(accounts) == 0 {
 		return
 	}
 
-	// 确保 token 有效
-	if err := h.ensureValidToken(account); err != nil {
-		return
+	aggregated := make([]ModelInfo, 0)
+	for i := range accounts {
+		account := &accounts[i]
+		if err := h.ensureValidToken(account); err != nil {
+			fmt.Printf("[ModelsCache] Skip %s token refresh failed: %v\n", account.Email, err)
+			continue
+		}
+
+		models, err := ListAvailableModels(account)
+		if err != nil {
+			fmt.Printf("[ModelsCache] Failed to refresh for %s: %v\n", account.Email, err)
+			continue
+		}
+		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
-	models, err := ListAvailableModels(account)
-	if err != nil {
-		fmt.Printf("[ModelsCache] Failed to refresh: %v\n", err)
-		return
-	}
-
-	if len(models) > 0 {
+	if len(aggregated) > 0 {
 		h.modelsCacheMu.Lock()
-		h.cachedModels = models
+		h.cachedModels = aggregated
 		h.modelsCacheTime = time.Now().Unix()
 		h.modelsCacheMu.Unlock()
-		fmt.Printf("[ModelsCache] Cached %d models\n", len(models))
+		fmt.Printf("[ModelsCache] Cached %d models\n", len(aggregated))
 	}
+}
+
+func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
+	if len(incoming) == 0 {
+		return existing
+	}
+
+	indexByID := make(map[string]int, len(existing))
+	merged := make([]ModelInfo, len(existing))
+	copy(merged, existing)
+	for i, model := range merged {
+		indexByID[strings.ToLower(strings.TrimSpace(model.ModelId))] = i
+	}
+
+	for _, model := range incoming {
+		key := strings.ToLower(strings.TrimSpace(model.ModelId))
+		if key == "" {
+			continue
+		}
+		if idx, ok := indexByID[key]; ok {
+			merged[idx] = mergeModelInfo(merged[idx], model)
+			continue
+		}
+		indexByID[key] = len(merged)
+		merged = append(merged, model)
+	}
+
+	return merged
+}
+
+func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
+	if base.ModelName == "" {
+		base.ModelName = extra.ModelName
+	}
+	if base.Description == "" {
+		base.Description = extra.Description
+	}
+	if base.RateMultiplier == 0 {
+		base.RateMultiplier = extra.RateMultiplier
+	}
+	if base.TokenLimits == nil {
+		base.TokenLimits = extra.TokenLimits
+	}
+	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
+	return base
+}
+
+func mergeStringLists(base []string, extra []string) []string {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[string]bool, len(base)+len(extra))
+	merged := make([]string, 0, len(base)+len(extra))
+	for _, item := range base {
+		key := strings.ToLower(strings.TrimSpace(item))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		merged = append(merged, item)
+	}
+	for _, item := range extra {
+		key := strings.ToLower(strings.TrimSpace(item))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		merged = append(merged, item)
+	}
+	return merged
 }
 
 // handleCountTokens Token 计数（Claude Code 会调用）
@@ -433,6 +602,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+	if msg := validateClaudeRequestShape(&req); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 
 	// 获取账号
 	account := h.pool.GetNext()
@@ -452,20 +625,22 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
+	cacheProfile := h.promptCache.BuildClaudeProfile(&req, estimatedInputTokens)
+	cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// 流式或非流式
 	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheUsage, cacheProfile)
 	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheUsage, cacheProfile)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -737,10 +912,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]int{
-				"input_tokens":  startInputTokens,
-				"output_tokens": 0,
-			},
+			"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
 		},
 	})
 
@@ -827,7 +999,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 	closeActiveBlock()
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	thinkingOutput := rawThinkingBuilder.String()
 	if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -841,6 +1015,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
 	stopReason := "end_turn"
@@ -853,10 +1028,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		"delta": map[string]interface{}{
 			"stop_reason": stopReason,
 		},
-		"usage": map[string]int{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 	})
 
 	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -925,7 +1097,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
@@ -973,12 +1145,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		thinkingContent = ""
 	}
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputTokens = estimateClaudeOutputTokens(finalContent, thinkingContent, toolUses)
 
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.promptCache.Update(account.ID, cacheProfile)
 
 	if thinking && thinkingContent != "" {
 		switch thinkingFormat {
@@ -993,6 +1168,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	}
 
 	resp := KiroToClaudeResponse(finalContent, thinkingContent, toolUses, inputTokens, outputTokens, model)
+	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+	if cacheProfile != nil {
+		resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
+			Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -1025,6 +1209,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
+		return
+	}
+	if msg := validateOpenAIRequestShape(&req); msg != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
 
@@ -1382,7 +1570,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		eventThinkingOpen = false
 	}
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	reasoningOutput := rawReasoningBuilder.String()
 	if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -1467,7 +1657,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		reasoningContent = ""
 	}
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 	h.recordSuccess(inputTokens, outputTokens, credits)
@@ -1814,7 +2006,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		h.pool.Reload()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"success":   true,
 			"refreshed": successCount,
 			"failed":    failCount,
 		})

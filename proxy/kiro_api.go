@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"kiro-api-proxy/config"
+	"kiro-go/config"
 	"net/http"
 	"strings"
 	"time"
@@ -12,7 +12,6 @@ import (
 
 const (
 	kiroRestAPIBase = "https://codewhisperer.us-east-1.amazonaws.com"
-	kiroVersion     = "0.7.45"
 )
 
 // GetUsageLimits 获取账户使用量和订阅信息
@@ -110,21 +109,14 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 }
 
 func setKiroHeaders(req *http.Request, account *config.Account) {
-	machineId := account.MachineId
-	var userAgent, amzUserAgent string
-	if machineId != "" {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s-%s", kiroVersion, machineId)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s %s", kiroVersion, machineId)
-	} else {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s", kiroVersion)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s", kiroVersion)
+	host := ""
+	if req.URL != nil {
+		host = req.URL.Host
 	}
+	headerValues := buildRuntimeHeaderValues(account, host)
 
-	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("x-amz-user-agent", amzUserAgent)
-	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	applyKiroBaseHeaders(req, account, headerValues)
 }
 
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
@@ -156,7 +148,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 
 			return nil, fmt.Errorf("Account suspended: %w", err)
 		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
-				  strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
+			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
 			// Token 相关错误，可能需要重新认证
 			fmt.Printf("[RefreshAccountInfo] Authentication error for %s: %v\n", account.Email, err)
 
@@ -286,14 +278,14 @@ type UsageLimitsResponse struct {
 }
 
 type UsageBreakdown struct {
-	ResourceType   string  `json:"resourceType"`
-	CurrentUsage   float64 `json:"currentUsage"`
-	UsageLimit     float64 `json:"usageLimit"`
-	Currency       string  `json:"currency"`
-	Unit           string  `json:"unit"`
-	OverageRate    float64 `json:"overageRate"`
-	FreeTrialInfo  *FreeTrialInfo `json:"freeTrialInfo"`
-	Bonuses        []BonusInfo    `json:"bonuses"`
+	ResourceType  string         `json:"resourceType"`
+	CurrentUsage  float64        `json:"currentUsage"`
+	UsageLimit    float64        `json:"usageLimit"`
+	Currency      string         `json:"currency"`
+	Unit          string         `json:"unit"`
+	OverageRate   float64        `json:"overageRate"`
+	FreeTrialInfo *FreeTrialInfo `json:"freeTrialInfo"`
+	Bonuses       []BonusInfo    `json:"bonuses"`
 }
 
 type FreeTrialInfo struct {
