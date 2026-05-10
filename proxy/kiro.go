@@ -9,14 +9,13 @@ import (
 	"io"
 	"kiro-api-proxy/config"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
-
-const KiroVersion = "0.7.45"
 
 // 双端点配置（429 时自动 fallback）
 type kiroEndpoint struct {
@@ -164,17 +163,6 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return err
 	}
 
-	// User-Agent
-	machineId := account.MachineId
-	var userAgent, amzUserAgent string
-	if machineId != "" {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s-%s", KiroVersion, machineId)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s %s", KiroVersion, machineId)
-	} else {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s", KiroVersion)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s", KiroVersion)
-	}
-
 	// 根据配置排序端点
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
@@ -190,16 +178,20 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
+		host := ""
+		if parsedURL, parseErr := url.Parse(ep.URL); parseErr == nil {
+			host = parsedURL.Host
+		}
+		headerValues := buildStreamingHeaderValues(account, host)
+
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "*/*")
 		req.Header.Set("X-Amz-Target", ep.AmzTarget)
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("X-Amz-User-Agent", amzUserAgent)
+		applyKiroBaseHeaders(req, account, headerValues)
 		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 		req.Header.Set("x-amzn-codewhisperer-optout", "true")
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 
 		resp, err := kiroHttpClient.Do(req)
 		if err != nil {

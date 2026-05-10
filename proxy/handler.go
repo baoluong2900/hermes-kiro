@@ -33,6 +33,7 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	promptCache     *promptCacheTracker
 }
 
 type thinkingStreamSource int
@@ -61,6 +62,77 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
+func validateClaudeRequestShape(req *ClaudeRequest) string {
+	if len(req.Messages) == 0 {
+		return "messages must not be empty"
+	}
+
+	hasUserContext := false
+	lastRole := ""
+	for _, msg := range req.Messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		lastRole = role
+		if role != "user" {
+			continue
+		}
+
+		text, images, toolResults := extractClaudeUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0) != "" || len(toolResults) > 0 {
+			hasUserContext = true
+		}
+	}
+
+	if lastRole == "assistant" {
+		return "assistant-prefill final message is not supported; last message must be user"
+	}
+	if !hasUserContext {
+		return "at least one non-empty user message is required"
+	}
+	return ""
+}
+
+func validateOpenAIRequestShape(req *OpenAIRequest) string {
+	if len(req.Messages) == 0 {
+		return "messages must not be empty"
+	}
+
+	hasNonSystem := false
+	hasUserContext := false
+	lastRole := ""
+	for _, msg := range req.Messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		if role != "system" {
+			hasNonSystem = true
+			lastRole = role
+		}
+
+		if role != "user" {
+			continue
+		}
+		text, images := extractOpenAIUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0) != "" {
+			hasUserContext = true
+		}
+	}
+
+	if !hasNonSystem {
+		return "at least one non-system message is required"
+	}
+	if lastRole == "assistant" {
+		return "assistant-prefill final message is not supported; last message must be user or tool"
+	}
+	if !hasUserContext {
+		return "at least one non-empty user message is required"
+	}
+	return ""
+}
+
 func NewHandler() *Handler {
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
@@ -73,6 +145,7 @@ func NewHandler() *Handler {
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
+		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -286,8 +359,8 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
 			buildModelInfo("claude-opus-4.6", "anthropic", true),
 			buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-	        buildModelInfo("claude-opus-4-7", "anthropic", true),
-            buildModelInfo("claude-opus-4-7"+thinkingSuffix, "anthropic", true),
+			buildModelInfo("claude-opus-4-7", "anthropic", true),
+			buildModelInfo("claude-opus-4-7"+thinkingSuffix, "anthropic", true),
 			buildModelInfo("claude-sonnet-4.5", "anthropic", true),
 			buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
 			buildModelInfo("claude-sonnet-4", "anthropic", true),
@@ -433,6 +506,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+	if msg := validateClaudeRequestShape(&req); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 
 	// 获取账号
 	account := h.pool.GetNext()
@@ -452,20 +529,22 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
+	cacheProfile := h.promptCache.BuildClaudeProfile(&req, estimatedInputTokens)
+	cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// 流式或非流式
 	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheUsage, cacheProfile)
 	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheUsage, cacheProfile)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -737,10 +816,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]int{
-				"input_tokens":  startInputTokens,
-				"output_tokens": 0,
-			},
+			"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
 		},
 	})
 
@@ -827,7 +903,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 	closeActiveBlock()
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	thinkingOutput := rawThinkingBuilder.String()
 	if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -841,6 +919,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
 	stopReason := "end_turn"
@@ -853,10 +932,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		"delta": map[string]interface{}{
 			"stop_reason": stopReason,
 		},
-		"usage": map[string]int{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 	})
 
 	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -925,7 +1001,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
@@ -973,12 +1049,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		thinkingContent = ""
 	}
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputTokens = estimateClaudeOutputTokens(finalContent, thinkingContent, toolUses)
 
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.promptCache.Update(account.ID, cacheProfile)
 
 	if thinking && thinkingContent != "" {
 		switch thinkingFormat {
@@ -993,6 +1072,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	}
 
 	resp := KiroToClaudeResponse(finalContent, thinkingContent, toolUses, inputTokens, outputTokens, model)
+	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+	if cacheProfile != nil {
+		resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
+			Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -1025,6 +1113,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
+		return
+	}
+	if msg := validateOpenAIRequestShape(&req); msg != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
 
@@ -1382,7 +1474,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		eventThinkingOpen = false
 	}
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	reasoningOutput := rawReasoningBuilder.String()
 	if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -1467,7 +1561,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		reasoningContent = ""
 	}
 
-	inputTokens = estimatedInputTokens
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 	h.recordSuccess(inputTokens, outputTokens, credits)
@@ -1814,7 +1910,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		h.pool.Reload()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"success":   true,
 			"refreshed": successCount,
 			"failed":    failCount,
 		})

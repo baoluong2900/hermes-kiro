@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 )
 
@@ -94,7 +95,10 @@ type Config struct {
 	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
 	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
 	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
-	Accounts      []Account `json:"accounts"`         // Registered Kiro accounts
+	KiroVersion   string    `json:"kiroVersion,omitempty"`
+	SystemVersion string    `json:"systemVersion,omitempty"`
+	NodeVersion   string    `json:"nodeVersion,omitempty"`
+	Accounts      []Account `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -439,4 +443,50 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
 	return Save()
+}
+
+type KiroClientConfig struct {
+	KiroVersion   string
+	SystemVersion string
+	NodeVersion   string
+}
+
+func GetKiroClientConfig() KiroClientConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	kiroVersion := "0.11.107"
+	if cfg != nil && cfg.KiroVersion != "" {
+		kiroVersion = cfg.KiroVersion
+	}
+
+	systemVersion := ""
+	if cfg != nil {
+		systemVersion = cfg.SystemVersion
+	}
+	if systemVersion == "" {
+		systemVersion = defaultSystemVersion()
+	}
+
+	nodeVersion := "22.22.0"
+	if cfg != nil && cfg.NodeVersion != "" {
+		nodeVersion = cfg.NodeVersion
+	}
+
+	return KiroClientConfig{
+		KiroVersion:   kiroVersion,
+		SystemVersion: systemVersion,
+		NodeVersion:   nodeVersion,
+	}
+}
+
+func defaultSystemVersion() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win32#10.0.22631"
+	case "darwin":
+		return "darwin#24.6.0"
+	default:
+		return "linux#6.6.87"
+	}
 }
