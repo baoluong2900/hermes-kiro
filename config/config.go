@@ -136,8 +136,8 @@ type AccountInfo struct {
 	TrialExpiresAt    int64
 }
 
-// Version 当前版本号
-const Version = "1.0.4"
+// Version current version
+const Version = "1.0.5"
 
 var (
 	cfg     *Config
