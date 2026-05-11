@@ -136,11 +136,12 @@ type InferenceConfig struct {
 
 // KiroStreamCallback 流式响应回调
 type KiroStreamCallback struct {
-	OnText     func(text string, isThinking bool)
-	OnToolUse  func(toolUse KiroToolUse)
-	OnComplete func(inputTokens, outputTokens int)
-	OnError    func(err error)
-	OnCredits  func(credits float64)
+	OnText           func(text string, isThinking bool)
+	OnToolUse        func(toolUse KiroToolUse)
+	OnComplete       func(inputTokens, outputTokens int)
+	OnError          func(err error)
+	OnCredits        func(credits float64)
+	OnContextUsage   func(percentage float64)
 }
 
 // ==================== API 调用 ====================
@@ -306,6 +307,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
+		case "contextUsageEvent":
+			if pct, ok := event["contextUsagePercentage"].(float64); ok {
+				if callback.OnContextUsage != nil {
+					callback.OnContextUsage(pct)
+				}
+			}
 		}
 	}
 
@@ -368,6 +375,16 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	}
 
 	return inputTokens, outputTokens
+}
+
+// getContextWindowSize 返回模型的上下文窗口大小（token 数）
+// Kiro 托管的 Claude 模型窗口由 AWS 硬性规定，此处与官方保持一致
+func getContextWindowSize(model string) int {
+	m := strings.ToLower(model)
+	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") {
+		return 1_000_000
+	}
+	return 200_000
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
