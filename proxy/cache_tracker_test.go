@@ -1,18 +1,20 @@
 package proxy
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 	tracker := newPromptCacheTracker(time.Hour)
+	longSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
 	req := &ClaudeRequest{
 		Model: "claude-sonnet-4.5",
 		System: []interface{}{
 			map[string]interface{}{
 				"type": "text",
-				"text": "system prompt",
+				"text": longSystem,
 				"cache_control": map[string]interface{}{
 					"type": "ephemeral",
 				},
@@ -69,5 +71,108 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 	}
 	if creation["ephemeral_5m_input_tokens"] != 10 || creation["ephemeral_1h_input_tokens"] != 20 {
 		t.Fatalf("unexpected ttl breakdown: %#v", creation)
+	}
+}
+
+// TestPromptCacheStableAcrossBillingHeaderDrift verifies that Claude Code's
+// per-request "x-anthropic-billing-header: cc_version=...; cch=...;" system
+// block (whose content drifts on every request) does not break cache hits.
+// The normalization logic should ensure the same conversation still matches.
+func TestPromptCacheStableAcrossBillingHeaderDrift(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	mainSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+
+	build := func(billingHdr string) *ClaudeRequest {
+		return &ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			System: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": billingHdr,
+				},
+				map[string]interface{}{
+					"type": "text",
+					"text": mainSystem,
+					"cache_control": map[string]interface{}{
+						"type": "ephemeral",
+					},
+				},
+			},
+			Messages: []ClaudeMessage{{Role: "user", Content: "hello world"}},
+		}
+	}
+
+	req1 := build("x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;")
+	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	if profile1 == nil {
+		t.Fatalf("profile1 should be built")
+	}
+	first := tracker.Compute("acct-1", profile1)
+	if first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected no cache read on first request, got %+v", first)
+	}
+	tracker.Update("acct-1", profile1)
+
+	req2 := build("x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb; padding=xxyyzz;")
+	profile2 := tracker.BuildClaudeProfile(req2, 2048)
+	if profile2 == nil {
+		t.Fatalf("profile2 should be built")
+	}
+	second := tracker.Compute("acct-1", profile2)
+	if second.CacheReadInputTokens == 0 {
+		t.Fatalf("expected cache read after billing header drift, got %+v", second)
+	}
+}
+
+// TestPromptCacheImplicitBreakpointAtMessageEnd verifies that once any
+// explicit cache_control breakpoint has been seen, subsequent message-end
+// boundaries act as implicit breakpoints. This allows multi-turn conversations
+// to hit earlier stored prefix fingerprints even when the newest messages
+// lack explicit cache_control.
+func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+
+	baseSystem := []interface{}{
+		map[string]interface{}{
+			"type": "text",
+			"text": systemText,
+			"cache_control": map[string]interface{}{
+				"type": "ephemeral",
+			},
+		},
+	}
+
+	// Round 1: single user message.
+	req1 := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   baseSystem,
+		Messages: []ClaudeMessage{{Role: "user", Content: "question one"}},
+	}
+	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	if profile1 == nil {
+		t.Fatalf("profile1 should be built")
+	}
+	tracker.Update("acct-1", profile1)
+
+	// Round 2: conversation continues with new messages. The latest user
+	// message has no explicit cache_control; it should still hit the stored
+	// prefix via the implicit message-end breakpoint.
+	req2 := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: baseSystem,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "question one"},
+			{Role: "assistant", Content: "answer one"},
+			{Role: "user", Content: "follow-up question"},
+		},
+	}
+	profile2 := tracker.BuildClaudeProfile(req2, 4096)
+	if profile2 == nil {
+		t.Fatalf("profile2 should be built")
+	}
+	result := tracker.Compute("acct-1", profile2)
+	if result.CacheReadInputTokens == 0 {
+		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
 	}
 }
