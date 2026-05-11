@@ -1018,6 +1018,15 @@
                 <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="settings.proxySettings"></span></div>
+                <div class="form-group">
+                    <label data-i18n="settings.proxyURL"></label>
+                    <input type="text" id="proxyURLInput" data-i18n-placeholder="settings.proxyURLPlaceholder">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block" data-i18n="settings.proxyURLHint"></small>
+                </div>
+                <button class="btn btn-primary" onclick="saveProxyConfig()" data-i18n="settings.saveProxy"></button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
                 <button class="btn btn-danger" onclick="resetStats()" data-i18n="settings.resetStats"></button>
             </div>
@@ -1146,6 +1155,12 @@
                 'settings.statistics': '统计',
                 'settings.resetStats': '重置统计',
                 'settings.confirmReset': '确定重置统计？',
+                'settings.proxySettings': '出站代理设置',
+                'settings.proxyURL': '代理地址',
+                'settings.proxyURLPlaceholder': '留空则直连（不使用代理）',
+                'settings.proxyURLHint': '支持 socks5://host:port、socks5://user:pass@host:port、http://host:port 格式，适用于网络受限地区的用户',
+                'settings.saveProxy': '保存代理设置',
+                'settings.proxySaved': '代理设置已保存，已即时生效',
                 'api.endpoints': 'API 端点',
                 'api.modelList': '模型列表',
                 'api.stats': '统计数据',
@@ -1352,6 +1367,12 @@
                 'settings.statistics': 'Statistics',
                 'settings.resetStats': 'Reset Statistics',
                 'settings.confirmReset': 'Confirm reset statistics?',
+                'settings.proxySettings': 'Outbound Proxy Settings',
+                'settings.proxyURL': 'Proxy URL',
+                'settings.proxyURLPlaceholder': 'Leave empty to connect directly',
+                'settings.proxyURLHint': 'Supports socks5://host:port, socks5://user:pass@host:port, http://host:port. For users in restricted network regions.',
+                'settings.saveProxy': 'Save Proxy Settings',
+                'settings.proxySaved': 'Proxy settings saved and applied',
                 'api.endpoints': 'API Endpoints',
                 'api.modelList': 'Model List',
                 'api.stats': 'Statistics',
@@ -1991,6 +2012,7 @@
             document.getElementById('apiKeyInput').value = d.apiKey || '';
             loadThinkingConfig();
             loadEndpointConfig();
+            loadProxyConfig();
         }
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
@@ -2019,6 +2041,19 @@
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.endpointSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
+        }
+        async function loadProxyConfig() {
+            const res = await fetch('/admin/api/proxy', { headers: { 'X-Admin-Password': password } });
+            const d = await res.json();
+            document.getElementById('proxyURLInput').value = d.proxyURL || '';
+        }
+        async function saveProxyConfig() {
+            const res = await fetch('/admin/api/proxy', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ proxyURL: document.getElementById('proxyURLInput').value.trim() })
+            });
+            const d = await res.json();
+            if (d.success) { alert(t('settings.proxySaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
         function generateApiKey() {
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';

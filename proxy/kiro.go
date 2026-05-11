@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,16 +41,39 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
-// 全局 HTTP 客户端，复用连接池
-var kiroHttpClient = &http.Client{
-	Timeout: 5 * time.Minute,
-	Transport: &http.Transport{
-		MaxIdleConns:        100,              // 最大空闲连接数
-		MaxIdleConnsPerHost: 20,               // 每个 Host 最大空闲连接数
-		IdleConnTimeout:     90 * time.Second, // 空闲连接超时
-		DisableCompression:  false,            // 启用压缩
-		ForceAttemptHTTP2:   true,             // 尝试使用 HTTP/2
-	},
+// 全局 HTTP 客户端，支持运行时更换（代理重配置）
+var kiroHttpStore atomic.Pointer[http.Client]
+
+func init() {
+	InitKiroHttpClient("")
+}
+
+// buildKiroTransport 构建带可选代理的 Transport
+func buildKiroTransport(proxyURL string) *http.Transport {
+	t := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+	if proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			t.Proxy = http.ProxyURL(u)
+			// 代理不支持 HTTP/2 协议升级
+			t.ForceAttemptHTTP2 = false
+		}
+	}
+	return t
+}
+
+// InitKiroHttpClient 初始化（或重新初始化）Kiro API 的 HTTP 客户端
+func InitKiroHttpClient(proxyURL string) {
+	client := &http.Client{
+		Timeout:   5 * time.Minute,
+		Transport: buildKiroTransport(proxyURL),
+	}
+	kiroHttpStore.Store(client)
 }
 
 // ==================== 请求结构 ====================
@@ -136,12 +160,12 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
-	OnText           func(text string, isThinking bool)
-	OnToolUse        func(toolUse KiroToolUse)
-	OnComplete       func(inputTokens, outputTokens int)
-	OnError          func(err error)
-	OnCredits        func(credits float64)
-	OnContextUsage   func(percentage float64)
+	OnText         func(text string, isThinking bool)
+	OnToolUse      func(toolUse KiroToolUse)
+	OnComplete     func(inputTokens, outputTokens int)
+	OnError        func(err error)
+	OnCredits      func(credits float64)
+	OnContextUsage func(percentage float64)
 }
 
 // ==================== API 调用 ====================
@@ -194,7 +218,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
-		resp, err := kiroHttpClient.Do(req)
+		resp, err := kiroHttpStore.Load().Do(req)
 		if err != nil {
 			lastErr = err
 			fmt.Printf("[KiroAPI] Endpoint %s failed: %v\n", ep.Name, err)

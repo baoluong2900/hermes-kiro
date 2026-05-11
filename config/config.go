@@ -108,6 +108,12 @@ type Config struct {
 	// Endpoint configuration: "auto", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
+	// Proxy configuration: optional outbound proxy for Kiro API requests
+	// Format: "socks5://host:port", "socks5://user:pass@host:port",
+	//         "http://host:port",  "http://user:pass@host:port"
+	// Leave empty to connect directly.
+	ProxyURL string `json:"proxyURL,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -442,6 +448,21 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
+	return Save()
+}
+
+// GetProxyURL 获取出站代理地址
+func GetProxyURL() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.ProxyURL
+}
+
+// UpdateProxySettings 更新出站代理配置
+func UpdateProxySettings(proxyURL string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ProxyURL = proxyURL
 	return Save()
 }
 

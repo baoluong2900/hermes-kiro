@@ -206,6 +206,9 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 }
 
 func NewHandler() *Handler {
+	// 启动时应用代理配置
+	applyProxyConfig(config.GetProxyURL())
+
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
 		pool:            pool.GetPool(),
@@ -1908,6 +1911,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetEndpointConfig(w, r)
 	case path == "/endpoint" && r.Method == "POST":
 		h.apiUpdateEndpointConfig(w, r)
+	case path == "/proxy" && r.Method == "GET":
+		h.apiGetProxy(w, r)
+	case path == "/proxy" && r.Method == "POST":
+		h.apiUpdateProxy(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2868,6 +2875,54 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// applyProxyConfig 将代理配置应用到所有出站 HTTP 客户端（Kiro API + auth 模块）
+func applyProxyConfig(proxyURL string) {
+	InitKiroHttpClient(proxyURL)
+	auth.InitHttpClient(proxyURL)
+}
+
+// apiGetProxy 获取当前代理配置
+func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]string{
+		"proxyURL": config.GetProxyURL(),
+	})
+}
+
+// apiUpdateProxy 更新代理配置并立即生效
+func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProxyURL string `json:"proxyURL"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// 验证代理 URL 格式（非空时）
+	if req.ProxyURL != "" {
+		if !strings.HasPrefix(req.ProxyURL, "http://") &&
+			!strings.HasPrefix(req.ProxyURL, "https://") &&
+			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
+			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			return
+		}
+	}
+
+	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// 立即应用新的代理配置
+	applyProxyConfig(req.ProxyURL)
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
