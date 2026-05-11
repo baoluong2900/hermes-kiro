@@ -17,6 +17,7 @@
 - 自动 Token 刷新、SSE 流式输出、Web 管理面板
 - 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
 - 用量追踪、账号导入导出、中英双语
+- 支持设置出站代理（SOCKS5 / HTTP）
 
 ## 快速开始
 
@@ -73,6 +74,12 @@ curl http://localhost:8080/v1/chat/completions \
 ## 思考模式
 
 在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
+
+## 出站代理
+
+可在管理面板「设置 - 出站代理设置」中配置代理。支持 SOCKS5 和 HTTP 代理。
+
+设置保存后即时生效，无需重启服务。
 
 ## 环境变量
 
