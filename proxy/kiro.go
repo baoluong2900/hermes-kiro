@@ -132,9 +132,9 @@ type InferenceConfig struct {
 	TopP        float64 `json:"topP,omitempty"`
 }
 
-// ==================== 流式回调 ====================
+// ==================== Stream Callbacks ====================
 
-// KiroStreamCallback 流式响应回调
+// KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
 	OnText           func(text string, isThinking bool)
 	OnToolUse        func(toolUse KiroToolUse)
@@ -377,11 +377,12 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	return inputTokens, outputTokens
 }
 
-// getContextWindowSize 返回模型的上下文窗口大小（token 数）
-// Kiro 托管的 Claude 模型窗口由 AWS 硬性规定，此处与官方保持一致
+// getContextWindowSize returns the context window size (in tokens) for a model.
 func getContextWindowSize(model string) int {
 	m := strings.ToLower(model)
-	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") {
+	// sonnet-4.6, opus-4.6, opus-4.7 all have 1M context windows
+	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") ||
+		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") {
 		return 1_000_000
 	}
 	return 200_000
