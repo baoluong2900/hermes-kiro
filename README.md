@@ -72,7 +72,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Thinking Mode
 
-Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Configure output format in the admin panel under Settings - Thinking Mode.
+Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
 
 ## Environment Variables
 

@@ -1,8 +1,6 @@
 package proxy
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestThinkingSourceReasoningFirst(t *testing.T) {
 	var source thinkingStreamSource
@@ -98,6 +96,240 @@ func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
 
 	if msg := validateClaudeRequestShape(req); msg == "" {
 		t.Fatalf("expected assistant-prefill final message to be rejected")
+	}
+}
+
+func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
+	tests := []struct {
+		name         string
+		model        string
+		thinking     *ClaudeThinkingConfig
+		wantModel    string
+		wantThinking bool
+	}{
+		{
+			name:         "adaptive request enables thinking",
+			model:        "claude-sonnet-4.6",
+			thinking:     &ClaudeThinkingConfig{Type: "adaptive"},
+			wantModel:    "claude-sonnet-4.6",
+			wantThinking: true,
+		},
+		{
+			name:         "enabled request enables thinking",
+			model:        "claude-opus-4.5",
+			thinking:     &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
+			wantModel:    "claude-opus-4.5",
+			wantThinking: true,
+		},
+		{
+			name:         "disabled request keeps thinking off",
+			model:        "claude-opus-4.7",
+			thinking:     &ClaudeThinkingConfig{Type: "disabled"},
+			wantModel:    "claude-opus-4.7",
+			wantThinking: false,
+		},
+		{
+			name:         "suffix remains supported when thinking is disabled",
+			model:        "claude-sonnet-4.5-thinking",
+			thinking:     &ClaudeThinkingConfig{Type: "disabled"},
+			wantModel:    "claude-sonnet-4.5",
+			wantThinking: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotModel, gotThinking := resolveClaudeThinkingMode(tc.model, tc.thinking, "-thinking")
+			if gotModel != tc.wantModel {
+				t.Fatalf("expected model %q, got %q", tc.wantModel, gotModel)
+			}
+			if gotThinking != tc.wantThinking {
+				t.Fatalf("expected thinking=%v, got %v", tc.wantThinking, gotThinking)
+			}
+		})
+	}
+}
+
+func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:  "claude-sonnet-4.6",
+		System: "Follow the user instructions.",
+	}
+
+	cloned := cloneClaudeRequestForThinking(req, true)
+	blocks, ok := cloned.System.([]interface{})
+	if !ok {
+		t.Fatalf("expected cloned system prompt to be structured blocks, got %T", cloned.System)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
+	}
+	gotPrompt := extractSystemPrompt(cloned.System)
+	expected := ThinkingModePrompt + "\n\nFollow the user instructions."
+	if gotPrompt != expected {
+		t.Fatalf("expected injected system prompt %q, got %q", expected, gotPrompt)
+	}
+	if original, ok := req.System.(string); !ok || original != "Follow the user instructions." {
+		t.Fatalf("expected original request system prompt to stay unchanged, got %#v", req.System)
+	}
+}
+
+func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.6",
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "cached system",
+				"cache_control": map[string]interface{}{
+					"type": "ephemeral",
+					"ttl":  "5m",
+				},
+			},
+		},
+	}
+
+	cloned := cloneClaudeRequestForThinking(req, true)
+	blocks, ok := cloned.System.([]interface{})
+	if !ok {
+		t.Fatalf("expected structured system blocks, got %T", cloned.System)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
+	}
+	first, ok := blocks[0].(map[string]interface{})
+	if !ok || first["text"] != ThinkingModePrompt+"\n" {
+		t.Fatalf("expected first block to be thinking prompt, got %#v", blocks[0])
+	}
+	second, ok := blocks[1].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected original system block to remain a map, got %T", blocks[1])
+	}
+	cacheControl, ok := second["cache_control"].(map[string]interface{})
+	if !ok || cacheControl["type"] != "ephemeral" {
+		t.Fatalf("expected original cache_control to be preserved, got %#v", second["cache_control"])
+	}
+}
+
+func TestThinkingPromptAffectsClaudeTokenEstimate(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4.6",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
+	}
+
+	baseTokens := estimateClaudeRequestInputTokens(req)
+	thinkingTokens := estimateClaudeRequestInputTokens(cloneClaudeRequestForThinking(req, true))
+
+	if thinkingTokens <= baseTokens {
+		t.Fatalf("expected thinking tokens (%d) to exceed base tokens (%d)", thinkingTokens, baseTokens)
+	}
+}
+
+func TestValidateClaudeThinkingConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		thinking    *ClaudeThinkingConfig
+		maxTokens   int
+		expectError bool
+	}{
+		{
+			name:        "adaptive is valid",
+			thinking:    &ClaudeThinkingConfig{Type: "adaptive"},
+			maxTokens:   4096,
+			expectError: false,
+		},
+		{
+			name:        "enabled requires budget",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled"},
+			maxTokens:   4096,
+			expectError: true,
+		},
+		{
+			name:        "enabled requires at least 1024 budget tokens",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 512},
+			maxTokens:   4096,
+			expectError: true,
+		},
+		{
+			name:        "enabled rejects max tokens zero",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
+			maxTokens:   0,
+			expectError: true,
+		},
+		{
+			name:        "enabled budget must stay below max tokens",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 4096},
+			maxTokens:   4096,
+			expectError: true,
+		},
+		{
+			name:        "disabled rejects display",
+			thinking:    &ClaudeThinkingConfig{Type: "disabled", Display: "summarized"},
+			maxTokens:   4096,
+			expectError: true,
+		},
+		{
+			name:        "missing type is rejected",
+			thinking:    &ClaudeThinkingConfig{},
+			maxTokens:   4096,
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errMsg := validateClaudeThinkingConfig(tc.thinking, tc.maxTokens)
+			if tc.expectError && errMsg == "" {
+				t.Fatalf("expected validation error")
+			}
+			if !tc.expectError && errMsg != "" {
+				t.Fatalf("expected thinking config to be valid, got %q", errMsg)
+			}
+		})
+	}
+}
+
+func TestResolveClaudeThinkingResponseOptions(t *testing.T) {
+	tests := []struct {
+		name       string
+		thinking   *ClaudeThinkingConfig
+		defaultFmt string
+		wantFmt    string
+		wantOmit   bool
+	}{
+		{
+			name:       "default config is preserved when display unset",
+			thinking:   &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
+			defaultFmt: "think",
+			wantFmt:    "think",
+			wantOmit:   false,
+		},
+		{
+			name:       "summarized forces official thinking blocks",
+			thinking:   &ClaudeThinkingConfig{Type: "adaptive", Display: "summarized"},
+			defaultFmt: "reasoning_content",
+			wantFmt:    "thinking",
+			wantOmit:   false,
+		},
+		{
+			name:       "omitted forces official thinking blocks and hides content",
+			thinking:   &ClaudeThinkingConfig{Type: "adaptive", Display: "omitted"},
+			defaultFmt: "think",
+			wantFmt:    "thinking",
+			wantOmit:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := resolveClaudeThinkingResponseOptions(tc.thinking, tc.defaultFmt)
+			if opts.Format != tc.wantFmt {
+				t.Fatalf("expected format %q, got %q", tc.wantFmt, opts.Format)
+			}
+			if opts.OmitDisplay != tc.wantOmit {
+				t.Fatalf("expected omitDisplay=%v, got %v", tc.wantOmit, opts.OmitDisplay)
+			}
+		})
 	}
 }
 

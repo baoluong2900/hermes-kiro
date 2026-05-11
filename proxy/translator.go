@@ -76,6 +76,19 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	return model, thinking
 }
 
+func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {
+	actualModel, suffixThinking := ParseModelAndThinking(model, thinkingSuffix)
+	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+}
+
+func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
+	if thinkingCfg == nil {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(thinkingCfg.Type))
+	return kind == "enabled" || kind == "adaptive"
+}
+
 func MapModel(model string) string {
 	mapped, _ := ParseModelAndThinking(model, "-thinking")
 	return mapped
@@ -84,15 +97,22 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ClaudeMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	System      interface{}     `json:"system,omitempty"` // string or []SystemBlock
-	Tools       []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+	Model       string                `json:"model"`
+	Messages    []ClaudeMessage       `json:"messages"`
+	MaxTokens   int                   `json:"max_tokens"`
+	Temperature float64               `json:"temperature,omitempty"`
+	TopP        float64               `json:"top_p,omitempty"`
+	Stream      bool                  `json:"stream,omitempty"`
+	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Tools       []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+}
+
+type ClaudeThinkingConfig struct {
+	Type         string `json:"type,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Display      string `json:"display,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -104,6 +124,7 @@ type ClaudeContentBlock struct {
 	Type      string       `json:"type"`
 	Text      string       `json:"text,omitempty"`
 	Thinking  string       `json:"thinking,omitempty"`
+	Signature string       `json:"signature,omitempty"`
 	ID        string       `json:"id,omitempty"`
 	Name      string       `json:"name,omitempty"`
 	Input     interface{}  `json:"input,omitempty"`
@@ -157,12 +178,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := extractSystemPrompt(req.System)
-
-	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
-	}
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -261,6 +277,88 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	return payload
+}
+
+func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+	systemPrompt := extractSystemPrompt(system)
+	if !thinking {
+		return systemPrompt
+	}
+	if systemPrompt == "" {
+		return ThinkingModePrompt
+	}
+	return ThinkingModePrompt + "\n\n" + systemPrompt
+}
+
+func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeRequest {
+	if req == nil {
+		return nil
+	}
+
+	cloned := *req
+	if thinking {
+		cloned.System = prependThinkingSystem(req.System)
+	}
+	return &cloned
+}
+
+func prependThinkingSystem(system interface{}) interface{} {
+	thinkingText := ThinkingModePrompt
+	if hasClaudeSystemContent(system) {
+		thinkingText += "\n"
+	}
+	thinkingBlock := map[string]interface{}{
+		"type": "text",
+		"text": thinkingText,
+	}
+
+	switch v := system.(type) {
+	case nil:
+		return []interface{}{thinkingBlock}
+	case string:
+		if v == "" {
+			return []interface{}{thinkingBlock}
+		}
+		return []interface{}{
+			thinkingBlock,
+			map[string]interface{}{
+				"type": "text",
+				"text": v,
+			},
+		}
+	case []interface{}:
+		blocks := make([]interface{}, 0, len(v)+1)
+		blocks = append(blocks, thinkingBlock)
+		blocks = append(blocks, v...)
+		return blocks
+	case []string:
+		blocks := make([]interface{}, 0, len(v)+1)
+		blocks = append(blocks, thinkingBlock)
+		for _, block := range v {
+			blocks = append(blocks, map[string]interface{}{
+				"type": "text",
+				"text": block,
+			})
+		}
+		return blocks
+	default:
+		return []interface{}{thinkingBlock}
+	}
+}
+
+func hasClaudeSystemContent(system interface{}) bool {
+	switch v := system.(type) {
+	case nil:
+		return false
+	case string:
+		return v != ""
+	case []interface{}:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	default:
+		return true
+	}
 }
 
 func extractSystemPrompt(system interface{}) string {
@@ -459,10 +557,10 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content, thinkingContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
-	if thinkingContent != "" {
+	if thinkingContent != "" || includeEmptyThinkingBlock {
 		blocks = append(blocks, ClaudeContentBlock{
 			Type:     "thinking",
 			Thinking: thinkingContent,

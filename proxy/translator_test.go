@@ -233,6 +233,23 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 	}
 }
 
+func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
+	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6")
+
+	if len(resp.Content) != 2 {
+		t.Fatalf("expected empty thinking block plus text block, got %d blocks", len(resp.Content))
+	}
+	if resp.Content[0].Type != "thinking" {
+		t.Fatalf("expected first block to be thinking, got %#v", resp.Content[0])
+	}
+	if resp.Content[0].Thinking != "" {
+		t.Fatalf("expected omitted thinking block to have empty content, got %#v", resp.Content[0].Thinking)
+	}
+	if resp.Content[1].Type != "text" || resp.Content[1].Text != "final answer" {
+		t.Fatalf("expected text block to be preserved, got %#v", resp.Content[1])
+	}
+}
+
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",

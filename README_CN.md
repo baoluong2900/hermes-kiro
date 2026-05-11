@@ -72,7 +72,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 思考模式
 
-在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。输出格式可在管理面板「设置 - Thinking 模式」中配置。
+在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
 
 ## 环境变量
 
