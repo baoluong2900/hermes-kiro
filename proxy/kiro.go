@@ -7,16 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"kiro-api-proxy/config"
+	"kiro-go/config"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 )
-
-const KiroVersion = "0.7.45"
 
 // 双端点配置（429 时自动 fallback）
 type kiroEndpoint struct {
@@ -41,16 +41,48 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
-// 全局 HTTP 客户端，复用连接池
-var kiroHttpClient = &http.Client{
-	Timeout: 5 * time.Minute,
-	Transport: &http.Transport{
-		MaxIdleConns:        100,              // 最大空闲连接数
-		MaxIdleConnsPerHost: 20,               // 每个 Host 最大空闲连接数
-		IdleConnTimeout:     90 * time.Second, // 空闲连接超时
-		DisableCompression:  false,            // 启用压缩
-		ForceAttemptHTTP2:   true,             // 尝试使用 HTTP/2
-	},
+// 全局 HTTP 客户端，支持运行时更换（代理重配置）
+var kiroHttpStore atomic.Pointer[http.Client]
+var kiroRestHttpStore atomic.Pointer[http.Client]
+
+func init() {
+	InitKiroHttpClient("")
+}
+
+// buildKiroTransport 构建带可选代理的 Transport
+func buildKiroTransport(proxyURL string) *http.Transport {
+	t := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	}
+	if proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			t.Proxy = http.ProxyURL(u)
+			// 代理不支持 HTTP/2 协议升级
+			t.ForceAttemptHTTP2 = false
+		}
+	} else {
+		t.Proxy = http.ProxyFromEnvironment
+	}
+	return t
+}
+
+// InitKiroHttpClient 初始化（或重新初始化）Kiro API 的 HTTP 客户端
+func InitKiroHttpClient(proxyURL string) {
+	client := &http.Client{
+		Timeout:   5 * time.Minute,
+		Transport: buildKiroTransport(proxyURL),
+	}
+	kiroHttpStore.Store(client)
+
+	restClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: buildKiroTransport(proxyURL),
+	}
+	kiroRestHttpStore.Store(restClient)
 }
 
 // ==================== 请求结构 ====================
@@ -133,15 +165,16 @@ type InferenceConfig struct {
 	TopP        float64 `json:"topP,omitempty"`
 }
 
-// ==================== 流式回调 ====================
+// ==================== Stream Callbacks ====================
 
-// KiroStreamCallback 流式响应回调
+// KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
-	OnText     func(text string, isThinking bool)
-	OnToolUse  func(toolUse KiroToolUse)
-	OnComplete func(inputTokens, outputTokens int)
-	OnError    func(err error)
-	OnCredits  func(credits float64)
+	OnText         func(text string, isThinking bool)
+	OnToolUse      func(toolUse KiroToolUse)
+	OnComplete     func(inputTokens, outputTokens int)
+	OnError        func(err error)
+	OnCredits      func(credits float64)
+	OnContextUsage func(percentage float64)
 }
 
 // ==================== API 调用 ====================
@@ -163,16 +196,16 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	if _, err := json.Marshal(payload); err != nil {
 		return err
 	}
-
-	// User-Agent
-	machineId := account.MachineId
-	var userAgent, amzUserAgent string
-	if machineId != "" {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s-%s", KiroVersion, machineId)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s %s", KiroVersion, machineId)
-	} else {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s", KiroVersion)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s", KiroVersion)
+	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+		if profileArn, err := ResolveProfileArn(account); err == nil {
+			payload.ProfileArn = profileArn
+		} else {
+			accountEmail := "<nil>"
+			if account != nil {
+				accountEmail = account.Email
+			}
+			fmt.Printf("[ProfileArn] Failed to resolve profile ARN for %s: %v\n", accountEmail, err)
+		}
 	}
 
 	// 根据配置排序端点
@@ -190,18 +223,22 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
+		host := ""
+		if parsedURL, parseErr := url.Parse(ep.URL); parseErr == nil {
+			host = parsedURL.Host
+		}
+		headerValues := buildStreamingHeaderValues(account, host)
+
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "*/*")
 		req.Header.Set("X-Amz-Target", ep.AmzTarget)
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("X-Amz-User-Agent", amzUserAgent)
+		applyKiroBaseHeaders(req, account, headerValues)
 		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 		req.Header.Set("x-amzn-codewhisperer-optout", "true")
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 
-		resp, err := kiroHttpClient.Do(req)
+		resp, err := kiroHttpStore.Load().Do(req)
 		if err != nil {
 			lastErr = err
 			fmt.Printf("[KiroAPI] Endpoint %s failed: %v\n", ep.Name, err)
@@ -314,6 +351,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
+		case "contextUsageEvent":
+			if pct, ok := event["contextUsagePercentage"].(float64); ok {
+				if callback.OnContextUsage != nil {
+					callback.OnContextUsage(pct)
+				}
+			}
 		}
 	}
 
@@ -376,6 +419,17 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	}
 
 	return inputTokens, outputTokens
+}
+
+// getContextWindowSize returns the context window size (in tokens) for a model.
+func getContextWindowSize(model string) int {
+	m := strings.ToLower(model)
+	// sonnet-4.6, opus-4.6, opus-4.7 all have 1M context windows
+	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") ||
+		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") {
+		return 1_000_000
+	}
+	return 200_000
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {

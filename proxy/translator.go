@@ -22,8 +22,8 @@ var modelMapOrdered = []modelMapping{
 	{"claude-sonnet-4.5", "claude-sonnet-4.5"},
 	{"claude-sonnet-4-6", "claude-sonnet-4.6"},
 	{"claude-sonnet-4.6", "claude-sonnet-4.6"},
-	{"claude-opus-4-7", "claude-opus-4-7"},
-    {"claude-opus-4.7", "claude-opus-4-7"},
+	{"claude-opus-4-7", "claude-opus-4.7"},
+	{"claude-opus-4.7", "claude-opus-4.7"},
 	{"claude-haiku-4-5", "claude-haiku-4.5"},
 	{"claude-haiku-4.5", "claude-haiku-4.5"},
 	{"claude-opus-4-5", "claude-opus-4.5"},
@@ -46,6 +46,7 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
 const minimalFallbackUserContent = "."
+const toolResultsContinuationPrefix = "Tool results:"
 
 // ParseModelAndThinking 解析模型名称，返回实际模型和是否启用 thinking
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
@@ -72,7 +73,20 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		return model, thinking
 	}
 
-	return "claude-sonnet-4.5", thinking
+	return model, thinking
+}
+
+func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {
+	actualModel, suffixThinking := ParseModelAndThinking(model, thinkingSuffix)
+	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+}
+
+func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
+	if thinkingCfg == nil {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(thinkingCfg.Type))
+	return kind == "enabled" || kind == "adaptive"
 }
 
 func MapModel(model string) string {
@@ -83,15 +97,22 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ClaudeMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	System      interface{}     `json:"system,omitempty"` // string or []SystemBlock
-	Tools       []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+	Model       string                `json:"model"`
+	Messages    []ClaudeMessage       `json:"messages"`
+	MaxTokens   int                   `json:"max_tokens"`
+	Temperature float64               `json:"temperature,omitempty"`
+	TopP        float64               `json:"top_p,omitempty"`
+	Stream      bool                  `json:"stream,omitempty"`
+	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Tools       []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+}
+
+type ClaudeThinkingConfig struct {
+	Type         string `json:"type,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Display      string `json:"display,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -103,6 +124,7 @@ type ClaudeContentBlock struct {
 	Type      string       `json:"type"`
 	Text      string       `json:"text,omitempty"`
 	Thinking  string       `json:"thinking,omitempty"`
+	Signature string       `json:"signature,omitempty"`
 	ID        string       `json:"id,omitempty"`
 	Name      string       `json:"name,omitempty"`
 	Input     interface{}  `json:"input,omitempty"`
@@ -134,9 +156,17 @@ type ClaudeResponse struct {
 	Usage        ClaudeUsage          `json:"usage"`
 }
 
+type ClaudeCacheCreationUsage struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens,omitempty"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens,omitempty"`
+}
+
 type ClaudeUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int                       `json:"input_tokens"`
+	OutputTokens             int                       `json:"output_tokens"`
+	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
+	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -148,12 +178,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := extractSystemPrompt(req.System)
-
-	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
-	}
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -175,7 +200,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			} else {
 				userMsg := KiroUserInputMessage{
 					Content: content,
-					// ModelID: modelID,
+					ModelID: modelID,
 					Origin:  origin,
 				}
 				if len(images) > 0 {
@@ -201,16 +226,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// 确保 history 以 user 开始
-	if len(history) > 0 && history[0].AssistantResponseMessage != nil {
-		history = append([]KiroHistoryMessage{{
-			UserInputMessage: &KiroUserInputMessage{
-				Content: "Begin conversation",
-				// ModelID: modelID,
-				Origin:  origin,
-			},
-		}}, history...)
-	}
+	history = trimLeadingAssistantHistory(history)
 
 	// 构建最终内容
 	finalContent := ""
@@ -236,7 +252,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
-		// ModelID: modelID,
+		ModelID: modelID,
 		Origin:  origin,
 		Images:  currentImages,
 	}
@@ -261,6 +277,88 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	return payload
+}
+
+func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+	systemPrompt := extractSystemPrompt(system)
+	if !thinking {
+		return systemPrompt
+	}
+	if systemPrompt == "" {
+		return ThinkingModePrompt
+	}
+	return ThinkingModePrompt + "\n\n" + systemPrompt
+}
+
+func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeRequest {
+	if req == nil {
+		return nil
+	}
+
+	cloned := *req
+	if thinking {
+		cloned.System = prependThinkingSystem(req.System)
+	}
+	return &cloned
+}
+
+func prependThinkingSystem(system interface{}) interface{} {
+	thinkingText := ThinkingModePrompt
+	if hasClaudeSystemContent(system) {
+		thinkingText += "\n"
+	}
+	thinkingBlock := map[string]interface{}{
+		"type": "text",
+		"text": thinkingText,
+	}
+
+	switch v := system.(type) {
+	case nil:
+		return []interface{}{thinkingBlock}
+	case string:
+		if v == "" {
+			return []interface{}{thinkingBlock}
+		}
+		return []interface{}{
+			thinkingBlock,
+			map[string]interface{}{
+				"type": "text",
+				"text": v,
+			},
+		}
+	case []interface{}:
+		blocks := make([]interface{}, 0, len(v)+1)
+		blocks = append(blocks, thinkingBlock)
+		blocks = append(blocks, v...)
+		return blocks
+	case []string:
+		blocks := make([]interface{}, 0, len(v)+1)
+		blocks = append(blocks, thinkingBlock)
+		for _, block := range v {
+			blocks = append(blocks, map[string]interface{}{
+				"type": "text",
+				"text": block,
+			})
+		}
+		return blocks
+	default:
+		return []interface{}{thinkingBlock}
+	}
+}
+
+func hasClaudeSystemContent(system interface{}) bool {
+	switch v := system.(type) {
+	case nil:
+		return false
+	case string:
+		return v != ""
+	case []interface{}:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	default:
+		return true
+	}
 }
 
 func extractSystemPrompt(system interface{}) string {
@@ -459,10 +557,10 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content, thinkingContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
-	if thinkingContent != "" {
+	if thinkingContent != "" || includeEmptyThinkingBlock {
 		blocks = append(blocks, ClaudeContentBlock{
 			Type:     "thinking",
 			Thinking: thinkingContent,
@@ -615,7 +713,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 				history = append(history, KiroHistoryMessage{
 					UserInputMessage: &KiroUserInputMessage{
 						Content: content,
-						// ModelID: modelID,
+						ModelID: modelID,
 						Origin:  origin,
 						Images:  images,
 					},
@@ -661,7 +759,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 					history = append(history, KiroHistoryMessage{
 						UserInputMessage: &KiroUserInputMessage{
 							Content: buildToolResultsContinuation(currentToolResults),
-							// ModelID: modelID,
+							ModelID: modelID,
 							Origin:  origin,
 							UserInputMessageContext: &UserInputMessageContext{
 								ToolResults: currentToolResults,
@@ -698,7 +796,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
-		// ModelID: modelID,
+		ModelID: modelID,
 		Origin:  origin,
 		Images:  currentImages,
 	}
@@ -832,11 +930,25 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 		return minimalFallbackUserContent
 	}
 
-	joined := strings.Join(parts, "\n\n")
+	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
 	if len(joined) > 4000 {
 		return joined[:4000]
 	}
 	return joined
+}
+
+func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
+	idx := 0
+	for idx < len(history) && history[idx].AssistantResponseMessage != nil {
+		idx++
+	}
+	if idx == 0 {
+		return history
+	}
+	if idx >= len(history) {
+		return nil
+	}
+	return history[idx:]
 }
 
 func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
@@ -849,15 +961,7 @@ func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
 			return strings.TrimSpace(text)
 		}
 		if len(toolResults) > 0 {
-			return buildToolResultsContinuation(toolResults)
-		}
-	}
-
-	for _, msg := range messages {
-		if strings.TrimSpace(msg.Role) != "" {
-			if text := extractOpenAIMessageText(msg.Content); strings.TrimSpace(text) != "" {
-				return strings.TrimSpace(text)
-			}
+			continue
 		}
 	}
 
@@ -875,23 +979,30 @@ func firstOpenAIConversationAnchor(messages []OpenAIMessage) string {
 		}
 	}
 
-	for _, msg := range messages {
-		text := extractOpenAIMessageText(msg.Content)
-		if strings.TrimSpace(text) != "" {
-			return strings.TrimSpace(text)
-		}
-	}
-
 	return ""
 }
 
 func buildConversationID(modelID, systemPrompt, anchor string) string {
 	anchor = strings.TrimSpace(anchor)
-	if anchor == "" {
+	if isSyntheticConversationAnchor(anchor) {
 		return uuid.New().String()
 	}
 	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+}
+
+func isSyntheticConversationAnchor(anchor string) bool {
+	if strings.TrimSpace(anchor) == "" {
+		return true
+	}
+
+	normalized := strings.ToLower(strings.Join(strings.Fields(anchor), " "))
+	switch normalized {
+	case ".", "begin conversation", "please analyze the attached image.", strings.ToLower(minimalFallbackUserContent):
+		return true
+	default:
+		return false
+	}
 }
 
 func extractOpenAITextPart(part map[string]interface{}) (string, bool) {

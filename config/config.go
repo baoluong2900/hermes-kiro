@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 )
 
@@ -49,6 +50,7 @@ type Account struct {
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
+	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
 
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
@@ -98,7 +100,10 @@ type Config struct {
 	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
 	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
 	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
-	Accounts      []Account `json:"accounts"`         // Registered Kiro accounts
+	KiroVersion   string    `json:"kiroVersion,omitempty"`
+	SystemVersion string    `json:"systemVersion,omitempty"`
+	NodeVersion   string    `json:"nodeVersion,omitempty"`
+	Accounts      []Account `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -107,6 +112,12 @@ type Config struct {
 
 	// Endpoint configuration: "auto", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
+
+	// Proxy configuration: optional outbound proxy for Kiro API requests
+	// Format: "socks5://host:port", "socks5://user:pass@host:port",
+	//         "http://host:port",  "http://user:pass@host:port"
+	// Leave empty to connect directly.
+	ProxyURL string `json:"proxyURL,omitempty"`
 
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
@@ -136,8 +147,8 @@ type AccountInfo struct {
 	TrialExpiresAt    int64
 }
 
-// Version 当前版本号
-const Version = "1.0.3"
+// Version current version
+const Version = "1.0.6"
 
 var (
 	cfg     *Config
@@ -262,6 +273,18 @@ func UpdateAccount(id string, account Account) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i] = account
+			return Save()
+		}
+	}
+	return nil
+}
+
+func UpdateAccountProfileArn(id, profileArn string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ProfileArn = profileArn
 			return Save()
 		}
 	}
@@ -443,4 +466,65 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
 	return Save()
+}
+
+// GetProxyURL 获取出站代理地址
+func GetProxyURL() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.ProxyURL
+}
+
+// UpdateProxySettings 更新出站代理配置
+func UpdateProxySettings(proxyURL string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ProxyURL = proxyURL
+	return Save()
+}
+
+type KiroClientConfig struct {
+	KiroVersion   string
+	SystemVersion string
+	NodeVersion   string
+}
+
+func GetKiroClientConfig() KiroClientConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	kiroVersion := "0.11.107"
+	if cfg != nil && cfg.KiroVersion != "" {
+		kiroVersion = cfg.KiroVersion
+	}
+
+	systemVersion := ""
+	if cfg != nil {
+		systemVersion = cfg.SystemVersion
+	}
+	if systemVersion == "" {
+		systemVersion = defaultSystemVersion()
+	}
+
+	nodeVersion := "22.22.0"
+	if cfg != nil && cfg.NodeVersion != "" {
+		nodeVersion = cfg.NodeVersion
+	}
+
+	return KiroClientConfig{
+		KiroVersion:   kiroVersion,
+		SystemVersion: systemVersion,
+		NodeVersion:   nodeVersion,
+	}
+}
+
+func defaultSystemVersion() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win32#10.0.22631"
+	case "darwin":
+		return "darwin#24.6.0"
+	default:
+		return "linux#6.6.87"
+	}
 }

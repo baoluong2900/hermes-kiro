@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"kiro-api-proxy/auth"
-	"kiro-api-proxy/config"
-	"kiro-api-proxy/pool"
+	"kiro-go/auth"
+	"kiro-go/config"
+	"kiro-go/pool"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +33,7 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	promptCache     *promptCacheTracker
 }
 
 type thinkingStreamSource int
@@ -61,7 +62,153 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
+func validateClaudeRequestShape(req *ClaudeRequest) string {
+	if len(req.Messages) == 0 {
+		return "messages must not be empty"
+	}
+	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
+		return msg
+	}
+
+	hasUserContext := false
+	lastRole := ""
+	for _, msg := range req.Messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		lastRole = role
+		if role != "user" {
+			continue
+		}
+
+		text, images, toolResults := extractClaudeUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0) != "" || len(toolResults) > 0 {
+			hasUserContext = true
+		}
+	}
+
+	if lastRole == "assistant" {
+		return "assistant-prefill final message is not supported; last message must be user"
+	}
+	if !hasUserContext {
+		return "at least one non-empty user message is required"
+	}
+	return ""
+}
+
+func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int) string {
+	if thinking == nil {
+		return ""
+	}
+
+	kind := strings.ToLower(strings.TrimSpace(thinking.Type))
+	switch kind {
+	case "enabled":
+		if maxTokens == 0 {
+			return "thinking.type enabled cannot be used with max_tokens=0"
+		}
+		if thinking.BudgetTokens <= 0 {
+			return "thinking.budget_tokens is required when thinking.type is enabled"
+		}
+		if thinking.BudgetTokens < 1024 {
+			return "thinking.budget_tokens must be at least 1024"
+		}
+		if maxTokens > 0 && thinking.BudgetTokens >= maxTokens {
+			return "thinking.budget_tokens must be less than max_tokens"
+		}
+	case "adaptive":
+		if thinking.BudgetTokens != 0 {
+			return "thinking.budget_tokens is not supported when thinking.type is adaptive"
+		}
+	case "disabled":
+		if thinking.BudgetTokens != 0 {
+			return "thinking.budget_tokens is not supported when thinking.type is disabled"
+		}
+	default:
+		return "thinking.type must be one of: enabled, adaptive, disabled"
+	}
+
+	display := strings.ToLower(strings.TrimSpace(thinking.Display))
+	if display != "" && display != "summarized" && display != "omitted" {
+		return "thinking.display must be one of: summarized, omitted"
+	}
+	if kind == "disabled" && display != "" {
+		return "thinking.display is not supported when thinking.type is disabled"
+	}
+
+	return ""
+}
+
+type claudeThinkingResponseOptions struct {
+	Format      string
+	OmitDisplay bool
+}
+
+func resolveClaudeThinkingResponseOptions(thinking *ClaudeThinkingConfig, defaultFormat string) claudeThinkingResponseOptions {
+	opts := claudeThinkingResponseOptions{Format: defaultFormat}
+	if opts.Format == "" {
+		opts.Format = "thinking"
+	}
+	if thinking == nil {
+		return opts
+	}
+
+	display := strings.ToLower(strings.TrimSpace(thinking.Display))
+	switch display {
+	case "summarized":
+		opts.Format = "thinking"
+	case "omitted":
+		opts.Format = "thinking"
+		opts.OmitDisplay = true
+	}
+
+	return opts
+}
+
+func validateOpenAIRequestShape(req *OpenAIRequest) string {
+	if len(req.Messages) == 0 {
+		return "messages must not be empty"
+	}
+
+	hasNonSystem := false
+	hasUserContext := false
+	lastRole := ""
+	for _, msg := range req.Messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		if role != "system" {
+			hasNonSystem = true
+			lastRole = role
+		}
+
+		if role != "user" {
+			continue
+		}
+		text, images := extractOpenAIUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0) != "" {
+			hasUserContext = true
+		}
+	}
+
+	if !hasNonSystem {
+		return "at least one non-system message is required"
+	}
+	if lastRole == "assistant" {
+		return "assistant-prefill final message is not supported; last message must be user or tool"
+	}
+	if !hasUserContext {
+		return "at least one non-empty user message is required"
+	}
+	return ""
+}
+
 func NewHandler() *Handler {
+	// 启动时应用代理配置
+	applyProxyConfig(config.GetProxyURL())
+
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
 		pool:            pool.GetPool(),
@@ -73,6 +220,7 @@ func NewHandler() *Handler {
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
+		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -268,36 +416,20 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
+	if len(cached) == 0 {
+		h.refreshModelsCache()
+		h.modelsCacheMu.RLock()
+		cached = h.cachedModels
+		h.modelsCacheMu.RUnlock()
+	}
 
 	thinkingSuffix := config.GetThinkingConfig().Suffix
 
-	var models []map[string]interface{}
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
-	} else {
-		// fallback 静态列表
-		models = []map[string]interface{}{
-			buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-			buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-opus-4.6", "anthropic", true),
-			buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-	        buildModelInfo("claude-opus-4-7", "anthropic", true),
-            buildModelInfo("claude-opus-4-7"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-			buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-sonnet-4", "anthropic", true),
-			buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-haiku-4.5", "anthropic", true),
-			buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-			buildModelInfo("claude-opus-4.5", "anthropic", true),
-			buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
-		}
+	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	if len(models) == 0 {
+		models = fallbackAnthropicModels(thinkingSuffix)
 	}
+
 	// 添加别名模型
 	models = append(models,
 		buildModelInfo("auto", "kiro-proxy", true),
@@ -310,6 +442,43 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   models,
 	})
+	return
+}
+
+func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
+	if len(cached) == 0 {
+		return nil
+	}
+
+	models := make([]map[string]interface{}, 0, len(cached)*2)
+	if len(cached) > 0 {
+		for _, m := range cached {
+			supportsImage := modelSupportsImage(m.InputTypes)
+			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
+			// 自动生成 thinking 变体
+			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+		}
+	}
+	return models
+}
+
+func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
+	return []map[string]interface{}{
+		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
+		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.6", "anthropic", true),
+		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.7", "anthropic", true),
+		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
+		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-4", "anthropic", true),
+		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-haiku-4.5", "anthropic", true),
+		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.5", "anthropic", true),
+		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+	}
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -357,29 +526,104 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
 func (h *Handler) refreshModelsCache() {
-	account := h.pool.GetNext()
-	if account == nil {
+	accounts := config.GetEnabledAccounts()
+	if len(accounts) == 0 {
 		return
 	}
 
-	// 确保 token 有效
-	if err := h.ensureValidToken(account); err != nil {
-		return
+	aggregated := make([]ModelInfo, 0)
+	for i := range accounts {
+		account := &accounts[i]
+		if err := h.ensureValidToken(account); err != nil {
+			fmt.Printf("[ModelsCache] Skip %s token refresh failed: %v\n", account.Email, err)
+			continue
+		}
+
+		models, err := ListAvailableModels(account)
+		if err != nil {
+			fmt.Printf("[ModelsCache] Failed to refresh for %s: %v\n", account.Email, err)
+			continue
+		}
+		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
-	models, err := ListAvailableModels(account)
-	if err != nil {
-		fmt.Printf("[ModelsCache] Failed to refresh: %v\n", err)
-		return
-	}
-
-	if len(models) > 0 {
+	if len(aggregated) > 0 {
 		h.modelsCacheMu.Lock()
-		h.cachedModels = models
+		h.cachedModels = aggregated
 		h.modelsCacheTime = time.Now().Unix()
 		h.modelsCacheMu.Unlock()
-		fmt.Printf("[ModelsCache] Cached %d models\n", len(models))
+		fmt.Printf("[ModelsCache] Cached %d models\n", len(aggregated))
 	}
+}
+
+func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
+	if len(incoming) == 0 {
+		return existing
+	}
+
+	indexByID := make(map[string]int, len(existing))
+	merged := make([]ModelInfo, len(existing))
+	copy(merged, existing)
+	for i, model := range merged {
+		indexByID[strings.ToLower(strings.TrimSpace(model.ModelId))] = i
+	}
+
+	for _, model := range incoming {
+		key := strings.ToLower(strings.TrimSpace(model.ModelId))
+		if key == "" {
+			continue
+		}
+		if idx, ok := indexByID[key]; ok {
+			merged[idx] = mergeModelInfo(merged[idx], model)
+			continue
+		}
+		indexByID[key] = len(merged)
+		merged = append(merged, model)
+	}
+
+	return merged
+}
+
+func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
+	if base.ModelName == "" {
+		base.ModelName = extra.ModelName
+	}
+	if base.Description == "" {
+		base.Description = extra.Description
+	}
+	if base.RateMultiplier == 0 {
+		base.RateMultiplier = extra.RateMultiplier
+	}
+	if base.TokenLimits == nil {
+		base.TokenLimits = extra.TokenLimits
+	}
+	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
+	return base
+}
+
+func mergeStringLists(base []string, extra []string) []string {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[string]bool, len(base)+len(extra))
+	merged := make([]string, 0, len(base)+len(extra))
+	for _, item := range base {
+		key := strings.ToLower(strings.TrimSpace(item))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		merged = append(merged, item)
+	}
+	for _, item := range extra {
+		key := strings.ToLower(strings.TrimSpace(item))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		merged = append(merged, item)
+	}
+	return merged
 }
 
 // handleCountTokens Token 计数（Claude Code 会调用）
@@ -400,8 +644,17 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
+	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 
-	estimatedTokens := estimateClaudeRequestInputTokens(&req)
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	req.Model = actualModel
+	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
+
+	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	if estimatedTokens < 1 {
 		estimatedTokens = 1
 	}
@@ -433,6 +686,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+	if msg := validateClaudeRequestShape(&req); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 
 	// 获取账号
 	account := h.pool.GetNext()
@@ -449,23 +706,27 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
-	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
+	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
+	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
+	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
+	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+	cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
-	// 流式或非流式
+	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile)
 	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -477,11 +738,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	// 获取 thinking 输出格式配置
-	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
+	thinkingFormat := thinkingOpts.Format
 
 	msgID := "msg_" + uuid.New().String()
 	var inputTokens, outputTokens int
 	var credits float64
+	var realInputTokens int
 	var toolUses []KiroToolUse
 	var nextContentIndex int
 	var rawContentBuilder strings.Builder
@@ -593,6 +855,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				"delta": map[string]string{"type": "text_delta", "text": text},
 			})
 		default:
+			if thinkingOpts.OmitDisplay {
+				if thinkingState == 1 {
+					startContentBlock("thinking")
+					return
+				}
+				if thinkingState == 3 {
+					if activeBlockType != "thinking" {
+						startContentBlock("thinking")
+					}
+					closeActiveBlock()
+				}
+				return
+			}
 			if thinkingState == 3 && text == "" {
 				if activeBlockType == "thinking" {
 					closeActiveBlock()
@@ -737,10 +1012,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]int{
-				"input_tokens":  startInputTokens,
-				"output_tokens": 0,
-			},
+			"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
 		},
 	})
 
@@ -806,6 +1078,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		OnCredits: func(c float64) {
 			credits = c
 		},
+		OnContextUsage: func(pct float64) {
+			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+		},
 	}
 
 	err := CallKiroAPI(account, payload, callback)
@@ -827,7 +1102,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 	closeActiveBlock()
 
-	inputTokens = estimatedInputTokens
+	if realInputTokens > 0 {
+		inputTokens = realInputTokens
+	} else if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	thinkingOutput := rawThinkingBuilder.String()
 	if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -841,6 +1120,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
 	stopReason := "end_turn"
@@ -853,10 +1133,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		"delta": map[string]interface{}{
 			"stop_reason": stopReason,
 		},
-		"usage": map[string]int{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 	})
 
 	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -925,12 +1202,13 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
 	var credits float64
+	var realInputTokens int
 
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
@@ -953,6 +1231,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		OnCredits: func(c float64) {
 			credits = c
 		},
+		OnContextUsage: func(pct float64) {
+			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+		},
 	}
 
 	err := CallKiroAPI(account, payload, callback)
@@ -964,35 +1245,56 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	}
 
 	// 合并 thinking 内容（如果有 reasoningContentEvent 的内容）
-	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
+	thinkingFormat := thinkingOpts.Format
 	finalContent, extractedReasoning := extractThinkingFromContent(content)
-	if thinking && thinkingContent == "" && extractedReasoning != "" {
-		thinkingContent = extractedReasoning
+	rawThinkingContent := thinkingContent
+	if thinking && rawThinkingContent == "" && extractedReasoning != "" {
+		rawThinkingContent = extractedReasoning
 	}
 	if !thinking {
-		thinkingContent = ""
+		rawThinkingContent = ""
 	}
 
-	inputTokens = estimatedInputTokens
-	outputTokens = estimateClaudeOutputTokens(finalContent, thinkingContent, toolUses)
+	if realInputTokens > 0 {
+		inputTokens = realInputTokens
+	} else if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
+	outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.promptCache.Update(account.ID, cacheProfile)
 
-	if thinking && thinkingContent != "" {
+	responseThinkingContent := rawThinkingContent
+	includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
+	if includeEmptyThinkingBlock {
+		responseThinkingContent = ""
+	}
+
+	if thinking && responseThinkingContent != "" {
 		switch thinkingFormat {
 		case "think":
-			finalContent = "<think>" + thinkingContent + "</think>" + finalContent
-			thinkingContent = ""
+			finalContent = "<think>" + responseThinkingContent + "</think>" + finalContent
+			responseThinkingContent = ""
 		case "reasoning_content":
-			finalContent = thinkingContent + finalContent // Claude 格式不支持 reasoning_content，直接拼接
-			thinkingContent = ""
+			finalContent = responseThinkingContent + finalContent // Claude 格式不支持 reasoning_content，直接拼接
+			responseThinkingContent = ""
 		default:
 		}
 	}
 
-	resp := KiroToClaudeResponse(finalContent, thinkingContent, toolUses, inputTokens, outputTokens, model)
+	resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+	if cacheProfile != nil {
+		resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
+			Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -1025,6 +1327,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
+		return
+	}
+	if msg := validateOpenAIRequestShape(&req); msg != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
 
@@ -1074,6 +1380,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	var toolCallIndex int
 	var inputTokens, outputTokens int
 	var credits float64
+	var realInputTokens int
 	var rawContentBuilder strings.Builder
 	var rawReasoningBuilder strings.Builder
 
@@ -1366,6 +1673,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		OnCredits: func(c float64) {
 			credits = c
 		},
+		OnContextUsage: func(pct float64) {
+			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+		},
 	}
 
 	err := CallKiroAPI(account, payload, callback)
@@ -1382,7 +1692,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		eventThinkingOpen = false
 	}
 
-	inputTokens = estimatedInputTokens
+	if realInputTokens > 0 {
+		inputTokens = realInputTokens
+	} else if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	reasoningOutput := rawReasoningBuilder.String()
 	if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -1436,6 +1750,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
 	var credits float64
+	var realInputTokens int
 
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
@@ -1449,6 +1764,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
 		OnCredits:  func(c float64) { credits = c },
+		OnContextUsage: func(pct float64) {
+			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+		},
 	}
 
 	err := CallKiroAPI(account, payload, callback)
@@ -1467,7 +1785,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		reasoningContent = ""
 	}
 
-	inputTokens = estimatedInputTokens
+	if realInputTokens > 0 {
+		inputTokens = realInputTokens
+	} else if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
 	outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 	h.recordSuccess(inputTokens, outputTokens, credits)
@@ -1589,6 +1911,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetEndpointConfig(w, r)
 	case path == "/endpoint" && r.Method == "POST":
 		h.apiUpdateEndpointConfig(w, r)
+	case path == "/proxy" && r.Method == "GET":
+		h.apiGetProxy(w, r)
+	case path == "/proxy" && r.Method == "POST":
+		h.apiUpdateProxy(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -1822,7 +2148,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		h.pool.Reload()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"success":   true,
 			"refreshed": successCount,
 			"failed":    failCount,
 		})
@@ -2560,6 +2886,54 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// applyProxyConfig 将代理配置应用到所有出站 HTTP 客户端（Kiro API + auth 模块）
+func applyProxyConfig(proxyURL string) {
+	InitKiroHttpClient(proxyURL)
+	auth.InitHttpClient(proxyURL)
+}
+
+// apiGetProxy 获取当前代理配置
+func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]string{
+		"proxyURL": config.GetProxyURL(),
+	})
+}
+
+// apiUpdateProxy 更新代理配置并立即生效
+func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProxyURL string `json:"proxyURL"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// 验证代理 URL 格式（非空时）
+	if req.ProxyURL != "" {
+		if !strings.HasPrefix(req.ProxyURL, "http://") &&
+			!strings.HasPrefix(req.ProxyURL, "https://") &&
+			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
+			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			return
+		}
+	}
+
+	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// 立即应用新的代理配置
+	applyProxyConfig(req.ProxyURL)
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }

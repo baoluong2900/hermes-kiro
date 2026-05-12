@@ -4,20 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"kiro-api-proxy/config"
+	"kiro-go/config"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 )
 
 const (
 	kiroRestAPIBase = "https://codewhisperer.us-east-1.amazonaws.com"
-	kiroVersion     = "0.7.45"
 )
 
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
+	url = withProfileArnQuery(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -26,8 +27,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 
 	setKiroHeaders(req, account)
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := kiroRestHttpStore.Load().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -58,8 +58,7 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 	setKiroHeaders(req, account)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := kiroRestHttpStore.Load().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +79,7 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 // ListAvailableModels 获取可用模型列表
 func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
+	url = withProfileArnQuery(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -88,8 +88,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 
 	setKiroHeaders(req, account)
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := kiroRestHttpStore.Load().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -109,22 +108,75 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	return result.Models, nil
 }
 
-func setKiroHeaders(req *http.Request, account *config.Account) {
-	machineId := account.MachineId
-	var userAgent, amzUserAgent string
-	if machineId != "" {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s-%s", kiroVersion, machineId)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s %s", kiroVersion, machineId)
-	} else {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s", kiroVersion)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s", kiroVersion)
+// ResolveProfileArn returns the account profile ARN, fetching and caching it
+// when it is missing. Some Kiro generation requests require this profile for
+// model authorization even when model listing works without it.
+func ResolveProfileArn(account *config.Account) (string, error) {
+	if account == nil {
+		return "", fmt.Errorf("account is nil")
+	}
+	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
+		return profileArn, nil
 	}
 
-	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), strings.NewReader(`{"maxResults":10}`))
+	if err != nil {
+		return "", err
+	}
+	setKiroHeaders(req, account)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := kiroRestHttpStore.Load().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Profiles []struct {
+			Arn string `json:"arn"`
+		} `json:"profiles"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	for _, profile := range result.Profiles {
+		if profileArn := strings.TrimSpace(profile.Arn); profileArn != "" {
+			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
+				fmt.Printf("[ProfileArn] Failed to cache profile ARN for %s: %v\n", account.Email, updateErr)
+			}
+			account.ProfileArn = profileArn
+			return profileArn, nil
+		}
+	}
+	return "", fmt.Errorf("no available Kiro profile")
+}
+
+func withProfileArnQuery(rawURL string, account *config.Account) string {
+	if account == nil {
+		return rawURL
+	}
+	profileArn := strings.TrimSpace(account.ProfileArn)
+	if profileArn == "" {
+		return rawURL
+	}
+	return rawURL + "&profileArn=" + neturl.QueryEscape(profileArn)
+}
+
+func setKiroHeaders(req *http.Request, account *config.Account) {
+	host := ""
+	if req.URL != nil {
+		host = req.URL.Host
+	}
+	headerValues := buildRuntimeHeaderValues(account, host)
+
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("x-amz-user-agent", amzUserAgent)
-	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	applyKiroBaseHeaders(req, account, headerValues)
 }
 
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
@@ -156,7 +208,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 
 			return nil, fmt.Errorf("Account suspended: %w", err)
 		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
-				  strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
+			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
 			// Token 相关错误，可能需要重新认证
 			fmt.Printf("[RefreshAccountInfo] Authentication error for %s: %v\n", account.Email, err)
 
@@ -286,14 +338,14 @@ type UsageLimitsResponse struct {
 }
 
 type UsageBreakdown struct {
-	ResourceType   string  `json:"resourceType"`
-	CurrentUsage   float64 `json:"currentUsage"`
-	UsageLimit     float64 `json:"usageLimit"`
-	Currency       string  `json:"currency"`
-	Unit           string  `json:"unit"`
-	OverageRate    float64 `json:"overageRate"`
-	FreeTrialInfo  *FreeTrialInfo `json:"freeTrialInfo"`
-	Bonuses        []BonusInfo    `json:"bonuses"`
+	ResourceType  string         `json:"resourceType"`
+	CurrentUsage  float64        `json:"currentUsage"`
+	UsageLimit    float64        `json:"usageLimit"`
+	Currency      string         `json:"currency"`
+	Unit          string         `json:"unit"`
+	OverageRate   float64        `json:"overageRate"`
+	FreeTrialInfo *FreeTrialInfo `json:"freeTrialInfo"`
+	Bonuses       []BonusInfo    `json:"bonuses"`
 }
 
 type FreeTrialInfo struct {

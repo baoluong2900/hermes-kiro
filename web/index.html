@@ -1018,6 +1018,34 @@
                 <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="settings.proxySettings"></span></div>
+                <div class="form-group">
+                    <label data-i18n="settings.proxyType"></label>
+                    <select id="proxyType" onchange="onProxyTypeChange()">
+                        <option value="none" data-i18n="settings.proxyNone"></option>
+                        <option value="socks5">SOCKS5</option>
+                        <option value="http">HTTP</option>
+                    </select>
+                </div>
+                <div id="proxyFields" style="display:none">
+                    <div class="form-group">
+                        <label data-i18n="settings.proxyHost"></label>
+                        <div style="display:flex;gap:8px;align-items:stretch">
+                            <input type="text" id="proxyHost" style="flex:1" placeholder="127.0.0.1">
+                            <input type="number" id="proxyPort" style="width:90px" placeholder="1080" min="1" max="65535">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.proxyAuth"></label>
+                        <div style="display:flex;gap:8px">
+                            <input type="text" id="proxyUsername" style="flex:1" data-i18n-placeholder="settings.proxyUsername" autocomplete="off">
+                            <input type="password" id="proxyPassword" style="flex:1" data-i18n-placeholder="settings.proxyPassword" autocomplete="new-password">
+                        </div>
+                    </div>
+                </div>
+                <button class="btn btn-primary" onclick="saveProxyConfig()" data-i18n="settings.saveProxy"></button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
                 <button class="btn btn-danger" onclick="resetStats()" data-i18n="settings.resetStats"></button>
             </div>
@@ -1147,6 +1175,16 @@
                 'settings.statistics': '统计',
                 'settings.resetStats': '重置统计',
                 'settings.confirmReset': '确定重置统计？',
+                'settings.proxySettings': '出站代理设置',
+                'settings.proxyType': '代理类型',
+                'settings.proxyNone': '直连（不使用代理）',
+                'settings.proxyHost': '地址 / 端口',
+                'settings.proxyAuth': '认证（可选）',
+                'settings.proxyUsername': '用户名',
+                'settings.proxyPassword': '密码',
+                'settings.proxyHostRequired': '请填写代理地址和端口',
+                'settings.saveProxy': '保存代理设置',
+                'settings.proxySaved': '代理设置已保存',
                 'api.endpoints': 'API 端点',
                 'api.modelList': '模型列表',
                 'api.stats': '统计数据',
@@ -1357,6 +1395,16 @@
                 'settings.statistics': 'Statistics',
                 'settings.resetStats': 'Reset Statistics',
                 'settings.confirmReset': 'Confirm reset statistics?',
+                'settings.proxySettings': 'Outbound Proxy Settings',
+                'settings.proxyType': 'Proxy Type',
+                'settings.proxyNone': 'Direct (no proxy)',
+                'settings.proxyHost': 'Host / Port',
+                'settings.proxyAuth': 'Authentication (optional)',
+                'settings.proxyUsername': 'Username',
+                'settings.proxyPassword': 'Password',
+                'settings.proxyHostRequired': 'Please enter proxy host and port',
+                'settings.saveProxy': 'Save Proxy Settings',
+                'settings.proxySaved': 'Proxy settings saved',
                 'api.endpoints': 'API Endpoints',
                 'api.modelList': 'Model List',
                 'api.stats': 'Statistics',
@@ -2021,6 +2069,7 @@
             document.getElementById('apiKeyInput').value = d.apiKey || '';
             loadThinkingConfig();
             loadEndpointConfig();
+            loadProxyConfig();
         }
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
@@ -2049,6 +2098,52 @@
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.endpointSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
+        }
+        async function loadProxyConfig() {
+            const res = await fetch('/admin/api/proxy', { headers: { 'X-Admin-Password': password } });
+            const d = await res.json();
+            const proxyURL = d.proxyURL || '';
+            if (!proxyURL) {
+                document.getElementById('proxyType').value = 'none';
+                document.getElementById('proxyFields').style.display = 'none';
+                return;
+            }
+            try {
+                const u = new URL(proxyURL);
+                const scheme = u.protocol.replace(':', '');
+                document.getElementById('proxyType').value = scheme.startsWith('socks5') ? 'socks5' : 'http';
+                document.getElementById('proxyHost').value = u.hostname;
+                document.getElementById('proxyPort').value = u.port;
+                document.getElementById('proxyUsername').value = decodeURIComponent(u.username);
+                document.getElementById('proxyPassword').value = decodeURIComponent(u.password);
+                document.getElementById('proxyFields').style.display = '';
+            } catch(e) {
+                document.getElementById('proxyType').value = 'none';
+                document.getElementById('proxyFields').style.display = 'none';
+            }
+        }
+        function onProxyTypeChange() {
+            const type = document.getElementById('proxyType').value;
+            document.getElementById('proxyFields').style.display = type === 'none' ? 'none' : '';
+        }
+        async function saveProxyConfig() {
+            const type = document.getElementById('proxyType').value;
+            let proxyURL = '';
+            if (type !== 'none') {
+                const host = document.getElementById('proxyHost').value.trim();
+                const port = document.getElementById('proxyPort').value.trim();
+                if (!host || !port) { alert(t('settings.proxyHostRequired')); return; }
+                const user = document.getElementById('proxyUsername').value.trim();
+                const pass = document.getElementById('proxyPassword').value.trim();
+                const auth = user ? (pass ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : `${encodeURIComponent(user)}@`) : '';
+                proxyURL = `${type}://${auth}${host}:${port}`;
+            }
+            const res = await fetch('/admin/api/proxy', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ proxyURL })
+            });
+            const d = await res.json();
+            if (d.success) { alert(t('settings.proxySaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
         function generateApiKey() {
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
