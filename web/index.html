@@ -1115,6 +1115,7 @@
                 'accounts.copyJSON': '复制 JSON',
                 'accounts.copyJSONSuccess': 'JSON 已复制到剪贴板',
                 'accounts.trialDays': '天后到期',
+                'accounts.overage': '超额',
                 'time.expired': '已过期',
                 'time.minutes': '分钟',
                 'time.hours': '小时',
@@ -1281,7 +1282,10 @@
                 'filter.banned': '已封禁',
                 'accounts.weight': '权重',
                 'detail.weight': '请求权重',
-                'detail.weightHint': '0-1=普通, 2+=高优先级'
+                'detail.weightHint': '0-1=普通, 2+=高优先级',
+                'detail.overage': '超额使用',
+                'detail.allowOverage': '允许达到主配额后继续使用',
+                'detail.overageHint': '超额后频率权重，1 最低，数字越大频率越高'
             },
             en: {
                 'login.subtitle': 'Enter admin password to login',
@@ -1321,6 +1325,7 @@
                 'accounts.confirmDelete': 'Confirm delete?',
                 'accounts.copyJSON': 'Copy JSON',
                 'accounts.copyJSONSuccess': 'JSON copied to clipboard',
+                'accounts.overage': 'Overage',
                 'time.expired': 'Expired',
                 'time.minutes': 'min',
                 'time.hours': 'hr',
@@ -1483,7 +1488,10 @@
                 'filter.banned': 'Banned',
                 'accounts.weight': 'Weight',
                 'detail.weight': 'Request Weight',
-                'detail.weightHint': '0-1=normal, 2+=higher priority'
+                'detail.weightHint': '0-1=normal, 2+=higher priority',
+                'detail.overage': 'Overage Usage',
+                'detail.allowOverage': 'Keep using after main quota is reached',
+                'detail.overageHint': 'Overage frequency weight, 1 is lowest; higher means more requests'
             }
         };
         let currentLang = localStorage.getItem('kiro_lang') || 'zh';
@@ -1749,6 +1757,7 @@
                 const isSelected = selectedAccounts.has(a.id);
                 const weightVal = a.weight || 0;
                 const weightBadge = weightVal >= 2 ? '<span class="badge" style="background:#f59e0b;color:#fff">W:' + weightVal + '</span>' : '';
+                const overageBadge = a.allowOverage ? '<span class="badge badge-warning">' + t('accounts.overage') + ':' + (a.overageWeight || 1) + '</span>' : '';
                 return '<div class="account-card" style="' + (isSelected ? 'border-color:#7c3aed;background:#faf5ff' : '') + '">' +
                     '<div class="account-header">' +
                     '<div class="account-info" style="display:flex;align-items:center;gap:8px">' +
@@ -1759,6 +1768,7 @@
                     getSubBadge(a.subscriptionType) +
                     getTrialBadge(a) +
                     weightBadge +
+                    overageBadge +
                     '<span class="badge badge-info">' + formatAuthMethod(a.provider || a.authMethod) + '</span>' +
                     getStatusBadge(a) +
                     '</div>' +
@@ -1895,6 +1905,12 @@
                 '<span style="color:#64748b;font-size:12px;flex:1">' + t('detail.weightHint') + '</span>' +
                 '<button class="btn btn-sm btn-primary" onclick="saveWeight(\'' + id + '\')">' + t('common.saved').split(' ')[0] + '</button>' +
                 '</div></div>' +
+                '<div class="detail-section"><h4>' + t('detail.overage') + '</h4><div class="machine-id-row">' +
+                '<label style="display:flex;align-items:center;gap:8px;white-space:nowrap"><label class="switch" style="margin:0"><input type="checkbox" id="allowOverageInput" ' + (a.allowOverage ? 'checked' : '') + '><span class="slider"></span></label><span style="font-size:13px">' + t('detail.allowOverage') + '</span></label>' +
+                '<input type="number" id="overageWeightInput" value="' + (a.overageWeight || 1) + '" min="1" max="10" style="width:80px">' +
+                '<span style="color:#64748b;font-size:12px;flex:1">' + t('detail.overageHint') + '</span>' +
+                '<button class="btn btn-sm btn-primary" onclick="saveOverageSettings(\'' + id + '\')">' + t('common.saved').split(' ')[0] + '</button>' +
+                '</div></div>' +
                 '<div class="detail-section"><h4>' + t('detail.subscription') + '</h4><div class="detail-grid">' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.subscriptionType') + '</div><div class="detail-value">' + (a.subscriptionTitle || a.subscriptionType || '-') + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.tokenExpiry') + '</div><div class="detail-value">' + (a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') + '</div></div>' +
@@ -1968,6 +1984,20 @@
                 const res = await fetch('/admin/api/accounts/' + id, {
                     method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
                     body: JSON.stringify({ weight })
+                });
+                const d = await res.json();
+                if (d.success) { alert(t('detail.saved')); loadAccounts(); } else { alert(t('detail.saveFailed') + ': ' + d.error); }
+            } catch (e) { alert(t('detail.saveFailed')); }
+        }
+        async function saveOverageSettings(id) {
+            const allowOverage = document.getElementById('allowOverageInput').checked;
+            let overageWeight = parseInt(document.getElementById('overageWeightInput').value) || 1;
+            overageWeight = Math.max(1, Math.min(10, overageWeight));
+            document.getElementById('overageWeightInput').value = overageWeight;
+            try {
+                const res = await fetch('/admin/api/accounts/' + id, {
+                    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ allowOverage, overageWeight })
                 });
                 const d = await res.json();
                 if (d.success) { alert(t('detail.saved')); loadAccounts(); } else { alert(t('detail.saveFailed') + ': ' + d.error); }
