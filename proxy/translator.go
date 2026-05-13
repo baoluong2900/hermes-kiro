@@ -244,11 +244,14 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	// 转换工具
-	kiroTools := convertClaudeTools(req.Tools)
+	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
 	// 构建 payload
 	payload := &KiroPayload{}
+	payload.ToolNameMap = toolNameMap
 	payload.ConversationState.ChatTriggerType = "MANUAL"
+	payload.ConversationState.AgentTaskType = "vibe"
+	payload.ConversationState.AgentContinuationId = uuid.New().String()
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
@@ -519,21 +522,115 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 	return text, toolUses
 }
 
-func convertClaudeTools(tools []ClaudeTool) []KiroToolWrapper {
+func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
 	if len(tools) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	result := make([]KiroToolWrapper, len(tools))
-	for i, tool := range tools {
+	result := make([]KiroToolWrapper, 0, len(tools))
+	nameMap := make(map[string]string)
+	for _, tool := range tools {
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
 		}
-		result[i] = KiroToolWrapper{}
-		result[i].ToolSpecification.Name = shortenToolName(tool.Name)
-		result[i].ToolSpecification.Description = desc
-		result[i].ToolSpecification.InputSchema = InputSchema{JSON: tool.InputSchema}
+		sanitized := shortenToolName(sanitizeToolName(tool.Name))
+		if sanitized != tool.Name {
+			nameMap[sanitized] = tool.Name
+		}
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = sanitized
+		w.ToolSpecification.Description = desc
+		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
+		result = append(result, w)
+	}
+	return result, nameMap
+}
+
+// ensureObjectSchema ensures the JSON schema has "type": "object" at the top level
+// and removes invalid null values from "required" fields (recursively).
+// Kiro API rejects tool schemas with "required": null.
+func ensureObjectSchema(schema interface{}) interface{} {
+	m, ok := schema.(map[string]interface{})
+	if !ok {
+		return map[string]interface{}{"type": "object"}
+	}
+	cleanSchema(m)
+	if _, hasType := m["type"]; !hasType {
+		m["type"] = "object"
+	}
+	return m
+}
+
+// cleanSchema recursively removes or fixes invalid "required": null entries
+// in a JSON Schema tree.
+func cleanSchema(m map[string]interface{}) {
+	// Fix "required" field: must be array or absent
+	if req, exists := m["required"]; exists {
+		if req == nil {
+			delete(m, "required")
+		} else if arr, ok := req.([]interface{}); ok && len(arr) == 0 {
+			delete(m, "required")
+		}
+	}
+
+	// Recurse into "properties"
+	if props, ok := m["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				cleanSchema(sub)
+			}
+		}
+	}
+
+	// Recurse into "items"
+	if items, ok := m["items"].(map[string]interface{}); ok {
+		cleanSchema(items)
+	}
+
+	// Recurse into nested object schemas (e.g., additionalProperties, allOf, oneOf, anyOf)
+	for _, key := range []string{"additionalProperties"} {
+		if sub, ok := m[key].(map[string]interface{}); ok {
+			cleanSchema(sub)
+		}
+	}
+	for _, key := range []string{"allOf", "oneOf", "anyOf"} {
+		if arr, ok := m[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					cleanSchema(sub)
+				}
+			}
+		}
+	}
+}
+
+// sanitizeToolName normalizes a tool name to characters the Kiro API accepts.
+// Kiro tool names must be pure camelCase (no underscores or dashes).
+// Separators (_, -, and multi-underscore namespace prefixes) are converted to camelCase boundaries.
+func sanitizeToolName(name string) string {
+	// Split on underscores and dashes, including multi-underscore namespace prefixes.
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return r == '_' || r == '-'
+	})
+	if len(parts) == 0 {
+		return "tool"
+	}
+	// Build camelCase: first part lowercase start, rest capitalize first letter
+	var b strings.Builder
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		if i == 0 {
+			b.WriteString(strings.ToLower(part[:1]) + part[1:])
+		} else {
+			b.WriteString(strings.ToUpper(part[:1]) + part[1:])
+		}
+	}
+	result := b.String()
+	if result == "" {
+		return "tool"
 	}
 	return result
 }

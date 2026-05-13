@@ -16,6 +16,7 @@ package main
 import (
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"kiro-go/pool"
 	"kiro-go/proxy"
 	"log"
@@ -41,6 +42,9 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
+	logger.Init(config.GetLogLevel())
+
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
@@ -54,12 +58,12 @@ func main() {
 
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
-	log.Printf("Kiro-Go starting on http://%s", addr)
-	log.Printf("Admin panel: http://%s/admin", addr)
-	log.Printf("Claude API: http://%s/v1/messages", addr)
-	log.Printf("OpenAI API: http://%s/v1/chat/completions", addr)
+	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
+	logger.Infof("Admin panel: http://%s/admin", addr)
+	logger.Infof("Claude API: http://%s/v1/messages", addr)
+	logger.Infof("OpenAI API: http://%s/v1/chat/completions", addr)
 
 	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("Server failed: %v", err)
+		logger.Fatalf("Server failed: %v", err)
 	}
 }

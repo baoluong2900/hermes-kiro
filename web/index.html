@@ -1002,11 +1002,20 @@
                     <label data-i18n="settings.preferredEndpoint"></label>
                     <select id="preferredEndpoint">
                         <option value="auto" data-i18n="settings.endpointAuto"></option>
+                        <option value="kiro">Kiro IDE</option>
                         <option value="codewhisperer">CodeWhisperer</option>
                         <option value="amazonq">AmazonQ</option>
                     </select>
                     <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
                         data-i18n="settings.endpointHint"></small>
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                        <input type="checkbox" id="endpointFallback" checked>
+                        <span data-i18n="settings.endpointFallback"></span>
+                    </label>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
+                        data-i18n="settings.endpointFallbackHint"></small>
                 </div>
                 <button class="btn btn-primary" onclick="saveEndpointConfig()"
                     data-i18n="settings.saveEndpoint"></button>
@@ -1163,6 +1172,8 @@
                 'settings.preferredEndpoint': '首选端点',
                 'settings.endpointAuto': '自动选择',
                 'settings.endpointHint': '选择首选端点，自动选择模式下会根据可用性自动选择端点',
+                'settings.endpointFallback': '端点不可用时自动切换',
+                'settings.endpointFallbackHint': '关闭后，仅使用选定的端点，不会自动切换到其他端点',
                 'settings.saveEndpoint': '保存端点设置',
                 'settings.endpointSaved': '端点设置已保存',
                 'settings.adminPassword': '管理密码',
@@ -1379,6 +1390,8 @@
                 'settings.preferredEndpoint': 'Preferred Endpoint',
                 'settings.endpointAuto': 'Auto',
                 'settings.endpointHint': 'Select preferred endpoint. In auto-select mode, the endpoint is automatically selected based on availability.',
+                'settings.endpointFallback': 'Fallback to other endpoints',
+                'settings.endpointFallbackHint': 'When disabled, only the selected endpoint is used without automatic fallback',
                 'settings.saveEndpoint': 'Save Endpoint Settings',
                 'settings.endpointSaved': 'Endpoint settings saved',
                 'settings.adminPassword': 'Admin Password',
@@ -2060,11 +2073,12 @@
             const res = await fetch('/admin/api/endpoint', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
             document.getElementById('preferredEndpoint').value = d.preferredEndpoint || 'auto';
+            document.getElementById('endpointFallback').checked = d.endpointFallback !== false;
         }
         async function saveEndpointConfig() {
             const res = await fetch('/admin/api/endpoint', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ preferredEndpoint: document.getElementById('preferredEndpoint').value })
+                body: JSON.stringify({ preferredEndpoint: document.getElementById('preferredEndpoint').value, endpointFallback: document.getElementById('endpointFallback').checked })
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.endpointSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
