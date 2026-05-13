@@ -113,6 +113,11 @@ type Config struct {
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
 
+	// AllowOverUsage allows accounts to continue serving requests even when their
+	// usage quota has been exhausted. When enabled, the pool will not skip accounts
+	// solely because usageCurrent >= usageLimit.
+	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -503,6 +508,21 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	return Save()
+}
+
+// GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
+func GetAllowOverUsage() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.AllowOverUsage
+}
+
+// UpdateAllowOverUsage sets the over-usage setting and persists the change.
+func UpdateAllowOverUsage(allow bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.AllowOverUsage = allow
 	return Save()
 }
 
