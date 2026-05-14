@@ -1898,6 +1898,9 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/test")
+		h.apiTestAccount(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models")
 		h.apiGetAccountModels(w, r, id)
@@ -2635,6 +2638,42 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGenerateMachineId(w http.ResponseWriter, r *http.Request) {
 	machineId := config.GenerateMachineId()
 	json.NewEncoder(w).Encode(map[string]string{"machineId": machineId})
+}
+
+// apiTestAccount tests connectivity for a specific account using its configured proxy.
+func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+
+	if err := h.ensureValidToken(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		return
+	}
+
+	info, err := GetUserInfo(account)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"email":   info.Email,
+		"status":  info.Status,
+	})
 }
 
 // apiRefreshAccount 刷新账户信息（使用量、订阅等）

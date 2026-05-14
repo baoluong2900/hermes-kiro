@@ -2194,31 +2194,24 @@
             const email = acc ? acc.email : id;
             const proxy = acc ? (acc.proxyURL || '\u5168\u5c40\u4ee3\u7406') : '?';
             
-            addTestLog('\u5f00\u59cb\u6d4b\u8bd5 ' + email + ' | \u6a21\u578b: ' + testModel + ' | \u4ee3\u7406: ' + proxy, 'info');
+            addTestLog('\u5f00\u59cb\u6d4b\u8bd5 ' + email + ' | \u4ee3\u7406: ' + proxy, 'info');
             
             try {
-                let apiKey = ''; try { const el = document.getElementById('apiKeyInput'); if (el && el.value) { apiKey = el.value; } if (!apiKey) { const sr = await fetch('/admin/api/settings', {headers:{'X-Admin-Password': password}}); const sd = await sr.json(); apiKey = sd.apiKey || ''; } } catch(e) {}
                 const startTime = Date.now();
-                const res = await fetch('/v1/chat/completions', {
+                const res = await fetch('/admin/api/accounts/' + id + '/test', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-                    body: JSON.stringify({ model: testModel, messages: [{ role: 'user', content: 'say ok' }], max_tokens: 5 })
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }
                 });
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 const d = await res.json();
-                if (d.choices && d.choices[0]) {
-                    const reply = d.choices[0].message.content;
-                    addTestLog('\u2713 ' + email + ' \u6210\u529f (' + elapsed + 's) \u56de\u590d: ' + reply, 'ok');
+                if (d.success) {
+                    addTestLog('\u2713 ' + email + ' \u6210\u529f (' + elapsed + 's) status: ' + d.status, 'ok');
                     btn.textContent = '\u2713';
                     btn.style.background = '#059669';
-                } else if (d.error) {
-                    addTestLog('\u2717 ' + email + ' \u5931\u8d25 (' + elapsed + 's): ' + (d.error.message || JSON.stringify(d.error)), 'err');
+                } else {
+                    addTestLog('\u2717 ' + email + ' \u5931\u8d25 (' + elapsed + 's): ' + (d.error || 'unknown'), 'err');
                     btn.textContent = '\u2717';
                     btn.style.background = '#dc2626';
-                } else {
-                    addTestLog('? ' + email + ' \u672a\u77e5\u54cd\u5e94 (' + elapsed + 's)', 'err');
-                    btn.textContent = '?';
-                    btn.style.background = '#f59e0b';
                 }
             } catch (e) {
                 addTestLog('\u2717 ' + email + ' \u5f02\u5e38: ' + e.message, 'err');
