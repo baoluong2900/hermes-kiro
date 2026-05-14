@@ -17,7 +17,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const tokenRefreshSkewSeconds int64 = 30
+const tokenRefreshSkewSeconds int64 = 120
 
 // Handler HTTP 处理器
 type Handler struct {

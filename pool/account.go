@@ -10,7 +10,7 @@ import (
 )
 
 const overageFrequencyScale = 10
-const tokenRefreshSkewSeconds int64 = 30
+const tokenRefreshSkewSeconds int64 = 120
 
 // AccountPool 账号池
 type AccountPool struct {
