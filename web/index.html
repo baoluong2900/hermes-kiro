@@ -970,6 +970,19 @@
                 <button class="btn btn-primary" onclick="saveSettings()" data-i18n="common.save"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="settings.usageSettings"></span></div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:10px">
+                        <label class="switch"><input type="checkbox" id="allowOverUsage"><span
+                                class="slider"></span></label>
+                        <span data-i18n="settings.allowOverUsage"></span>
+                    </label>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
+                        data-i18n="settings.allowOverUsageHint"></small>
+                </div>
+                <button class="btn btn-primary" onclick="saveOverUsageConfig()" data-i18n="common.save"></button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.thinkingSuffix"></label>
@@ -1173,6 +1186,10 @@
                 'settings.enableApiKey': '启用 API Key 验证',
                 'settings.apiKeyPlaceholder': '留空则不验证',
                 'settings.generateApiKey': '随机生成',
+                'settings.usageSettings': '用量控制',
+                'settings.allowOverUsage': '允许超额使用',
+                'settings.allowOverUsageHint': '开启后，即使账号额度用尽也会继续使用该账号处理请求，不再因余额不足而报错',
+                'settings.overUsageSaved': '超额使用设置已保存',
                 'settings.thinkingSettings': 'Thinking 模式设置',
                 'settings.thinkingSuffix': '触发后缀',
                 'settings.thinkingSuffixHint': '模型名称加此后缀即启用思考模式，如 claude-sonnet-4.5-thinking',
@@ -1417,6 +1434,10 @@
                 'settings.enableApiKey': 'Enable API Key Verification',
                 'settings.apiKeyPlaceholder': 'Leave empty to disable',
                 'settings.generateApiKey': 'Generate',
+                'settings.usageSettings': 'Usage Control',
+                'settings.allowOverUsage': 'Allow Over-Usage',
+                'settings.allowOverUsageHint': 'When enabled, accounts will continue to serve requests even after their quota is exhausted',
+                'settings.overUsageSaved': 'Over-usage settings saved',
                 'settings.thinkingSettings': 'Thinking Mode Settings',
                 'settings.thinkingSuffix': 'Trigger Suffix',
                 'settings.thinkingSuffixHint': 'Add this suffix to model name to enable thinking mode, e.g. claude-sonnet-4.5-thinking',
@@ -2252,6 +2273,7 @@
             const d = await res.json();
             document.getElementById('requireApiKey').checked = d.requireApiKey;
             document.getElementById('apiKeyInput').value = d.apiKey || '';
+            document.getElementById('allowOverUsage').checked = d.allowOverUsage || false;
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
@@ -2348,6 +2370,14 @@
                 body: JSON.stringify({ requireApiKey, apiKey: apiKeyInput.value })
             });
             alert(t('detail.saved'));
+        }
+        async function saveOverUsageConfig() {
+            const allowOverUsage = document.getElementById('allowOverUsage').checked;
+            await fetch('/admin/api/settings', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ allowOverUsage })
+            });
+            alert(t('settings.overUsageSaved'));
         }
         async function changePassword() {
             const newPwd = document.getElementById('newPassword').value;

@@ -1098,6 +1098,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	if err != nil {
 		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
+		h.checkOverageError(err, account.ID)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1212,6 +1213,18 @@ func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
+// checkOverageError 检测 402 超额错误，自动关闭对应账号的超额使用
+func (h *Handler) checkOverageError(err error, accountID string) {
+	if err == nil {
+		return
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "402") && strings.Contains(errMsg, "OVERAGE") {
+		logger.Warnf("[Overage] Detected overage limit error for account %s, disabling AllowOverage", accountID)
+		config.DisableAccountOverage(accountID)
+	}
+}
+
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	var content string
@@ -1251,6 +1264,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	if err != nil {
 		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+		h.checkOverageError(err, account.ID)
 		h.sendClaudeError(w, 500, "api_error", err.Error())
 		return
 	}
@@ -1693,6 +1707,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	if err != nil {
 		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+		h.checkOverageError(err, account.ID)
 		return
 	}
 
@@ -1784,6 +1799,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	if err != nil {
 		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+		h.checkOverageError(err, account.ID)
 		h.sendOpenAIError(w, 500, "server_error", err.Error())
 		return
 	}
@@ -2583,18 +2599,20 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":        config.GetApiKey(),
-		"requireApiKey": config.IsApiKeyRequired(),
-		"port":          config.GetPort(),
-		"host":          config.GetHost(),
+		"apiKey":         config.GetApiKey(),
+		"requireApiKey":  config.IsApiKeyRequired(),
+		"port":           config.GetPort(),
+		"host":           config.GetHost(),
+		"allowOverUsage": config.GetAllowOverUsage(),
 	})
 }
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey        string `json:"apiKey"`
-		RequireApiKey bool   `json:"requireApiKey"`
-		Password      string `json:"password"`
+		ApiKey         string `json:"apiKey"`
+		RequireApiKey  bool   `json:"requireApiKey"`
+		Password       string `json:"password"`
+		AllowOverUsage *bool  `json:"allowOverUsage,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2606,6 +2624,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+
+	// 更新超额使用设置
+	if req.AllowOverUsage != nil {
+		if err := config.UpdateAllowOverUsage(*req.AllowOverUsage); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
