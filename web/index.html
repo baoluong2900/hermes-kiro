@@ -930,6 +930,7 @@
                             </label>
                         </div>
                         <button class="btn btn-secondary btn-sm" onclick="showExportModal()" data-i18n="accounts.export"></button>
+                        <button class="btn btn-secondary btn-sm" onclick="refreshAllModels()" data-i18n="models.refreshAll"></button>
                         <button class="btn btn-primary btn-sm" onclick="showModal('add')" data-i18n="accounts.add"></button>
                     </div>
                 </div>
@@ -941,6 +942,7 @@
                         <button class="btn btn-sm btn-primary" onclick="batchAction('enable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.enable"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('disable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.disable"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('refresh')" style="padding:3px 10px;font-size:12px" data-i18n="batch.refresh"></button>
+                        <button class="btn btn-sm btn-secondary" onclick="batchRefreshModels()" style="padding:3px 10px;font-size:12px" data-i18n="batch.refreshModels"></button>
                         <div style="height:16px;width:1px;background:#e2e8f0;flex-shrink:0"></div>
                     </div>
                     <div style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0">
@@ -1291,6 +1293,7 @@
                 'detail.totalCredits': '总Credits',
                 'detail.models': '可用模型',
                 'detail.loadModels': '加载',
+                'detail.refreshModelCache': '刷新路由缓存',
                 'detail.loading': '加载中...',
                 'detail.noModels': '无可用模型',
                 'detail.loadFailed': '加载失败',
@@ -1376,6 +1379,9 @@
                 'common.saveFailed': '保存失败',
                 'common.logout': '退出登录',
                 'accounts.export': '导出',
+                'models.refreshAll': '刷新模型缓存',
+                'models.confirmRefreshAll': '确定为所有已启用账号刷新模型缓存？',
+                'models.refreshAllDone': '模型缓存刷新完成：成功 {0}，失败 {1}',
                 'export.title': '导出账号',
                 'export.selectAll': '全选',
                 'export.deselectAll': '取消全选',
@@ -1398,12 +1404,15 @@
                 'batch.enable': '批量启用',
                 'batch.disable': '批量禁用',
                 'batch.refresh': '批量刷新',
+                'batch.refreshModels': '批量刷新模型',
                 'batch.selected': '已选 {0} 个',
                 'batch.selectAll': '全选',
                 'batch.confirmEnable': '确定批量启用 {0} 个账号？',
                 'batch.confirmDisable': '确定批量禁用 {0} 个账号？',
                 'batch.confirmRefresh': '确定批量刷新 {0} 个账号？',
                 'batch.refreshResult': '刷新完成：成功 {0}，失败 {1}',
+                'batch.confirmRefreshModels': '确定为已选 {0} 个账号刷新模型缓存？',
+                'batch.refreshModelsResult': '模型缓存刷新完成：成功 {0}，失败 {1}',
                 'batch.done': '操作完成',
                 'filter.search': '搜索邮箱/昵称...',
                 'filter.all': '全部',
@@ -1565,6 +1574,7 @@
                 'detail.totalCredits': 'Total Credits',
                 'detail.models': 'Available Models',
                 'detail.loadModels': 'Load',
+                'detail.refreshModelCache': 'Refresh Route Cache',
                 'detail.loading': 'Loading...',
                 'detail.noModels': 'No models available',
                 'detail.loadFailed': 'Load failed',
@@ -1650,6 +1660,9 @@
                 'common.saveFailed': 'Save failed',
                 'common.logout': 'Logout',
                 'accounts.export': 'Export',
+                'models.refreshAll': 'Refresh Model Cache',
+                'models.confirmRefreshAll': 'Refresh model cache for all enabled accounts?',
+                'models.refreshAllDone': 'Model cache refresh done: {0} success, {1} failed',
                 'export.title': 'Export Accounts',
                 'export.selectAll': 'Select All',
                 'export.deselectAll': 'Deselect All',
@@ -1672,12 +1685,15 @@
                 'batch.enable': 'Batch Enable',
                 'batch.disable': 'Batch Disable',
                 'batch.refresh': 'Batch Refresh',
+                'batch.refreshModels': 'Batch Refresh Models',
                 'batch.selected': '{0} selected',
                 'batch.selectAll': 'Select All',
                 'batch.confirmEnable': 'Enable {0} accounts?',
                 'batch.confirmDisable': 'Disable {0} accounts?',
                 'batch.confirmRefresh': 'Refresh {0} accounts?',
                 'batch.refreshResult': 'Refresh done: {0} success, {1} failed',
+                'batch.confirmRefreshModels': 'Refresh model cache for {0} selected accounts?',
+                'batch.refreshModelsResult': 'Model cache refresh done: {0} success, {1} failed',
                 'batch.done': 'Done',
                 'filter.search': 'Search email/nickname...',
                 'filter.all': 'All',
@@ -1966,6 +1982,52 @@
                 alert(t('common.failed'));
             }
         }
+        async function batchRefreshModels() {
+            const ids = Array.from(selectedAccounts);
+            if (ids.length === 0) return;
+            if (!confirm(t('batch.confirmRefreshModels', ids.length))) return;
+            let success = 0, fail = 0;
+            for (const id of ids) {
+                try {
+                    const res = await fetch('/admin/api/accounts/' + id + '/models/refresh', {
+                        method: 'POST', headers: { 'X-Admin-Password': password }
+                    });
+                    const d = await res.json();
+                    if (d.success) success++; else fail++;
+                } catch { fail++; }
+            }
+            alert(t('batch.refreshModelsResult', success, fail));
+            selectedAccounts.clear();
+            updateBatchBar();
+            loadAccounts();
+        }
+        async function refreshAllModels() {
+            if (!confirm(t('models.confirmRefreshAll'))) return;
+            try {
+                const res = await fetch('/admin/api/accounts/models/refresh', {
+                    method: 'POST', headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                alert(t('models.refreshAllDone', d.refreshed || 0, d.failed || 0));
+            } catch (e) {
+                alert(t('common.failed'));
+            }
+        }
+        async function refreshAccountModels(id) {
+            try {
+                const res = await fetch('/admin/api/accounts/' + id + '/models/refresh', {
+                    method: 'POST', headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                if (d.success) {
+                    alert(t('detail.refreshModelCache') + ' OK (' + (d.count || 0) + ' models)');
+                } else {
+                    alert(t('common.failed') + ': ' + (d.error || ''));
+                }
+            } catch (e) {
+                alert(t('common.failed'));
+            }
+        }
         function renderAccounts() {
             const container = document.getElementById('accountsList');
             if (!container) return;
@@ -2163,7 +2225,7 @@
                 '<div class="detail-item"><div class="detail-label">' + t('detail.totalTokens') + '</div><div class="detail-value">' + formatNum(a.totalTokens || 0) + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.totalCredits') + '</div><div class="detail-value">' + (a.totalCredits || 0).toFixed(2) + '</div></div>' +
                 '</div></div>' +
-                '<div class="detail-section"><h4>' + t('detail.models') + ' <button class="btn btn-sm btn-secondary" onclick="loadModels(\'' + id + '\')" style="margin-left:8px">' + t('detail.loadModels') + '</button></h4><div id="modelsList" class="model-list"></div></div>';
+                '<div class="detail-section"><h4>' + t('detail.models') + ' <button class="btn btn-sm btn-secondary" onclick="loadModels(\'' + id + '\')" style="margin-left:8px">' + t('detail.loadModels') + '</button> <button class="btn btn-sm btn-secondary" onclick="refreshAccountModels(\'' + id + '\')" style="margin-left:4px">' + t('detail.refreshModelCache') + '</button></h4><div id="modelsList" class="model-list"></div></div>';
             document.getElementById('detailModal').classList.add('active');
         }
         async function loadModels(id) {

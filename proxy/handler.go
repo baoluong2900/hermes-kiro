@@ -573,6 +573,79 @@ func (h *Handler) refreshModelsCache() {
 	}
 }
 
+// fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
+// 同时更新 pool 的路由缓存与全局聚合模型列表。
+func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
+	if err := h.ensureValidToken(account); err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+	models, err := ListAvailableModels(account)
+	if err != nil {
+		return err
+	}
+	modelIDs := make([]string, 0, len(models))
+	for _, m := range models {
+		modelIDs = append(modelIDs, m.ModelId)
+	}
+	h.pool.SetModelList(account.ID, modelIDs)
+
+	// 合并到聚合缓存
+	h.modelsCacheMu.Lock()
+	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.modelsCacheTime = time.Now().Unix()
+	h.modelsCacheMu.Unlock()
+
+	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
+	return nil
+}
+
+// apiRefreshAccountModels POST /admin/api/accounts/{id}/models/refresh
+// 立即为指定账号拉取并更新模型路由缓存。
+func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request, id string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if err := h.fetchAndCacheAccountModels(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   len(h.pool.GetModelList(id)),
+	})
+}
+
+// apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
+// 立即为所有已启用账号刷新模型路由缓存（同步执行）。
+func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
+	accounts := config.GetEnabledAccounts()
+	successCount, failCount := 0, 0
+	for i := range accounts {
+		if err := h.fetchAndCacheAccountModels(&accounts[i]); err != nil {
+			logger.Warnf("[ModelsCache] Refresh failed for %s: %v", accounts[i].Email, err)
+			failCount++
+		} else {
+			successCount++
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   successCount > 0 || failCount == 0,
+		"refreshed": successCount,
+		"failed":    failCount,
+	})
+}
+
 func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
 	if len(incoming) == 0 {
 		return existing
@@ -1925,6 +1998,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/test")
 		h.apiTestAccount(w, r, id)
+	case path == "/accounts/models/refresh" && r.Method == "POST":
+		h.apiRefreshAllAccountsModels(w, r)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
+		h.apiRefreshAccountModels(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
 		h.apiGetAccountModelsCached(w, r, id)
@@ -2069,6 +2147,14 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.pool.Reload()
+	// 新账号若已启用且有 token，立即拉取并缓存模型列表
+	if account.Enabled && account.AccessToken != "" {
+		go func(acc config.Account) {
+			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
+			}
+		}(account)
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": account.ID})
 }
 
@@ -2106,6 +2192,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	// 只更新传入的字段
+	oldEnabled := existing.Enabled
 	if v, ok := updates["enabled"].(bool); ok {
 		existing.Enabled = v
 	}
@@ -2135,6 +2222,14 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	h.pool.Reload()
+	// 账号从禁用→启用时，自动拉取并缓存模型列表
+	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
+		go func(acc config.Account) {
+			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
+			}
+		}(*existing)
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -2163,8 +2258,13 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		for _, id := range req.IDs {
 			idSet[id] = true
 		}
+		var toRefreshModels []config.Account
 		for _, a := range accounts {
 			if idSet[a.ID] {
+				// 记录本次从禁用→启用、且有 token 的账号
+				if enabled && !a.Enabled && a.AccessToken != "" {
+					toRefreshModels = append(toRefreshModels, a)
+				}
 				a.Enabled = enabled
 				if enabled && a.BanStatus != "" && a.BanStatus != "ACTIVE" {
 					a.BanStatus = "ACTIVE"
@@ -2175,6 +2275,15 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		h.pool.Reload()
+		// 为本次新启用的账号异步拉取模型缓存
+		for _, acc := range toRefreshModels {
+			go func(a config.Account) {
+				a.Enabled = true
+				if err := h.fetchAndCacheAccountModels(&a); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
+				}
+			}(acc)
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
 
 	case "refresh":
@@ -2992,6 +3101,17 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+
+	// 同步更新路由缓存
+	modelIDs := make([]string, 0, len(models))
+	for _, m := range models {
+		modelIDs = append(modelIDs, m.ModelId)
+	}
+	h.pool.SetModelList(id, modelIDs)
+	h.modelsCacheMu.Lock()
+	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.modelsCacheTime = time.Now().Unix()
+	h.modelsCacheMu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
