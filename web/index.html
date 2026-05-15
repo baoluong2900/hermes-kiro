@@ -1381,7 +1381,7 @@
                 'accounts.export': '导出',
                 'models.refreshAll': '刷新模型缓存',
                 'models.confirmRefreshAll': '确定为所有已启用账号刷新模型缓存？',
-                'models.refreshAllDone': '模型缓存刷新完成：成功 {0}，失败 {1}',
+                'models.refreshAllDone': '模型缓存刷新完成，共缓存 {0} 个模型',
                 'export.title': '导出账号',
                 'export.selectAll': '全选',
                 'export.deselectAll': '取消全选',
@@ -1662,7 +1662,7 @@
                 'accounts.export': 'Export',
                 'models.refreshAll': 'Refresh Model Cache',
                 'models.confirmRefreshAll': 'Refresh model cache for all enabled accounts?',
-                'models.refreshAllDone': 'Model cache refresh done: {0} success, {1} failed',
+                'models.refreshAllDone': 'Model cache refreshed, {0} models cached',
                 'export.title': 'Export Accounts',
                 'export.selectAll': 'Select All',
                 'export.deselectAll': 'Deselect All',
@@ -2008,7 +2008,7 @@
                     method: 'POST', headers: { 'X-Admin-Password': password }
                 });
                 const d = await res.json();
-                alert(t('models.refreshAllDone', d.refreshed || 0, d.failed || 0));
+                alert(t('models.refreshAllDone', d.refreshed || 0));
             } catch (e) {
                 alert(t('common.failed'));
             }

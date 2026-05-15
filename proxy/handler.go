@@ -615,6 +615,13 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
 	}
+	// 从 pool 取运行时最新 token（与 refreshModelsCache 逻辑一致）
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+	}
 	if err := h.fetchAndCacheAccountModels(account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -627,22 +634,16 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 }
 
 // apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
-// 立即为所有已启用账号刷新模型路由缓存（同步执行）。
+// 直接复用 refreshModelsCache，为所有已启用账号刷新模型路由缓存。
 func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
-	accounts := config.GetEnabledAccounts()
-	successCount, failCount := 0, 0
-	for i := range accounts {
-		if err := h.fetchAndCacheAccountModels(&accounts[i]); err != nil {
-			logger.Warnf("[ModelsCache] Refresh failed for %s: %v", accounts[i].Email, err)
-			failCount++
-		} else {
-			successCount++
-		}
-	}
+	h.refreshModelsCache()
+	h.modelsCacheMu.RLock()
+	cachedLen := len(h.cachedModels)
+	h.modelsCacheMu.RUnlock()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   successCount > 0 || failCount == 0,
-		"refreshed": successCount,
-		"failed":    failCount,
+		"success":   true,
+		"refreshed": cachedLen,
+		"failed":    0,
 	})
 }
 
@@ -1992,17 +1993,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
+	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
+	case path == "/accounts/models/refresh" && r.Method == "POST":
+		h.apiRefreshAllAccountsModels(w, r)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
+		h.apiRefreshAccountModels(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/test")
 		h.apiTestAccount(w, r, id)
-	case path == "/accounts/models/refresh" && r.Method == "POST":
-		h.apiRefreshAllAccountsModels(w, r)
-	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
-		h.apiRefreshAccountModels(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
 		h.apiGetAccountModelsCached(w, r, id)
