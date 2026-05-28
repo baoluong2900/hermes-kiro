@@ -230,6 +230,8 @@ func NewHandler() *Handler {
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
+	// 清理过期的 stored responses（>30 天）
+	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
 }
 
@@ -371,6 +373,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleOpenAIChat(w, ar)
+	case path == "/v1/responses" || path == "/responses":
+		ar := h.authenticateForOpenAI(w, r)
+		if ar == nil {
+			return
+		}
+		h.handleOpenAIResponses(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":

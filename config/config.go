@@ -313,6 +313,24 @@ func SetPassword(password string) {
 	cfg.Password = password
 }
 
+// GetConfigDir returns the directory containing the config JSON file.
+// Useful for sibling state (e.g. stored Responses, caches) that should live
+// alongside the configuration file.
+func GetConfigDir() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfgPath == "" {
+		return "."
+	}
+	dir := cfgPath
+	for i := len(dir) - 1; i >= 0; i-- {
+		if dir[i] == '/' || dir[i] == '\\' {
+			return dir[:i]
+		}
+	}
+	return "."
+}
+
 func Get() *Config {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
