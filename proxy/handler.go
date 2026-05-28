@@ -297,29 +297,39 @@ func (h *Handler) refreshAllAccounts() {
 	h.pool.Reload()
 }
 
-// validateApiKey 验证 API Key
+// validateApiKey 验证 API Key（Bool 包装，旧签名仍被部分调用方使用）
 func (h *Handler) validateApiKey(r *http.Request) bool {
-	if !config.IsApiKeyRequired() {
-		return true
+	_, err := h.authenticate(r)
+	return err == nil
+}
+
+// authenticateForClaude runs authenticate and writes a Claude-style error on failure.
+// Returns the request with the matched API key injected into context, or nil if auth failed.
+func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) *http.Request {
+	entry, err := h.authenticate(r)
+	if err != nil {
+		ae, _ := err.(*authError)
+		if ae == nil {
+			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
+		}
+		h.sendClaudeError(w, ae.status, ae.code, ae.message)
+		return nil
 	}
+	return withApiKeyContext(r, entry)
+}
 
-	expectedKey := config.GetApiKey()
-	if expectedKey == "" {
-		return true
+// authenticateForOpenAI runs authenticate and writes an OpenAI-style error on failure.
+func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) *http.Request {
+	entry, err := h.authenticate(r)
+	if err != nil {
+		ae, _ := err.(*authError)
+		if ae == nil {
+			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
+		}
+		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
+		return nil
 	}
-
-	// 从 Authorization 头或 X-Api-Key 头获取
-	authHeader := r.Header.Get("Authorization")
-	apiKeyHeader := r.Header.Get("X-Api-Key")
-
-	var providedKey string
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		providedKey = strings.TrimPrefix(authHeader, "Bearer ")
-	} else if apiKeyHeader != "" {
-		providedKey = apiKeyHeader
-	}
-
-	return providedKey == expectedKey
+	return withApiKeyContext(r, entry)
 }
 
 // ServeHTTP 路由分发
@@ -344,23 +354,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	// API 端点（需要验证 API Key）
 	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
-		if !h.validateApiKey(r) {
-			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
+		ar := h.authenticateForClaude(w, r)
+		if ar == nil {
 			return
 		}
-		h.handleClaudeMessages(w, r)
+		h.handleClaudeMessages(w, ar)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
-		if !h.validateApiKey(r) {
-			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
+		ar := h.authenticateForClaude(w, r)
+		if ar == nil {
 			return
 		}
-		h.handleCountTokens(w, r)
+		h.handleCountTokens(w, ar)
 	case path == "/v1/chat/completions" || path == "/chat/completions":
-		if !h.validateApiKey(r) {
-			h.sendOpenAIError(w, 401, "authentication_error", "Invalid or missing API key")
+		ar := h.authenticateForOpenAI(w, r)
+		if ar == nil {
 			return
 		}
-		h.handleOpenAIChat(w, r)
+		h.handleOpenAIChat(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
@@ -798,15 +808,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// Stream or non-stream
+	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1213,7 +1224,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccess(inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1302,13 +1313,26 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 	h.addCredits(credits)
 }
 
+// recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
+// When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
+// global counters are updated. Persistence errors are logged but do not propagate.
+func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+	h.recordSuccess(inputTokens, outputTokens, credits)
+	if apiKeyID == "" {
+		return
+	}
+	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+	}
+}
+
 func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1380,7 +1404,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccess(inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1470,15 +1494,16 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
+	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1825,7 +1850,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccess(inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -1867,7 +1892,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1928,7 +1953,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccess(inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -2100,6 +2125,19 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
 		h.apiExportAccounts(w, r)
+	case path == "/api-keys" && r.Method == "GET":
+		h.apiListApiKeys(w, r)
+	case path == "/api-keys" && r.Method == "POST":
+		h.apiCreateApiKey(w, r)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/reset-usage") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/reset-usage")
+		h.apiResetApiKeyUsage(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && r.Method == "GET":
+		h.apiGetApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
+	case strings.HasPrefix(path, "/api-keys/") && r.Method == "PUT":
+		h.apiUpdateApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
+	case strings.HasPrefix(path, "/api-keys/") && r.Method == "DELETE":
+		h.apiDeleteApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	default:
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Not Found"})

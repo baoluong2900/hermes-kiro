@@ -1314,9 +1314,8 @@
     const res = await api('/settings');
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
-    $('apiKeyInput').value = d.apiKey || '';
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1399,13 +1398,19 @@
     if (d.success) toast(t('settings.proxySaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
-  async function saveApiSettings() {
+  async function saveRequireApiKey() {
     try {
       const requireApiKey = $('requireApiKey').checked;
-      const apiKeyInput = $('apiKeyInput');
-      if (requireApiKey && !apiKeyInput.value.trim()) generateApiKey();
-      if (requireApiKey && !apiKeyInput.value.trim()) return;
-      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ requireApiKey, apiKey: apiKeyInput.value }) });
+      if (requireApiKey) {
+        const hasEnabledKey = Array.isArray(apiKeysCache) && apiKeysCache.some(k => k && k.enabled);
+        if (!hasEnabledKey) {
+          if (!confirm(t('apiKeys.requireWithoutEnabledKeyWarning'))) {
+            $('requireApiKey').checked = false;
+            return;
+          }
+        }
+      }
+      const res = await api('/settings', { method: 'POST', body: JSON.stringify({ requireApiKey }) });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
       toast(t('detail.saved'), 'success');
@@ -1448,25 +1453,284 @@
       toastError((e && e.message) || t('common.failed'));
     }
   }
-  function generateApiKey() {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let k = 'sk-';
-    const cryptoApi = window.crypto || window.msCrypto;
-    if (!cryptoApi || !cryptoApi.getRandomValues) {
-      toast(t('common.failed'), 'error');
+  // Multi API Key management
+  let apiKeysCache = [];
+  let apiKeyEditingId = '';
+  let apiKeyModalSubmitting = false;
+
+  async function loadApiKeys() {
+    const list = $('apiKeysList');
+    if (!list) return;
+    try {
+      const res = await api('/api-keys');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      apiKeysCache = Array.isArray(d.apiKeys) ? d.apiKeys : [];
+      renderApiKeys();
+    } catch (e) {
+      apiKeysCache = [];
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.loadFailed')) + '</div>';
+    }
+  }
+
+  function formatNumber(n) {
+    if (n == null || isNaN(n)) return '0';
+    if (Math.abs(n) >= 1 && Math.floor(n) === n) return Number(n).toLocaleString('en-US');
+    return Number(n).toLocaleString('en-US', { maximumFractionDigits: 4 });
+  }
+
+  function usageBar(used, limit) {
+    if (!limit || limit <= 0) return '';
+    const ratio = Math.max(0, Math.min(1, used / limit));
+    const pct = (ratio * 100).toFixed(1);
+    let color = '#3b82f6';
+    if (ratio >= 0.95) color = '#ef4444';
+    else if (ratio >= 0.8) color = '#f59e0b';
+    return '<div style="height:6px;background:rgba(127,127,127,0.2);border-radius:3px;overflow:hidden;margin-top:4px;">' +
+      '<div style="height:100%;width:' + pct + '%;background:' + color + ';transition:width 0.3s;"></div>' +
+      '</div>';
+  }
+
+  function usageLine(label, used, limit, options) {
+    options = options || {};
+    const fmt = options.fmt || formatNumber;
+    if (!limit || limit <= 0) {
+      return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(t('apiKeys.unlimited')) + '</div>';
+    }
+    return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
+  }
+
+  function renderApiKeys() {
+    const list = $('apiKeysList');
+    if (!list) return;
+    if (!apiKeysCache.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
       return;
     }
-    const bytes = new Uint8Array(32);
-    const limit = Math.floor(256 / chars.length) * chars.length;
-    while (k.length < 35) {
-      cryptoApi.getRandomValues(bytes);
-      for (const b of bytes) {
-        if (b >= limit) continue;
-        k += chars.charAt(b % chars.length);
-        if (k.length >= 35) break;
-      }
+    const html = apiKeysCache.map(item => {
+      const id = escapeAttr(item.id || '');
+      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
+      const masked = escapeHtml(item.keyMasked || '');
+      const migrated = item.migrated
+        ? '<span class="text-xs" style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.migrated')) + '</span>'
+        : '';
+      const disabled = !item.enabled
+        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
+        : '';
+      const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
+      const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
+      const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
+      return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+            '<span class="font-semibold">' + name + '</span>' +
+            migrated +
+            disabled +
+            '<span class="text-xs muted-text font-mono">' + masked + '</span>' +
+          '</div>' +
+          '<div class="flex items-center gap-2">' +
+            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+              '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
+              '<span class="slider"></span>' +
+            '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
+            '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
+          '</div>' +
+        '</div>' +
+        '<div style="margin-top:0.5rem;display:grid;gap:0.35rem;">' +
+          tokensLine +
+          creditsLine +
+          requestsLine +
+        '</div>' +
+      '</div>';
+    }).join('');
+    list.innerHTML = html;
+  }
+
+  function openApiKeyModal(entry) {
+    apiKeyEditingId = entry ? (entry.id || '') : '';
+    const titleEl = $('apiKeyModalTitle');
+    titleEl.textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : 'apiKeys.modalTitleCreate');
+    $('apiKeyForm_name').value = entry ? (entry.name || '') : '';
+    const keyEl = $('apiKeyForm_key');
+    if (apiKeyEditingId) {
+      keyEl.value = entry.keyMasked || '';
+      keyEl.readOnly = true;
+    } else {
+      keyEl.value = '';
+      keyEl.readOnly = false;
     }
-    $('apiKeyInput').value = k;
+    $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
+    $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
+    $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
+    apiKeyModalSubmitting = false;
+    $('apiKeyModalSaveBtn').disabled = false;
+    openDialog('apiKeyModal');
+  }
+
+  function closeApiKeyModal() {
+    closeDialog('apiKeyModal');
+    apiKeyEditingId = '';
+    apiKeyModalSubmitting = false;
+    $('apiKeyModalSaveBtn').disabled = false;
+  }
+
+  async function submitApiKeyModal() {
+    if (apiKeyModalSubmitting) return;
+    apiKeyModalSubmitting = true;
+    const saveBtn = $('apiKeyModalSaveBtn');
+    saveBtn.disabled = true;
+    try {
+      const name = $('apiKeyForm_name').value.trim();
+      const enabled = $('apiKeyForm_enabled').checked;
+      const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
+      const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      const payload = {
+        name: name,
+        enabled: enabled,
+        tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
+        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
+      };
+      let res, d;
+      if (apiKeyEditingId) {
+        res = await api('/api-keys/' + encodeURIComponent(apiKeyEditingId), { method: 'PUT', body: JSON.stringify(payload) });
+        d = await res.json().catch(() => ({}));
+        if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+        toast(t('apiKeys.updated'), 'success');
+        closeApiKeyModal();
+        await loadApiKeys();
+      } else {
+        const keyVal = $('apiKeyForm_key').value.trim();
+        if (keyVal) payload.key = keyVal;
+        res = await api('/api-keys', { method: 'POST', body: JSON.stringify(payload) });
+        d = await res.json().catch(() => ({}));
+        if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+        toast(t('apiKeys.created'), 'success');
+        closeApiKeyModal();
+        await loadApiKeys();
+        if (d.key) showNewApiKey(d.key);
+      }
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      apiKeyModalSubmitting = false;
+      saveBtn.disabled = false;
+    }
+  }
+
+  async function toggleApiKeyEntry(id, enabled) {
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify({ enabled }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      const item = apiKeysCache.find(x => x.id === id);
+      if (item) item.enabled = enabled;
+      renderApiKeys();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      await loadApiKeys();
+    }
+  }
+
+  async function deleteApiKeyEntry(id, name) {
+    const ok = await confirmAction(t('apiKeys.confirmDelete', name || t('apiKeys.unnamed')), {
+      title: t('apiKeys.actionDelete'),
+      confirmText: t('apiKeys.actionDelete'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id), { method: 'DELETE' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('apiKeys.deleteSuccess'), 'success');
+      await loadApiKeys();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function resetApiKeyUsageEntry(id, name) {
+    const ok = await confirmAction(t('apiKeys.confirmReset', name || t('apiKeys.unnamed')), {
+      title: t('apiKeys.actionReset'),
+      confirmText: t('apiKeys.actionReset')
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/reset-usage', { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('apiKeys.usageReset'), 'success');
+      await loadApiKeys();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  function showNewApiKey(plaintext) {
+    $('apiKeyShowValue').value = plaintext || '';
+    openDialog('apiKeyShowModal');
+    setTimeout(() => {
+      const el = $('apiKeyShowValue');
+      if (el) { try { el.select(); } catch (_) { } }
+    }, 0);
+  }
+
+  function closeShowApiKeyModal() {
+    closeDialog('apiKeyShowModal');
+    $('apiKeyShowValue').value = '';
+  }
+
+  async function copyNewApiKey() {
+    const val = $('apiKeyShowValue').value;
+    if (!val) return;
+    try {
+      await copyText(val);
+      toast(t('apiKeys.copySuccess'), 'success');
+    } catch (e) {
+      toast(t('common.failed'), 'error');
+    }
+  }
+
+  function bindApiKeyEvents() {
+    const list = $('apiKeysList');
+    if (list) {
+      list.addEventListener('click', e => {
+        const btn = e.target.closest('[data-apikey-action]');
+        if (!btn) return;
+        const action = btn.dataset.apikeyAction;
+        const id = btn.dataset.id;
+        if (!id) return;
+        const entry = apiKeysCache.find(x => x.id === id);
+        const name = entry ? entry.name : '';
+        if (action === 'edit') openApiKeyModal(entry);
+        else if (action === 'delete') deleteApiKeyEntry(id, name);
+        else if (action === 'reset') resetApiKeyUsageEntry(id, name);
+      });
+      list.addEventListener('change', e => {
+        const cb = e.target.closest('input[data-apikey-action="toggle"]');
+        if (!cb) return;
+        const id = cb.dataset.id;
+        if (!id) return;
+        toggleApiKeyEntry(id, cb.checked);
+      });
+    }
+    const addBtn = $('addApiKeyBtn');
+    if (addBtn) addBtn.addEventListener('click', () => openApiKeyModal(null));
+    const saveBtn = $('apiKeyModalSaveBtn');
+    if (saveBtn) saveBtn.addEventListener('click', submitApiKeyModal);
+    const cancelBtn = $('apiKeyModalCancelBtn');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeApiKeyModal);
+    const closeBtn = $('apiKeyModalClose');
+    if (closeBtn) closeBtn.addEventListener('click', closeApiKeyModal);
+    const showCloseBtn = $('apiKeyShowCloseBtn');
+    if (showCloseBtn) showCloseBtn.addEventListener('click', closeShowApiKeyModal);
+    const showCloseX = $('apiKeyShowClose');
+    if (showCloseX) showCloseX.addEventListener('click', closeShowApiKeyModal);
+    const copyBtn = $('apiKeyShowCopyBtn');
+    if (copyBtn) copyBtn.addEventListener('click', copyNewApiKey);
+    bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
+    bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
   }
 
   // Prompt filter rules
@@ -2253,8 +2517,7 @@
   }
 
   function bindSettingsEvents() {
-    $('generateApiKeyBtn').addEventListener('click', generateApiKey);
-    $('saveApiSettingsBtn').addEventListener('click', saveApiSettings);
+    $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
@@ -2262,6 +2525,7 @@
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('resetStatsBtn').addEventListener('click', resetStats);
+    bindApiKeyEvents();
   }
 
   function bindPromptFilterEvents() {

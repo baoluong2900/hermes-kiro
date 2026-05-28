@@ -108,18 +108,41 @@ type PromptFilterRule struct {
 	Enabled bool   `json:"enabled"`           // Whether this rule is active
 }
 
+// ApiKeyEntry represents a single API key with optional usage limits and counters.
+// Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
+// automatically; operators can use the admin endpoint to manually reset them.
+type ApiKeyEntry struct {
+	ID         string `json:"id"`                 // Unique identifier (UUID)
+	Name       string `json:"name,omitempty"`     // Human-readable label
+	Key        string `json:"key"`                // The actual key value clients send
+	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
+	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
+	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
+	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+
+	// Limits (0 = unlimited)
+	TokenLimit  int64   `json:"tokenLimit,omitempty"`
+	CreditLimit float64 `json:"creditLimit,omitempty"`
+
+	// Cumulative usage (never auto-reset)
+	TokensUsed    int64   `json:"tokensUsed,omitempty"`
+	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
+	RequestsCount int64   `json:"requestsCount,omitempty"`
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string    `json:"password"`         // Admin panel password
-	Port          int       `json:"port"`             // HTTP server port (default: 8080)
-	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
-	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
-	KiroVersion   string    `json:"kiroVersion,omitempty"`
-	SystemVersion string    `json:"systemVersion,omitempty"`
-	NodeVersion   string    `json:"nodeVersion,omitempty"`
-	Accounts      []Account `json:"accounts"` // Registered Kiro accounts
+	Password      string        `json:"password"`         // Admin panel password
+	Port          int           `json:"port"`             // HTTP server port (default: 8080)
+	Host          string        `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
+	ApiKey        string        `json:"apiKey,omitempty"` // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
+	RequireApiKey bool          `json:"requireApiKey"`    // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
+	ApiKeys       []ApiKeyEntry `json:"apiKeys,omitempty"` // Multiple API keys, each with independent quota
+	KiroVersion   string        `json:"kiroVersion,omitempty"`
+	SystemVersion string        `json:"systemVersion,omitempty"`
+	NodeVersion   string        `json:"nodeVersion,omitempty"`
+	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -227,7 +250,7 @@ func Load() error {
 				RequireApiKey: false,
 				Accounts:      []Account{},
 			}
-			return Save()
+			return saveLocked()
 		}
 		return err
 	}
@@ -237,7 +260,39 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
+	// promote it into the new structure. The migrated entry inherits the legacy
+	// RequireApiKey state — if the legacy deployment was public (RequireApiKey=false),
+	// we mark the entry disabled so it doesn't accidentally start enforcing auth.
+	// Operators can flip it on later from the admin UI. The legacy field is kept
+	// for backward compatibility when reading older config files.
+	if cfg.ApiKey != "" && len(cfg.ApiKeys) == 0 {
+		cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
+			ID:        newUUID(),
+			Name:      "legacy",
+			Key:       cfg.ApiKey,
+			Enabled:   cfg.RequireApiKey,
+			Migrated:  true,
+			CreatedAt: time.Now().Unix(),
+		})
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
+// This is identical to Save() (which does not take the lock either) but is named
+// distinctly so call sites that already hold cfgLock are explicit about it.
+func saveLocked() error {
+	return Save()
+}
+
+// newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
+func newUUID() string {
+	return GenerateMachineId()
 }
 
 // Save persists the current configuration to the JSON file.
