@@ -53,26 +53,28 @@ go build -o kiro-go .
 
 ### Deploy on Zeabur
 
-This fork ships a Zeabur-friendly `Dockerfile` (multi-arch `golang:1.23-alpine` builder + `alpine:latest` runtime) so the repo can be deployed directly without extra config.
+The repo already includes a `Dockerfile`, so it builds and runs on Zeabur out of the box.
 
-Two ways to deploy:
+**Option 1: Dashboard (one-click)**
 
-1. **One-click via the Zeabur dashboard**
-   - Create a new service, choose "Deploy from GitHub", and select your fork (e.g. `xb0or/Kiro-Go`).
-   - Zeabur auto-detects the `Dockerfile` and builds the image.
-   - Expose port `8080` and bind a domain in the **Networking** tab.
-   - Set environment variables (at minimum `ADMIN_PASSWORD`) in the **Variables** tab.
-   - Mount a persistent volume to `/app/data` if you want config / accounts to survive redeploys.
+1. Fork this repo to your GitHub account.
+2. In Zeabur, create a new service and choose **Deploy from GitHub**, then select your fork.
+3. Zeabur auto-detects the `Dockerfile` and builds the image.
+4. In the **Networking** tab, expose port `8080` and bind a domain.
+5. In the **Variables** tab, set at least `ADMIN_PASSWORD` (admin panel password).
+6. Mount a Volume at `/app/data` if you want accounts / config to survive redeploys.
 
-2. **Via the Zeabur CLI** (from the project root)
-   ```bash
-   npm i -g zeabur
-   zeabur auth login
-   zeabur deploy
-   ```
-   The CLI will create `.zeabur/context.json` locally to remember the target project / service. That file is gitignored on purpose because it contains personal IDs.
+**Option 2: CLI**
 
-After the service is running, open `https://<your-domain>/admin` to log in.
+```bash
+npm i -g zeabur
+zeabur auth login
+zeabur deploy
+```
+
+> Run the commands from the project root. The CLI writes `.zeabur/context.json` to remember the target project / service — it contains personal IDs, so don't commit it.
+
+Once the service is up, open `https://<your-domain>/admin` to log in.
 
 Config is auto-created at `data/config.json`. Mount `/app/data` for persistence. The default admin password is `changeme` — override it via the `ADMIN_PASSWORD` env var or change it in the admin panel before going to production.
 

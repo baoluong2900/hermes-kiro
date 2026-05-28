@@ -146,11 +146,11 @@ type ApiKeyEntry struct {
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string        `json:"password"`         // Admin panel password
-	Port          int           `json:"port"`             // HTTP server port (default: 8080)
-	Host          string        `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string        `json:"apiKey,omitempty"` // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
-	RequireApiKey bool          `json:"requireApiKey"`    // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
+	Password      string        `json:"password"`          // Admin panel password
+	Port          int           `json:"port"`              // HTTP server port (default: 8080)
+	Host          string        `json:"host"`              // HTTP server bind address (default: 0.0.0.0)
+	ApiKey        string        `json:"apiKey,omitempty"`  // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
+	RequireApiKey bool          `json:"requireApiKey"`     // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
 	ApiKeys       []ApiKeyEntry `json:"apiKeys,omitempty"` // Multiple API keys, each with independent quota
 	KiroVersion   string        `json:"kiroVersion,omitempty"`
 	SystemVersion string        `json:"systemVersion,omitempty"`
@@ -232,7 +232,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.9"
+const Version = "1.1.0"
 
 var (
 	cfg     *Config
