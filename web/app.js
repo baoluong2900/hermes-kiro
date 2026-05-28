@@ -1968,7 +1968,7 @@
       '<p class="help-block">' + escapeHtml(t('modal.credentialsDesc')) + '</p>' +
       '<p class="help-block">' + escapeHtml(t('credentials.batchHint')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('credentials.label')) + '</label>' +
-      '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]\'></textarea>' +
+      '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
       '</div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
@@ -2046,9 +2046,12 @@
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
   async function importCredentials() {
+    const raw = $('credJson').value.trim();
+    if (!raw) { toastWarning(t('credentials.jsonError')); return; }
+    let items;
+    let skipped = 0;
     try {
-      const json = JSON.parse($('credJson').value.trim());
-      let items;
+      const json = JSON.parse(raw);
       if (json.accounts && Array.isArray(json.accounts)) {
         items = json.accounts.map(a => {
           const c = a.credentials || {};
@@ -2064,39 +2067,75 @@
       } else {
         items = Array.isArray(json) ? json : [json];
       }
-      let ok = 0, fail = 0, newIds = [];
-      for (const item of items) {
-        if (!item.refreshToken) { fail++; continue; }
-        let authMethod = item.authMethod || '';
-        if (item.clientId && item.clientSecret) authMethod = 'idc';
-        else if (!authMethod || authMethod === 'social') authMethod = 'social';
-        else authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
-        let provider = item.provider || '';
-        if (!provider && authMethod === 'social') provider = 'Google';
-        if (!provider && authMethod === 'idc') provider = 'BuilderId';
-        const payload = {
-          refreshToken: item.refreshToken,
-          accessToken: item.accessToken || '',
-          clientId: item.clientId || '',
-          clientSecret: item.clientSecret || '',
-          authMethod, provider,
-          region: item.region || 'us-east-1'
-        };
-        try {
-          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
-          const d = await res.json();
-          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
-          else fail++;
-        } catch { fail++; }
+    } catch {
+      const parsed = parseLineCredentials(raw);
+      items = parsed.items;
+      skipped = parsed.skipped;
+      if (items.length === 0 && skipped === 0) {
+        toastWarning(t('credentials.jsonError'));
+        return;
       }
-      closeModal(); loadAccounts(); loadStats();
-      let msg = t('sso.importSuccess', ok);
-      if (fail > 0) msg += t('sso.importPartial', fail);
-      toastPrimary(msg, { duration: 5200 });
-      newIds.forEach(autoRefreshNewAccount);
-    } catch (e) {
-      toastWarning(t('credentials.jsonError'));
+      if (items.length === 0) {
+        toastWarning(t('credentials.lineParseAllSkipped', skipped));
+        return;
+      }
     }
+    let ok = 0, fail = 0, newIds = [];
+    for (const item of items) {
+      if (!item.refreshToken) { fail++; continue; }
+      let authMethod = item.authMethod || '';
+      if (item.clientId && item.clientSecret) authMethod = 'idc';
+      else if (!authMethod || authMethod === 'social') authMethod = 'social';
+      else authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
+      let provider = item.provider || '';
+      if (!provider && authMethod === 'social') provider = 'Google';
+      if (!provider && authMethod === 'idc') provider = 'BuilderId';
+      const payload = {
+        refreshToken: item.refreshToken,
+        accessToken: item.accessToken || '',
+        clientId: item.clientId || '',
+        clientSecret: item.clientSecret || '',
+        authMethod, provider,
+        region: item.region || 'us-east-1'
+      };
+      try {
+        const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+        const d = await res.json();
+        if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+        else fail++;
+      } catch { fail++; }
+    }
+    closeModal(); loadAccounts(); loadStats();
+    let msg = t('sso.importSuccess', ok);
+    if (fail > 0) msg += t('sso.importPartial', fail);
+    if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
+    toastPrimary(msg, { duration: 5200 });
+    newIds.forEach(autoRefreshNewAccount);
+  }
+  function parseLineCredentials(text) {
+    const items = [];
+    let skipped = 0;
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let parts;
+      if (trimmed.includes('----')) {
+        parts = trimmed.split('----').map(s => s.trim());
+      } else if (trimmed.includes('\t')) {
+        parts = trimmed.split(/\t+/).map(s => s.trim());
+      } else {
+        parts = trimmed.split(/\s+/).map(s => s.trim());
+      }
+      if (parts.length < 5) { skipped++; continue; }
+      const refreshToken = parts[2];
+      if (!refreshToken) { skipped++; continue; }
+      items.push({
+        refreshToken,
+        clientId: parts[3],
+        clientSecret: parts[4],
+      });
+    }
+    return { items, skipped };
   }
   async function importFromCookie() {
     const refreshToken = $('cookieRefreshToken').value.trim();
