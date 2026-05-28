@@ -51,6 +51,29 @@ go build -o kiro-go .
 ./kiro-go
 ```
 
+### 部署到 Zeabur
+
+本 fork 已经提供了适配 Zeabur 的 `Dockerfile`（多架构 `golang:1.23-alpine` 构建 + `alpine:latest` 运行），可以直接部署，无需额外配置。
+
+两种部署方式：
+
+1. **Zeabur 面板一键部署**
+   - 新建服务，选择 "Deploy from GitHub"，绑定你的 fork（例如 `xb0or/Kiro-Go`）。
+   - Zeabur 会自动识别 `Dockerfile` 并构建镜像。
+   - 在 **Networking** 标签暴露端口 `8080` 并绑定域名。
+   - 在 **Variables** 标签至少设置 `ADMIN_PASSWORD`。
+   - 如需持久化账号 / 配置，挂载持久卷到 `/app/data`。
+
+2. **Zeabur CLI 部署**（在项目根目录执行）
+   ```bash
+   npm i -g zeabur
+   zeabur auth login
+   zeabur deploy
+   ```
+   CLI 会在本地生成 `.zeabur/context.json` 记录目标 project / service，该文件已加入 `.gitignore`，因为包含个人 ID，不建议提交。
+
+部署完成后访问 `https://<你的域名>/admin` 登录。
+
 首次运行会在 `data/config.json` 自动生成配置，挂载 `/app/data` 以持久化。默认管理密码为 `changeme`，生产环境请务必通过 `ADMIN_PASSWORD` 环境变量或在管理面板中修改。
 
 ## 使用方法
