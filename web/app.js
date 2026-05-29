@@ -989,6 +989,30 @@
     updateBatchBar();
     loadAccounts();
   }
+  async function batchDelete() {
+    const ids = Array.from(selectedAccounts);
+    if (!ids.length) return;
+    const confirmed = await confirmAction(t('batch.confirmDelete', ids.length), {
+      title: t('accounts.delete'),
+      confirmText: t('accounts.delete'),
+      variant: 'danger'
+    });
+    if (!confirmed) return;
+    const dismiss = toast(t('batch.deleting'), 'info', { duration: 0 });
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      try {
+        const res = await api('/accounts/' + id, { method: 'DELETE' });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d.success !== false) ok++; else fail++;
+      } catch { fail++; }
+    }
+    dismiss();
+    toast(t('batch.deleteResult', ok, fail), fail ? 'warning' : 'success', { icon: 'fa-solid fa-trash' });
+    selectedAccounts.clear();
+    updateBatchBar();
+    loadAccounts(); loadStats();
+  }
   async function refreshAllModels() {
     const ok = await confirmAction(t('models.confirmRefreshAll'), {
       title: t('models.refreshAll'),
@@ -2594,6 +2618,7 @@
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
       if (a === 'refreshModels') batchRefreshModels();
+      else if (a === 'delete') batchDelete();
       else batchAction(a);
     }));
 
