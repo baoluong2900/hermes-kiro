@@ -2447,7 +2447,8 @@
       const latest = (d.version || '').replace(/^v/i, '');
       if (!latest) throw new Error('Latest version missing');
       if (latest && latest !== current && compareVersions(latest, current) > 0) {
-        showUpdateToast('available', current, latest);
+        if (manual) showUpdateModal(latest, d.download, d.changelog);
+        else showUpdateToast('available', current, latest);
       } else if (manual) {
         showUpdateToast('current', current, latest || current);
       }
