@@ -2496,7 +2496,7 @@
       if (!latest) throw new Error('Latest version missing');
       if (latest && latest !== current && compareVersions(latest, current) > 0) {
         if (manual) showUpdateModal(latest, d.download, d.changelog);
-        else showUpdateToast('available', current, latest, d.download, d.changelog);
+        else showUpdateToast('available', current, latest);
       } else if (manual) {
         showUpdateToast('current', current, latest || current);
       }
@@ -2506,12 +2506,12 @@
       if (manual) setUpdateButtonLoading(false);
     }
   }
-  function showUpdateToast(status, current, latest, url, changelog) {
+  function showUpdateToast(status, current, latest) {
     if (status === 'available') {
       toast(t('update.availableToast') + (latest ? ': ' + latest : ''), 'warning', {
         icon: 'fa-solid fa-arrow-up',
         duration: 5200,
-        onClick: function () { showUpdateModal(latest, url, changelog); }
+        onClick: function () { checkUpdate(true); }
       });
       return;
     }
