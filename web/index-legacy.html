@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Kiro-Go</title>
+    <link rel="icon" type="image/png" href="/admin/icon.png?v=20260724">
     <style>
         * {
             box-sizing: border-box;
@@ -1306,6 +1307,21 @@
                 'modal.builderIdDesc': '通过 AWS Builder ID 授权登录添加个人账号',
                 'modal.iamTitle': 'IAM Identity Center (企业 SSO) 登录',
                 'modal.iamDesc': '通过 IAM Identity Center (企业 SSO) 授权添加企业账号',
+                'modal.microsoftTitle': 'Microsoft Enterprise SSO 登录',
+                'modal.microsoftDesc': '通过 Microsoft Entra ID 企业账号授权登录 Kiro',
+                'microsoft.instructions': '登录流程与 IAM 企业 SSO 一致：打开登录页；浏览器跳转到 localhost 失败后，复制地址栏中的完整回调 URL 并粘贴到下方。服务不会监听或暴露 3128 端口。',
+                'microsoft.loginUrl': '登录地址',
+                'microsoft.callbackUrl': '回调 URL',
+                'microsoft.callbackPlaceholder': 'http://localhost:3128/...（请粘贴完整地址）',
+                'microsoft.start': '开始登录',
+                'microsoft.continue': '继续登录',
+                'microsoft.callbackRequired': '请先粘贴完整的回调 URL',
+                'microsoft.kiroPrompt': '完成 Kiro 登录后，复制浏览器地址栏中的完整 localhost 回调 URL。',
+                'microsoft.providerPrompt': '继续完成 Microsoft 登录，再复制新的完整 localhost 回调 URL。',
+                'microsoft.selectProfile': '选择 Kiro Profile',
+                'microsoft.profileHint': '该 Microsoft 账号关联了多个 Kiro Profile，请选择要添加的一个。',
+                'microsoft.confirmProfile': '确认添加',
+                'microsoft.success': 'Microsoft Enterprise SSO 登录成功',
                 'modal.ssoTitle': 'SSO Token',
                 'modal.ssoDesc': '通过浏览器 x-amz-sso_authn Token 添加账号',
                 'modal.localTitle': 'Kiro 本地缓存',
@@ -1587,6 +1603,21 @@
                 'modal.builderIdDesc': 'Add personal account via AWS Builder ID authorization',
                 'modal.iamTitle': 'IAM Identity Center (Enterprise SSO)',
                 'modal.iamDesc': 'Add enterprise account via IAM Identity Center SSO',
+                'modal.microsoftTitle': 'Microsoft Enterprise SSO',
+                'modal.microsoftDesc': 'Authorize a Kiro enterprise account with Microsoft Entra ID',
+                'microsoft.instructions': 'This follows the IAM Enterprise SSO interaction: open the sign-in page; when the browser cannot reach localhost, copy the complete callback URL from the address bar and paste it below. The service does not listen on or expose port 3128.',
+                'microsoft.loginUrl': 'Sign-in URL',
+                'microsoft.callbackUrl': 'Callback URL',
+                'microsoft.callbackPlaceholder': 'http://localhost:3128/... (paste the complete URL)',
+                'microsoft.start': 'Start sign-in',
+                'microsoft.continue': 'Continue',
+                'microsoft.callbackRequired': 'Paste the complete callback URL first',
+                'microsoft.kiroPrompt': 'After Kiro sign-in, copy the complete localhost callback URL from the browser address bar.',
+                'microsoft.providerPrompt': 'Complete Microsoft sign-in, then copy the new complete localhost callback URL.',
+                'microsoft.selectProfile': 'Select Kiro Profile',
+                'microsoft.profileHint': 'This Microsoft account has multiple Kiro profiles. Select the one to add.',
+                'microsoft.confirmProfile': 'Add selected profile',
+                'microsoft.success': 'Microsoft Enterprise SSO sign-in succeeded',
                 'modal.ssoTitle': 'SSO Token',
                 'modal.ssoDesc': 'Add account via browser x-amz-sso_authn token',
                 'modal.localTitle': 'Kiro Local Cache',
@@ -2113,8 +2144,10 @@
 
         function formatAuthMethod(method) {
             if (!method) return '-';
-            if (method === 'idc') return 'Enterprise';
-            if (method === 'social') return 'Social';
+            const normalized = String(method).toLowerCase();
+            if (normalized === 'external_idp' || normalized === 'azuread') return t('modal.microsoftTitle');
+            if (normalized === 'idc') return 'Enterprise';
+            if (normalized === 'social') return 'Social';
             return method;
         }
         function getStatusBadge(a) {
@@ -2740,6 +2773,7 @@
                     '<div style="display:flex;flex-direction:column;gap:12px">' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'builderid\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.builderIdTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.builderIdDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'iam\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.iamTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.iamDesc') + '</div></div>' +
+                    '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'microsoft\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.microsoftTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.microsoftDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'sso\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.ssoTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.ssoDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'local\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.localTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.localDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'credentials\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.credentialsTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.credentialsDesc') + '</div></div>' +
@@ -2789,6 +2823,19 @@
                     '<div class="form-group"><label>' + t('sso.tokenLabel') + ' <span style="font-weight:normal;color:#64748b;font-size:12px">' + t('sso.tokenHint') + '</span></label><textarea id="ssoToken" placeholder="' + t('sso.tokenPlaceholder') + '" style="min-height:120px"></textarea></div>' +
                     '<div class="form-group"><label>Region</label><input type="text" id="ssoRegion" value="us-east-1"></div>' +
                     '<div class="modal-footer"><button class="btn btn-secondary" onclick="showModal(\'add\')">' + t('common.back') + '</button><button class="btn btn-primary" onclick="importSsoToken()">' + t('common.add') + '</button></div>';
+            } else if (type === 'microsoft') {
+                title.textContent = t('modal.microsoftTitle');
+                body.innerHTML =
+                    '<p style="font-size:13px;color:#64748b;margin-bottom:12px">' + t('modal.microsoftDesc') + '</p>' +
+                    '<div class="message" style="background:#eff6ff;color:#1e40af;font-size:12px;line-height:1.6;margin-bottom:16px">' + t('microsoft.instructions') + '</div>' +
+                    '<div id="microsoftLoginStep" class="hidden">' +
+                    '<div class="form-group"><label>' + t('microsoft.loginUrl') + '</label><div class="endpoint" style="margin-bottom:0"><span id="microsoftAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'microsoftAuthUrl\').textContent,\'_blank\',\'noopener\')">' + t('builderid.open') + '</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="copyMicrosoftAuthUrl()">' + t('common.copy') + '</button></div></div>' +
+                    '<p id="microsoftPrompt" style="color:#16a34a;margin:12px 0;font-size:13px"></p>' +
+                    '<div class="form-group"><label>' + t('microsoft.callbackUrl') + '</label><input type="text" id="microsoftCallback" autocomplete="off" placeholder="' + t('microsoft.callbackPlaceholder') + '"></div>' +
+                    '</div>' +
+                    '<div id="microsoftProfileStep" class="hidden"></div>' +
+                    '<div class="modal-footer" id="microsoftFooter"><button class="btn btn-secondary" onclick="cancelMicrosoftSsoAndBack()">' + t('common.back') + '</button><button class="btn btn-primary" id="microsoftBtn" onclick="advanceMicrosoftSso()">' + t('microsoft.start') + '</button></div>';
             } else if (type === 'iam') {
                 title.textContent = t('modal.iamTitle');
                 body.innerHTML =
@@ -2802,6 +2849,7 @@
         }
         function closeModal() {
             document.getElementById('addModal').classList.remove('active');
+            cancelMicrosoftSso(false);
             iamSession = '';
             if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
             builderIdSession = '';
@@ -2850,13 +2898,21 @@
                     items = json.accounts.map(a => {
                         const c = a.credentials || {};
                         return {
+                            id: a.id,
+                            email: a.email,
+                            userId: a.userId,
+                            nickname: a.nickname,
+                            profileArn: a.profileArn || c.profileArn,
+                            accessToken: c.accessToken || a.accessToken,
                             refreshToken: c.refreshToken || a.refreshToken,
                             clientId: c.clientId || a.clientId,
                             clientSecret: c.clientSecret || a.clientSecret,
                             region: c.region || a.region,
-                            // 不传 accessToken，强制后端用 refreshToken 刷新获取新 token
                             authMethod: c.authMethod || a.authMethod,
-                            provider: c.provider || a.provider || a.idp
+                            provider: c.provider || a.provider || a.idp,
+                            tokenEndpoint: c.tokenEndpoint || a.tokenEndpoint,
+                            issuerUrl: c.issuerUrl || a.issuerUrl,
+                            scopes: c.scopes || a.scopes
                         };
                     });
                 } else {
@@ -2865,20 +2921,44 @@
                 let success = 0, failed = 0, errors = [], newIds = [];
                 for (const item of items) {
                     if (!item.refreshToken) { failed++; errors.push('missing refreshToken'); continue; }
-                    // 映射 authMethod: IdC/idc -> idc, social -> social
-                    let authMethod = item.authMethod || '';
-                    if (item.clientId && item.clientSecret) {
+                    let authMethod = String(item.authMethod || '').toLowerCase();
+                    const providerName = String(item.provider || '').toLowerCase();
+                    const externalAliases = ['external_idp', 'external-idp', 'external', 'microsoft', 'm365', 'office365', 'azure', 'azuread', 'azure-ad', 'azure_ad', 'entra', 'entra-id'];
+                    const isExternal = externalAliases.includes(authMethod) ||
+                        externalAliases.includes(providerName) ||
+                        !!item.tokenEndpoint || !!item.issuerUrl;
+                    if (isExternal) {
+                        authMethod = 'external_idp';
+                    } else if (item.clientId && item.clientSecret) {
                         authMethod = 'idc';
-                    } else if (!authMethod || authMethod === 'social') {
+                    } else if (authMethod === 'social' || authMethod === 'google' || authMethod === 'github') {
                         authMethod = 'social';
+                    } else if (!authMethod) {
+                        authMethod = '';
                     } else {
-                        authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
+                        authMethod = authMethod === 'idc' ? 'idc' : 'social';
                     }
-                    // 映射 provider
                     let provider = item.provider || '';
                     if (!provider && authMethod === 'social') provider = 'Google';
                     if (!provider && authMethod === 'idc') provider = 'BuilderId';
-                    const payload = { refreshToken: item.refreshToken, accessToken: item.accessToken || '', clientId: item.clientId || '', clientSecret: item.clientSecret || '', authMethod: authMethod, provider: provider, region: item.region || 'us-east-1' };
+                    if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
+                    const payload = {
+                        id: item.id || '',
+                        email: item.email || '',
+                        userId: item.userId || '',
+                        nickname: item.nickname || '',
+                        profileArn: item.profileArn || '',
+                        refreshToken: item.refreshToken,
+                        accessToken: item.accessToken || '',
+                        clientId: item.clientId || '',
+                        clientSecret: item.clientSecret || '',
+                        authMethod: authMethod,
+                        provider: provider,
+                        region: item.region || 'us-east-1',
+                        tokenEndpoint: item.tokenEndpoint || '',
+                        issuerUrl: item.issuerUrl || '',
+                        scopes: item.scopes || ''
+                    };
                     try {
                         const res = await fetch('/admin/api/auth/credentials', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify(payload) });
                         const d = await res.json();
@@ -2952,6 +3032,200 @@
             builderIdSession = '';
             showModal('add');
         }
+
+        let microsoftSession = '';
+        let microsoftSelection = '';
+        let microsoftProfiles = [];
+        let microsoftGeneration = 0;
+        let microsoftBusy = false;
+
+        function setMicrosoftBusy(busy) {
+            microsoftBusy = busy;
+            const button = document.getElementById('microsoftBtn') || document.getElementById('microsoftProfileBtn');
+            if (button) button.disabled = busy;
+            document.querySelectorAll('#microsoftFooter .btn-secondary').forEach(button => {
+                button.disabled = busy;
+            });
+        }
+
+        function discardStaleMicrosoftSso(sessionId, selectionId) {
+            if (!sessionId && !selectionId) return;
+            fetch('/admin/api/auth/microsoft-sso/cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ sessionId: sessionId || '', selectionId: selectionId || '' })
+            }).catch(() => { });
+        }
+
+        async function cancelMicrosoftSso(returnToAdd) {
+            const sessionId = microsoftSession;
+            const selectionId = microsoftSelection;
+            microsoftGeneration++;
+            microsoftSession = '';
+            microsoftSelection = '';
+            microsoftProfiles = [];
+            microsoftBusy = false;
+            if (returnToAdd) showModal('add');
+            if (!sessionId && !selectionId) return;
+            try {
+                await fetch('/admin/api/auth/microsoft-sso/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ sessionId, selectionId })
+                });
+            } catch (_) { }
+        }
+
+        function cancelMicrosoftSsoAndBack() {
+            cancelMicrosoftSso(true);
+        }
+
+        function copyMicrosoftAuthUrl() {
+            const value = document.getElementById('microsoftAuthUrl')?.textContent || '';
+            if (!value) return;
+            navigator.clipboard.writeText(value).then(() => alert(t('common.copied')));
+        }
+
+        function showMicrosoftLoginStep(authorizeUrl, promptKey) {
+            document.getElementById('microsoftLoginStep').classList.remove('hidden');
+            document.getElementById('microsoftProfileStep').classList.add('hidden');
+            document.getElementById('microsoftAuthUrl').textContent = authorizeUrl;
+            document.getElementById('microsoftPrompt').textContent = t(promptKey);
+            document.getElementById('microsoftCallback').value = '';
+            document.getElementById('microsoftBtn').textContent = t('microsoft.continue');
+        }
+
+        async function advanceMicrosoftSso() {
+            if (microsoftBusy) return;
+            if (!microsoftSession) {
+                const generation = ++microsoftGeneration;
+                setMicrosoftBusy(true);
+                try {
+                    const res = await fetch('/admin/api/auth/microsoft-sso/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                        body: '{}'
+                    });
+                    const data = await res.json();
+                    if (generation !== microsoftGeneration) {
+                        discardStaleMicrosoftSso(data.sessionId || '', data.selectionId || '');
+                        return;
+                    }
+                    if (!res.ok || !data.sessionId || !data.authorizeUrl) {
+                        alert(t('common.failed') + ': ' + (data.error || ''));
+                        return;
+                    }
+                    microsoftSession = data.sessionId;
+                    showMicrosoftLoginStep(data.authorizeUrl, 'microsoft.kiroPrompt');
+                } catch (error) {
+                    if (generation === microsoftGeneration) alert(t('common.failed') + ': ' + error.message);
+                } finally {
+                    if (generation === microsoftGeneration) setMicrosoftBusy(false);
+                }
+                return;
+            }
+
+            const callbackInput = document.getElementById('microsoftCallback');
+            const callbackUrl = callbackInput?.value.trim() || '';
+            if (!callbackUrl) {
+                alert(t('microsoft.callbackRequired'));
+                callbackInput?.focus();
+                return;
+            }
+            const generation = microsoftGeneration;
+            const sessionId = microsoftSession;
+            setMicrosoftBusy(true);
+            try {
+                const res = await fetch('/admin/api/auth/microsoft-sso/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ sessionId, callbackUrl })
+                });
+                const data = await res.json();
+                if (generation !== microsoftGeneration) {
+                    discardStaleMicrosoftSso(sessionId, data.selectionId || '');
+                    return;
+                }
+                if (!res.ok || data.error) {
+                    alert(t('common.failed') + ': ' + (data.error || ''));
+                    return;
+                }
+                if (data.requiresProfileSelection) {
+                    microsoftSelection = data.selectionId || '';
+                    renderMicrosoftProfiles(data.profiles || []);
+                    return;
+                }
+                if (data.authorizeUrl) {
+                    showMicrosoftLoginStep(data.authorizeUrl, 'microsoft.providerPrompt');
+                    return;
+                }
+                if (data.success && data.account) {
+                    finishMicrosoftSso(data.account);
+                }
+            } catch (error) {
+                if (generation === microsoftGeneration) alert(t('common.failed') + ': ' + error.message);
+            } finally {
+                if (generation === microsoftGeneration) setMicrosoftBusy(false);
+            }
+        }
+
+        function renderMicrosoftProfiles(profiles) {
+            microsoftProfiles = Array.isArray(profiles) ? profiles.slice() : [];
+            const step = document.getElementById('microsoftProfileStep');
+            document.getElementById('microsoftLoginStep').classList.add('hidden');
+            step.classList.remove('hidden');
+            const options = microsoftProfiles.map((profile, index) => {
+                const label = (profile.name || profile.arn || t('microsoft.selectProfile')) +
+                    (profile.region ? ' (' + profile.region + ')' : '');
+                return '<option value="' + index + '">' + escapeHtml(label) + '</option>';
+            }).join('');
+            step.innerHTML =
+                '<p style="font-size:13px;color:#64748b;margin-bottom:12px">' + t('microsoft.profileHint') + '</p>' +
+                '<div class="form-group"><label>' + t('microsoft.selectProfile') + '</label><select id="microsoftProfileSelect">' + options + '</select></div>';
+            document.getElementById('microsoftFooter').innerHTML =
+                '<button class="btn btn-secondary" onclick="cancelMicrosoftSsoAndBack()">' + t('common.back') + '</button>' +
+                '<button class="btn btn-primary" id="microsoftProfileBtn" onclick="selectMicrosoftProfile()">' + t('microsoft.confirmProfile') + '</button>';
+        }
+
+        async function selectMicrosoftProfile() {
+            if (microsoftBusy || !microsoftSelection) return;
+            const index = Number(document.getElementById('microsoftProfileSelect')?.value || 0);
+            const profile = microsoftProfiles[index];
+            if (!profile?.arn) return;
+            const generation = microsoftGeneration;
+            setMicrosoftBusy(true);
+            try {
+                const res = await fetch('/admin/api/auth/microsoft-sso/select-profile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ selectionId: microsoftSelection, profileArn: profile.arn })
+                });
+                const data = await res.json();
+                if (generation !== microsoftGeneration) return;
+                if (!res.ok || !data.success) {
+                    alert(t('common.failed') + ': ' + (data.error || ''));
+                    return;
+                }
+                microsoftSelection = '';
+                finishMicrosoftSso(data.account);
+            } catch (error) {
+                if (generation === microsoftGeneration) alert(t('common.failed') + ': ' + error.message);
+            } finally {
+                if (generation === microsoftGeneration) setMicrosoftBusy(false);
+            }
+        }
+
+        function finishMicrosoftSso(account) {
+            microsoftSession = '';
+            microsoftSelection = '';
+            microsoftProfiles = [];
+            closeModal();
+            loadAccounts();
+            loadStats();
+            alert(t('microsoft.success') + ': ' + (account?.email || account?.id || ''));
+            autoRefreshNewAccount(account?.id);
+        }
+
         let iamSession = '';
         async function startIamSso() {
             if (iamSession) {
@@ -2971,6 +3245,9 @@
             }
         }
         setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
+        document.getElementById('addModal').addEventListener('click', event => {
+            if (event.target === event.currentTarget) closeModal();
+        });
 
         // ==================== 版本检查 ====================
         let currentVersion = '';

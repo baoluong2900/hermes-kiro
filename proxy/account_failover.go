@@ -4,7 +4,6 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"strings"
-	"time"
 )
 
 const maxAccountRetryAttempts = 3
@@ -50,17 +49,11 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 		return
 	}
 
-	updatedAccount := *account
-	if !updatedAccount.Enabled && updatedAccount.BanStatus == banStatus && updatedAccount.BanReason == banReason {
+	if !account.Enabled && account.BanStatus == banStatus && account.BanReason == banReason {
 		return
 	}
 
-	updatedAccount.Enabled = false
-	updatedAccount.BanStatus = banStatus
-	updatedAccount.BanReason = banReason
-	updatedAccount.BanTime = time.Now().Unix()
-
-	if err := config.UpdateAccount(account.ID, updatedAccount); err != nil {
+	if err := config.SetAccountBanStatus(account.ID, banStatus, banReason); err != nil {
 		logger.Warnf("[AccountFailover] Failed to disable %s: %v", account.Email, err)
 		return
 	}

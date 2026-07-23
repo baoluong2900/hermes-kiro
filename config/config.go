@@ -12,12 +12,20 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"sync"
 	"time"
+)
+
+var (
+	ErrAccountNotFound       = errors.New("account not found")
+	ErrDuplicateAccountID    = errors.New("account ID already exists")
+	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -41,17 +49,29 @@ type Account struct {
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
 	// Authentication credentials
-	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
-	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
-	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
-	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC) or "social" (GitHub/Google)
-	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub")
-	Region       string `json:"region"`                 // AWS region for OIDC endpoints
-	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
-	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
-	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+	AccessToken  string `json:"accessToken"`  // OAuth access token for API calls
+	RefreshToken string `json:"refreshToken"` // OAuth refresh token for token renewal
+	// RefreshTokenFingerprint is a one-way identifier for the credential that
+	// originally created this account. It prevents a previously imported token
+	// from being imported again after the provider rotates it.
+	RefreshTokenFingerprint string `json:"refreshTokenFingerprint,omitempty"`
+	ClientID                string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
+	ClientSecret            string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
+	AuthMethod              string `json:"authMethod"`             // Authentication method: "idc", "social", or "external_idp"
+	Provider                string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
+	Region                  string `json:"region"`                 // AWS region for OIDC endpoints
+	StartUrl                string `json:"startUrl,omitempty"`     // AWS SSO start URL
+	ExpiresAt               int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
+	MachineId               string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
+	ProfileArn              string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+
+	// Microsoft Enterprise SSO uses an external OAuth2 public client. These
+	// fields are deliberately separate from the AWS IdC client secret/region:
+	// Account.Region remains the AWS authentication region, while data-plane
+	// routing treats ProfileArn as authoritative whenever it is available.
+	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint
+	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer
+	Scopes        string `json:"scopes,omitempty"`        // Space-separated external IdP scopes
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -417,11 +437,77 @@ func GetEnabledAccounts() []Account {
 	return accounts
 }
 
+// RefreshTokenFingerprint returns a stable, non-reversible identifier for an
+// opaque refresh token. Empty tokens do not receive a fingerprint.
+func RefreshTokenFingerprint(refreshToken string) string {
+	if refreshToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// AccountCredentialExists checks both the current refresh token and the
+// original credential fingerprint while holding the configuration read lock.
+func AccountCredentialExists(refreshToken string) bool {
+	if refreshToken == "" {
+		return false
+	}
+	fingerprint := RefreshTokenFingerprint(refreshToken)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.RefreshToken == refreshToken ||
+			(fingerprint != "" && account.RefreshTokenFingerprint == fingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountIDExists reports whether an account ID is already persisted.
+func AccountIDExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if account.RefreshTokenFingerprint == "" {
+		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
+	}
+	for _, existing := range cfg.Accounts {
+		if account.ID != "" && existing.ID == account.ID {
+			return ErrDuplicateAccountID
+		}
+		if account.RefreshToken != "" && existing.RefreshToken == account.RefreshToken {
+			return ErrDuplicateRefreshToken
+		}
+		existingFingerprint := existing.RefreshTokenFingerprint
+		if existingFingerprint == "" {
+			existingFingerprint = RefreshTokenFingerprint(existing.RefreshToken)
+		}
+		if account.RefreshTokenFingerprint != "" &&
+			existingFingerprint == account.RefreshTokenFingerprint {
+			return ErrDuplicateRefreshToken
+		}
+	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := Save(); err != nil {
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -429,8 +515,34 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			// Current callers use UpdateAccount for administrative/status fields.
+			// Preserve the authoritative credential state so a stale account
+			// snapshot cannot overwrite a refresh-token rotation that completed
+			// while an upstream status request was in flight.
+			account.AccessToken = a.AccessToken
+			account.RefreshToken = a.RefreshToken
+			account.RefreshTokenFingerprint = a.RefreshTokenFingerprint
+			account.ClientID = a.ClientID
+			account.ClientSecret = a.ClientSecret
+			account.AuthMethod = a.AuthMethod
+			account.Provider = a.Provider
+			account.Region = a.Region
+			account.StartUrl = a.StartUrl
+			account.ExpiresAt = a.ExpiresAt
+			account.ProfileArn = a.ProfileArn
+			account.TokenEndpoint = a.TokenEndpoint
+			account.IssuerURL = a.IssuerURL
+			account.Scopes = a.Scopes
+			if account.RefreshTokenFingerprint == "" {
+				account.RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i] = account
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -469,12 +581,17 @@ func SetAccountEnabled(id string, enabled bool) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].Enabled = enabled
 			if !enabled {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -487,13 +604,39 @@ func SetAccountBanStatus(id, status, reason string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// ClearAccountBanStatus marks an account active without replacing any
+// credential fields from a potentially stale caller snapshot.
+func ClearAccountBanStatus(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, account := range cfg.Accounts {
+		if account.ID == id {
+			previous := cfg.Accounts[i]
+			cfg.Accounts[i].BanStatus = "ACTIVE"
+			cfg.Accounts[i].BanReason = ""
+			cfg.Accounts[i].BanTime = 0
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -504,8 +647,13 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i].ProfileArn
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i].ProfileArn = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -524,19 +672,44 @@ func DeleteAccount(id string) error {
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	return UpdateAccountCredentialState(id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateAccountCredentialState atomically updates all fields produced by one
+// refresh-token exchange. If persistence fails, the in-memory configuration is
+// restored so a rotated token is never published from a state that cannot
+// survive restart.
+func UpdateAccountCredentialState(
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
+			if cfg.Accounts[i].RefreshTokenFingerprint == "" {
+				cfg.Accounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
 			cfg.Accounts[i].AccessToken = accessToken
 			if refreshToken != "" {
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			if profileArn != "" {
+				cfg.Accounts[i].ProfileArn = profileArn
+			}
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
-	return nil
+	return ErrAccountNotFound
 }
 
 func GetApiKey() string {

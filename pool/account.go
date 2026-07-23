@@ -383,6 +383,20 @@ func (p *AccountPool) MarkOverLimit(id string) {
 
 // UpdateToken 更新账号 Token
 func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
+	p.UpdateCredentialState(nil, id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateCredentialState publishes one persisted refresh result to both the
+// pool and an optional caller-owned account while holding the pool lock. The
+// target may itself point into the pool.
+func (p *AccountPool) UpdateCredentialState(
+	target *config.Account,
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i := range p.accounts {
@@ -392,6 +406,19 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 				p.accounts[i].RefreshToken = refreshToken
 			}
 			p.accounts[i].ExpiresAt = expiresAt
+			if profileArn != "" {
+				p.accounts[i].ProfileArn = profileArn
+			}
+		}
+	}
+	if target != nil {
+		target.AccessToken = accessToken
+		if refreshToken != "" {
+			target.RefreshToken = refreshToken
+		}
+		target.ExpiresAt = expiresAt
+		if profileArn != "" {
+			target.ProfileArn = profileArn
 		}
 	}
 }

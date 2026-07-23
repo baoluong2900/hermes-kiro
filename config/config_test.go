@@ -55,6 +55,62 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 	}
 }
 
+func TestUpdateAccountStaleSnapshotPreservesCredentialRotation(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	account := Account{
+		ID:            "rotation-account",
+		AccessToken:   "access-1",
+		RefreshToken:  "refresh-1",
+		ClientID:      "client",
+		AuthMethod:    "external_idp",
+		Region:        "us-east-1",
+		ExpiresAt:     100,
+		ProfileArn:    "arn:aws:codewhisperer:us-east-1:123456789012:profile/one",
+		TokenEndpoint: "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+		IssuerURL:     "https://login.microsoftonline.com/tenant/v2.0",
+		Scopes:        "scope-one",
+		Enabled:       true,
+	}
+	if err := AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	stale := GetAccounts()[0]
+
+	const rotatedProfile = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/two"
+	if err := UpdateAccountCredentialState(
+		account.ID,
+		"access-2",
+		"refresh-2",
+		200,
+		rotatedProfile,
+	); err != nil {
+		t.Fatalf("rotate credential: %v", err)
+	}
+
+	stale.Enabled = false
+	stale.BanStatus = "BANNED"
+	stale.BanReason = "stale status update"
+	if err := UpdateAccount(account.ID, stale); err != nil {
+		t.Fatalf("apply stale status snapshot: %v", err)
+	}
+
+	got := GetAccounts()[0]
+	if got.AccessToken != "access-2" ||
+		got.RefreshToken != "refresh-2" ||
+		got.ExpiresAt != 200 ||
+		got.ProfileArn != rotatedProfile {
+		t.Fatalf("stale status update reverted credential state: %+v", got)
+	}
+	if got.RefreshTokenFingerprint != RefreshTokenFingerprint("refresh-1") {
+		t.Fatalf("original refresh token fingerprint = %q", got.RefreshTokenFingerprint)
+	}
+	if got.Enabled || got.BanStatus != "BANNED" || got.BanReason != "stale status update" {
+		t.Fatalf("status fields were not applied: %+v", got)
+	}
+}
+
 // TestAccountAllowOverageMigration verifies that a config.json from before the
 // upstream-Overages-switch refactor (which carried `allowOverage: true` per
 // account) is migrated into OverageStatus="ENABLED" on first load, and that

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"kiro-go/config"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -39,5 +40,40 @@ func TestBuildRuntimeHeaderValuesUsesRuntimeAPIFormat(t *testing.T) {
 	}
 	if !strings.Contains(values.UserAgent, "m/N,E") {
 		t.Fatalf("expected runtime mode marker in user agent, got %q", values.UserAgent)
+	}
+}
+
+func TestApplyKiroBaseHeadersMarksExternalIdentityProviderTokens(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://q.us-east-1.amazonaws.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &config.Account{
+		AccessToken: "external-access",
+		AuthMethod:  " External_IDP ",
+	}
+
+	applyKiroBaseHeaders(req, account, buildRuntimeHeaderValues(account, req.URL.Host))
+
+	if got := req.Header.Get("Authorization"); got != "Bearer external-access" {
+		t.Fatalf("expected bearer authorization, got %q", got)
+	}
+	if got := req.Header.Get("TokenType"); got != "EXTERNAL_IDP" {
+		t.Fatalf("expected EXTERNAL_IDP token type, got %q", got)
+	}
+}
+
+func TestApplyKiroBaseHeadersOmitsTokenTypeForAWSAuthentication(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://q.us-east-1.amazonaws.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("TokenType", "stale")
+	account := &config.Account{AccessToken: "aws-access", AuthMethod: "idc"}
+
+	applyKiroBaseHeaders(req, account, buildRuntimeHeaderValues(account, req.URL.Host))
+
+	if got := req.Header.Get("TokenType"); got != "" {
+		t.Fatalf("expected no token type for AWS auth, got %q", got)
 	}
 }

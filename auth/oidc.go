@@ -7,6 +7,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,16 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	}
 	client := GetAuthClientForProxy(proxyURL)
 
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), MicrosoftSSOAuthMethod) {
+		return refreshExternalIdpToken(
+			account.RefreshToken,
+			account.ClientID,
+			account.TokenEndpoint,
+			account.IssuerURL,
+			account.Scopes,
+			client,
+		)
+	}
 	if account.AuthMethod == "social" {
 		return refreshSocialToken(account.RefreshToken, client)
 	}

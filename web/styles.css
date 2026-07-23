@@ -2309,6 +2309,73 @@ img.brand-icon {
   }
 }
 
+.microsoft-security-note {
+  margin-bottom: 1rem;
+}
+.microsoft-callback-note {
+  margin-top: 1rem;
+  text-align: left;
+  line-height: 1.55;
+}
+.microsoft-callback-note p {
+  margin: 0;
+}
+.microsoft-callback-input {
+  min-height: 5rem;
+  resize: vertical;
+  word-break: break-all;
+}
+.microsoft-profile-list {
+  display: grid;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.microsoft-profile-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+.microsoft-profile-card:hover,
+.microsoft-profile-card.selected {
+  border-color: var(--border-focus);
+  background: color-mix(in oklab, var(--primary) 5%, var(--card));
+}
+.microsoft-profile-card input {
+  flex: none;
+  margin-top: 0.2rem;
+  accent-color: var(--primary);
+}
+.microsoft-profile-body {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.microsoft-profile-name {
+  color: var(--foreground);
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+.microsoft-profile-arn {
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.microsoft-profile-region {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+}
+
 /* API endpoint panel */
 .api-card {
   background: var(--card);

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -58,6 +59,13 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kiroHeaderValues) {
 	if account != nil && account.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+	}
+	// Kiro requires external identity-provider access tokens to be identified
+	// explicitly. Keep this in the shared header path so streaming and REST
+	// requests cannot drift apart.
+	req.Header.Del("TokenType")
+	if account != nil && strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+		req.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
 	req.Header.Set("User-Agent", values.UserAgent)
 	req.Header.Set("x-amz-user-agent", values.AmzUserAgent)
