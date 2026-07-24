@@ -230,7 +230,7 @@
   "modal.cookieTitle": "Kiro 网页 Cookie",
   "modal.cookieDesc": "通过从 Kiro 网页 Cookie 中获取的 RefreshToken 添加账号",
   "modal.apiKeyTitle": "Kiro API Key",
-  "modal.apiKeyDesc": "通过 Kiro headless API Key（ksk_...）直接添加账号，无需 OAuth 刷新",
+  "modal.apiKeyDesc": "通过 Kiro API Key 添加账号",
   "apikey.label": "Kiro API Key",
   "apikey.placeholder": "ksk_xxxxxxxx 或 ksk_xxxxxxxx|eu-central-1",
   "apikey.hint": "支持纯 key，或 key|region 便捷写法。API Key 账号默认走 CLI runtime 协议。",

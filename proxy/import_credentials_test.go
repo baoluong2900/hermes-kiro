@@ -143,6 +143,21 @@ func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	// The import handler spawns a background, un-awaited model-list refresh
+	// for enabled accounts. Route it through a stub transport with no Proxy
+	// configured (rather than the real http.ProxyFromEnvironment-backed
+	// client) and restore to an equally inert stub afterward — never back to
+	// the real client — since the goroutine may still be in flight after this
+	// test returns and would otherwise poison TestBuildKiroTransport*, which
+	// relies on http.ProxyFromEnvironment reading env vars for the first time.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
 
 	h := &Handler{pool: accountpool.GetPool()}
 	body := `{"kiroApiKey":"ksk_test_import|eu-central-1","authMethod":"api_key","nickname":"cli-key"}`
@@ -180,6 +195,18 @@ func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	// See TestApiImportCredentialsAPIKeySuccess: avoid ever restoring the real
+	// http.ProxyFromEnvironment-backed client, since the background model
+	// refresh goroutine may still be in flight after this test returns.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
 	h := &Handler{pool: accountpool.GetPool()}
 	body := `{"kiroApiKey":"ksk_dup_import","authMethod":"api_key"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))

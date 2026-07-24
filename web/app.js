@@ -2538,8 +2538,7 @@
       } catch { fail++; }
     }
     closeModal(); loadAccounts(); loadStats();
-    lekiroApiKey: value('kiroApiKey'),
-      t msg = t('sso.importSuccess', ok);
+    let msg = t('sso.importSuccess', ok);
     if (fail > 0) msg += t('sso.importPartial', fail);
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
@@ -2561,6 +2560,7 @@
       profileArn: value('profileArn'),
       accessToken: value('accessToken'),
       refreshToken: value('refreshToken'),
+      kiroApiKey: value('kiroApiKey'),
       clientId: value('clientId'),
       clientSecret: value('clientSecret'),
       authMethod: value('authMethod'),

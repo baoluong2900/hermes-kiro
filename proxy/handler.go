@@ -4496,12 +4496,12 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		// API Key accounts are not OAuth credentials; export a flat-compatible shape.
 		if config.IsAPIKeyAccount(&a) {
 			exportAccounts = append(exportAccounts, ExportAccount{
-				ID:         a.ID,
-				Email:      a.Email,
-				Nickname:   a.Nickname,
-				Idp:        "APIKey",
-				UserId:     a.UserId,
-				MachineId:  a.MachineId,
+				ID:        a.ID,
+				Email:     a.Email,
+				Nickname:  a.Nickname,
+				Idp:       "APIKey",
+				UserId:    a.UserId,
+				MachineId: a.MachineId,
 				Credentials: ExportCredentials{
 					AccessToken:  a.KiroApiKey,
 					RefreshToken: "",

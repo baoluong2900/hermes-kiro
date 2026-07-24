@@ -228,9 +228,9 @@ func TestSetPayloadProfileArnForAccountPreservesExplicitPayloadArn(t *testing.T)
 func TestSetPayloadProfileArnForAccountClearsAPIKeyProfile(t *testing.T) {
 	payload := &KiroPayload{ProfileArn: "arn:aws:codewhisperer:us-east-1:123:profile/STALE"}
 	setPayloadProfileArnForAccount(payload, &config.Account{
-		AuthMethod:  "api_key",
-		KiroApiKey:  "ksk_test",
-		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123:profile/STALE",
+		AuthMethod: "api_key",
+		KiroApiKey: "ksk_test",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:123:profile/STALE",
 	})
 	if payload.ProfileArn != "" {
 		t.Fatalf("expected empty profileArn for API key account, got %q", payload.ProfileArn)

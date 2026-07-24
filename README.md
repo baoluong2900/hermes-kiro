@@ -15,7 +15,7 @@ If this project helps you, a Star would mean a lot.
 - Anthropic `/v1/messages` & OpenAI `/v1/chat/completions`
 - Multi-account pool with round-robin load balancing
 - Auto token refresh, SSE streaming, Web admin panel
-- Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, local cache, credentials JSON, Kiro API Key (`ksk_...`)
+- Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, local cache, credentials JSON, Kiro API Key
 - Usage tracking, account import/export, i18n (CN / EN)
 - Support configuring outbound proxy (SOCKS5 / HTTP)
 

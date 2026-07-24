@@ -230,7 +230,7 @@
   "modal.cookieTitle": "Kiro Web Cookie",
   "modal.cookieDesc": "Add account via RefreshToken obtained from Kiro Web Cookie",
   "modal.apiKeyTitle": "Kiro API Key",
-  "modal.apiKeyDesc": "Add an account with a Kiro headless API Key (ksk_...) — no OAuth refresh required",
+  "modal.apiKeyDesc": "Add an account using a Kiro API Key",
   "apikey.label": "Kiro API Key",
   "apikey.placeholder": "ksk_xxxxxxxx or ksk_xxxxxxxx|eu-central-1",
   "apikey.hint": "Supports plain key or key|region. API Key accounts use the CLI runtime protocol.",
