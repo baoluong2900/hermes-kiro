@@ -496,60 +496,87 @@ func listKiroProfilesInRegionContext(
 		return nil, fmt.Errorf("invalid Kiro profile region %q", region)
 	}
 	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(`{"maxResults":10}`))
-	if err != nil {
-		return nil, err
-	}
-	setKiroHeaders(req, account)
-	req.Header.Set("Content-Type", "application/json")
+	client := GetRestClientForProxy(ResolveAccountProxyURL(account))
 
-	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProfileErrorBytes))
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProfileResponseBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(responseBody) > maxProfileResponseBytes {
-		return nil, fmt.Errorf("profile response exceeds %d bytes", maxProfileResponseBytes)
-	}
-
-	var result struct {
-		Profiles []struct {
-			ARN  string `json:"arn"`
-			Name string `json:"profileName"`
-		} `json:"profiles"`
-	}
-	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return nil, err
-	}
-
-	profiles := make([]KiroProfile, 0, len(result.Profiles))
-	seen := make(map[string]struct{}, len(result.Profiles))
+	profiles := make([]KiroProfile, 0)
+	seen := make(map[string]struct{})
 	invalidCount := 0
-	for _, profile := range result.Profiles {
-		profileARN, profileRegion, ok := parseKiroProfileArn(profile.ARN)
-		if !ok {
-			invalidCount++
-			continue
+	nextToken := ""
+	// Bound pagination so a misbehaving upstream cannot loop forever. 20 pages
+	// of 50 is far above any realistic Kiro profile count.
+	const maxProfilePages = 20
+	const pageSize = 50
+	for page := 0; page < maxProfilePages; page++ {
+		requestBody := map[string]interface{}{"maxResults": pageSize}
+		if nextToken != "" {
+			requestBody["nextToken"] = nextToken
 		}
-		if _, exists := seen[profileARN]; exists {
-			continue
+		payload, err := json.Marshal(requestBody)
+		if err != nil {
+			return nil, err
 		}
-		seen[profileARN] = struct{}{}
-		profiles = append(profiles, KiroProfile{
-			ARN:    profileARN,
-			Name:   strings.TrimSpace(profile.Name),
-			Region: profileRegion,
-		})
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(payload)))
+		if err != nil {
+			return nil, err
+		}
+		setKiroHeaders(req, account)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProfileErrorBytes))
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProfileResponseBytes+1))
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(responseBody) > maxProfileResponseBytes {
+			return nil, fmt.Errorf("profile response exceeds %d bytes", maxProfileResponseBytes)
+		}
+
+		var result struct {
+			Profiles []struct {
+				ARN  string `json:"arn"`
+				Name string `json:"profileName"`
+			} `json:"profiles"`
+			NextToken string `json:"nextToken"`
+		}
+		if err := json.Unmarshal(responseBody, &result); err != nil {
+			return nil, err
+		}
+
+		for _, profile := range result.Profiles {
+			profileARN, profileRegion, ok := parseKiroProfileArn(profile.ARN)
+			if !ok {
+				invalidCount++
+				continue
+			}
+			if _, exists := seen[profileARN]; exists {
+				continue
+			}
+			seen[profileARN] = struct{}{}
+			profiles = append(profiles, KiroProfile{
+				ARN:    profileARN,
+				Name:   strings.TrimSpace(profile.Name),
+				Region: profileRegion,
+			})
+		}
+
+		nextToken = strings.TrimSpace(result.NextToken)
+		if nextToken == "" {
+			break
+		}
+		if page == maxProfilePages-1 {
+			return nil, fmt.Errorf("profile list exceeded %d pages", maxProfilePages)
+		}
 	}
 	if len(profiles) == 0 && invalidCount != 0 {
 		return nil, fmt.Errorf("profile response contained no valid Kiro profile ARN")

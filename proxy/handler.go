@@ -3252,13 +3252,23 @@ func (h *Handler) writeMicrosoftSSOCanceled(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft SSO login was canceled"})
 }
 
-func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error) {
+func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error, rotatedRefreshToken ...string) {
 	if errors.Is(err, config.ErrDuplicateAccountID) || errors.Is(err, config.ErrDuplicateRefreshToken) {
 		w.WriteHeader(http.StatusConflict)
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
-	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	payload := map[string]string{"error": err.Error()}
+	if len(rotatedRefreshToken) > 0 {
+		if rotated := strings.TrimSpace(rotatedRefreshToken[0]); rotated != "" {
+			// Microsoft may have already invalidated the original refresh token.
+			// Surface the rotated value so operators can retry import without a
+			// full interactive re-login.
+			payload["rotatedRefreshToken"] = rotated
+			payload["hint"] = "The identity provider rotated the refresh token before persistence failed; retry import with rotatedRefreshToken"
+		}
+	}
+	json.NewEncoder(w).Encode(payload)
 }
 
 func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
@@ -3500,23 +3510,25 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	derivedTokenEndpoint, derivedIssuer, derivedScopes := auth.DeriveExternalIdpEndpoints(
 		req.UserID, req.ClientID, req.AccessToken,
 	)
-	implicitExternal := method == "" && provider == "" && derivedTokenEndpoint != ""
-	// 标准化 authMethod
-	switch {
-	case method == "external_idp" || method == "external-idp" ||
+	// Explicit AWS/social methods win over incidental tokenEndpoint/issuerUrl
+	// fields so mixed JSON templates cannot force the external-IdP path.
+	explicitMicrosoft := method == "external_idp" || method == "external-idp" ||
 		method == "external" || method == "microsoft" || method == "m365" || method == "office365" ||
 		method == "azure" || method == "azuread" || method == "azure-ad" || method == "azure_ad" ||
 		method == "entra" || method == "entra-id" ||
 		provider == "external" || provider == "microsoft" || provider == "m365" || provider == "office365" ||
 		provider == "azure" || provider == "azuread" || provider == "azure-ad" || provider == "azure_ad" ||
-		provider == "entra" || provider == "entra-id" ||
-		strings.TrimSpace(req.TokenEndpoint) != "" || strings.TrimSpace(req.IssuerURL) != "":
-		req.AuthMethod = auth.MicrosoftSSOAuthMethod
+		provider == "entra" || provider == "entra-id"
+	implicitExternal := method == "" && provider == "" &&
+		(derivedTokenEndpoint != "" ||
+			strings.TrimSpace(req.TokenEndpoint) != "" ||
+			strings.TrimSpace(req.IssuerURL) != "")
+	switch {
 	case method == "idc" || method == "builderid" || method == "enterprise":
 		req.AuthMethod = "idc"
 	case method == "social" || method == "google" || method == "github":
 		req.AuthMethod = "social"
-	case implicitExternal:
+	case explicitMicrosoft || implicitExternal:
 		req.AuthMethod = auth.MicrosoftSSOAuthMethod
 	case req.ClientID != "" && req.ClientSecret != "":
 		req.AuthMethod = "idc"
@@ -3612,6 +3624,10 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if newRefreshToken != "" {
 		req.RefreshToken = newRefreshToken
 	}
+	rotatedRefreshToken := ""
+	if req.RefreshToken != "" && req.RefreshToken != originalRefreshToken {
+		rotatedRefreshToken = req.RefreshToken
+	}
 
 	// 获取用户信息
 	email := strings.TrimSpace(req.Email)
@@ -3633,6 +3649,37 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	if profileARN == "" {
 		profileARN = newProfileArn
+	}
+	// Interactive Microsoft login only accepts profiles discovered for the
+	// refreshed token. Import keeps the same trust boundary so a client cannot
+	// pin an arbitrary data-plane ARN onto a working credential.
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod && profileARN != "" {
+		probeAccount := *tempAccount
+		probeAccount.AccessToken = accessToken
+		probeAccount.RefreshToken = req.RefreshToken
+		probeAccount.ExpiresAt = expiresAt
+		offeredProfiles, discoverErr := DiscoverKiroProfiles(&probeAccount)
+		if discoverErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Unable to verify profileArn against Kiro profiles: " + discoverErr.Error(),
+			})
+			return
+		}
+		offered := false
+		for _, profile := range offeredProfiles {
+			if profile.ARN == profileARN {
+				offered = true
+				break
+			}
+		}
+		if !offered {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "profileArn was not offered for this credential",
+			})
+			return
+		}
 	}
 
 	// 创建账号
@@ -3659,7 +3706,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		h.writeAddAccountError(w, err)
+		h.writeAddAccountError(w, err, rotatedRefreshToken)
 		return
 	}
 

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -487,5 +489,188 @@ func TestMicrosoftSSOCancelDuringProfileDiscoveryDoesNotPersist(t *testing.T) {
 	h.microsoftSelectionsMu.Unlock()
 	if pendingSelections != 0 {
 		t.Fatalf("canceled login retained %d pending profile selections", pendingSelections)
+	}
+}
+
+func TestExternalIdpImportRejectsUnofferedProfileArn(t *testing.T) {
+	h := newMicrosoftHandlerForTest(t)
+
+	issuerURL := handlerMicrosoftIssuerURL()
+	tokenEndpoint := handlerMicrosoftTokenEndpoint()
+	scopes := handlerMicrosoftScopes()
+	refreshedAccessToken := handlerMicrosoftJWT(t, map[string]interface{}{
+		"iss":   issuerURL,
+		"oid":   handlerMicrosoftObjectID,
+		"email": "profile-check@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
+	const offeredARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/offered"
+	const unofferedARN = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/unoffered"
+
+	authClient := &http.Client{
+		Timeout: time.Second,
+		Transport: handlerMicrosoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.String() != tokenEndpoint {
+				return nil, fmt.Errorf("unexpected auth request: %s %s", request.Method, request.URL)
+			}
+			return handlerMicrosoftJSONResponse(request, http.StatusOK, map[string]interface{}{
+				"access_token":  refreshedAccessToken,
+				"refresh_token": "rotated-for-profile-check",
+				"expires_in":    3600,
+				"token_type":    "Bearer",
+			}), nil
+		}),
+	}
+	previousAuthClient := auth.SetGlobalAuthClientForTest(authClient)
+	t.Cleanup(func() { auth.SetGlobalAuthClientForTest(previousAuthClient) })
+
+	previousRestClient := kiroRestHttpStore.Load()
+	kiroRestHttpStore.Store(&http.Client{
+		Timeout: time.Second,
+		Transport: handlerMicrosoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.Path != "/ListAvailableProfiles" {
+				return nil, fmt.Errorf("unexpected Kiro REST request: %s %s", request.Method, request.URL)
+			}
+			return handlerMicrosoftJSONResponse(request, http.StatusOK, map[string]interface{}{
+				"profiles": []map[string]string{{
+					"arn":         offeredARN,
+					"profileName": "Offered",
+				}},
+			}), nil
+		}),
+	})
+	t.Cleanup(func() { kiroRestHttpStore.Store(previousRestClient) })
+
+	recorder := callImportCredentialsHandler(t, h, map[string]interface{}{
+		"refreshToken":  "profile-check-refresh",
+		"clientId":      handlerMicrosoftClientID,
+		"authMethod":    auth.MicrosoftSSOAuthMethod,
+		"tokenEndpoint": tokenEndpoint,
+		"issuerUrl":     issuerURL,
+		"scopes":        scopes,
+		"profileArn":    unofferedARN,
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "not offered") {
+		t.Fatalf("body = %s, want not-offered error", recorder.Body.String())
+	}
+	if accounts := config.GetAccounts(); len(accounts) != 0 {
+		t.Fatalf("unoffered profileArn import persisted accounts: %+v", accounts)
+	}
+}
+
+func TestExternalIdpImportReturnsRotatedRefreshTokenWhenPersistFails(t *testing.T) {
+	h := newMicrosoftHandlerForTest(t)
+
+	issuerURL := handlerMicrosoftIssuerURL()
+	tokenEndpoint := handlerMicrosoftTokenEndpoint()
+	scopes := handlerMicrosoftScopes()
+	refreshedAccessToken := handlerMicrosoftJWT(t, map[string]interface{}{
+		"iss":   issuerURL,
+		"oid":   handlerMicrosoftObjectID,
+		"email": "persist-fail@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
+
+	authClient := &http.Client{
+		Timeout: time.Second,
+		Transport: handlerMicrosoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.String() != tokenEndpoint {
+				return nil, fmt.Errorf("unexpected auth request: %s %s", request.Method, request.URL)
+			}
+			return handlerMicrosoftJSONResponse(request, http.StatusOK, map[string]interface{}{
+				"access_token":  refreshedAccessToken,
+				"refresh_token": "rotated-after-refresh",
+				"expires_in":    3600,
+				"token_type":    "Bearer",
+			}), nil
+		}),
+	}
+	previousAuthClient := auth.SetGlobalAuthClientForTest(authClient)
+	t.Cleanup(func() { auth.SetGlobalAuthClientForTest(previousAuthClient) })
+
+	// Force Save to fail after refresh by replacing the config path with a directory.
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	// config.Init was already called by newMicrosoftHandlerForTest on another path;
+	// reopen against a path we can sabotage after first successful seed isn't needed.
+	// Instead sabotage the active config file by making it unwritable via a directory
+	// collision on the path returned by re-init.
+	// Simplest reliable approach: re-init into a temp file, then replace it with a directory.
+	if err := config.Init(cfgPath); err != nil {
+		t.Fatalf("re-init config: %v", err)
+	}
+	if err := os.Remove(cfgPath); err != nil {
+		t.Fatalf("remove config file: %v", err)
+	}
+	if err := os.Mkdir(cfgPath, 0o700); err != nil {
+		t.Fatalf("replace config file with directory: %v", err)
+	}
+
+	recorder := callImportCredentialsHandler(t, h, map[string]interface{}{
+		"refreshToken":  "persist-fail-refresh",
+		"clientId":      handlerMicrosoftClientID,
+		"authMethod":    auth.MicrosoftSSOAuthMethod,
+		"tokenEndpoint": tokenEndpoint,
+		"issuerUrl":     issuerURL,
+		"scopes":        scopes,
+	})
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["rotatedRefreshToken"] != "rotated-after-refresh" {
+		t.Fatalf("rotatedRefreshToken = %q, want rotated-after-refresh; body=%v", body["rotatedRefreshToken"], body)
+	}
+	if body["error"] == "" {
+		t.Fatal("expected persistence error message")
+	}
+	if accounts := config.GetAccounts(); len(accounts) != 0 {
+		t.Fatalf("failed import persisted accounts: %+v", accounts)
+	}
+}
+
+func TestExplicitIdcAuthMethodWinsOverTokenEndpointHint(t *testing.T) {
+	h := newMicrosoftHandlerForTest(t)
+
+	// If classification still forces external_idp from tokenEndpoint, validation
+	// of the Microsoft endpoint will run and reject this IdC-shaped import before
+	// any social/IdC refresh is attempted. Explicit idc must win.
+	authClient := &http.Client{
+		Transport: handlerMicrosoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if strings.Contains(request.URL.Host, "microsoftonline") {
+				return nil, fmt.Errorf("should not reach Microsoft endpoint for explicit idc: %s", request.URL)
+			}
+			// IdC refresh path is free to fail; classification is what we care about.
+			return nil, fmt.Errorf("idc refresh blocked in test")
+		}),
+	}
+	previousAuthClient := auth.SetGlobalAuthClientForTest(authClient)
+	t.Cleanup(func() { auth.SetGlobalAuthClientForTest(previousAuthClient) })
+
+	recorder := callImportCredentialsHandler(t, h, map[string]interface{}{
+		"refreshToken":  "idc-refresh-token",
+		"clientId":      "idc-client",
+		"clientSecret":  "idc-secret",
+		"authMethod":    "idc",
+		"region":        "us-east-1",
+		"tokenEndpoint": "https://login.microsoftonline.com/11111111-2222-4333-8444-555555555555/oauth2/v2.0/token",
+		"issuerUrl":     "https://login.microsoftonline.com/11111111-2222-4333-8444-555555555555/v2.0",
+	})
+	body := recorder.Body.String()
+	// Must not be classified as external_idp (those fail earlier with Microsoft
+	// client_id UUID / scope validation, or hit login.microsoftonline.com).
+	if strings.Contains(body, "Microsoft client_id") ||
+		strings.Contains(body, "external IdP") ||
+		(strings.Contains(body, "scopes") && strings.Contains(body, "offline_access")) ||
+		strings.Contains(body, "should not reach Microsoft endpoint") {
+		t.Fatalf("explicit idc was classified as external_idp: %s", body)
+	}
+	if !strings.Contains(body, "Token refresh failed") {
+		t.Fatalf("expected IdC refresh path error, got %s", body)
 	}
 }

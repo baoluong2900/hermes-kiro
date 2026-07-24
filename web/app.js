@@ -1048,13 +1048,46 @@
       toast((e && e.message) || t('common.failed'), 'error');
     }
   }
+  function credentialImportPayloadFromFullAccount(a) {
+    const payload = {
+      clientId: a.clientId || '',
+      clientSecret: a.clientSecret || '',
+      accessToken: a.accessToken || '',
+      refreshToken: a.refreshToken || ''
+    };
+    if (a.authMethod) payload.authMethod = a.authMethod;
+    if (a.provider) payload.provider = a.provider;
+    if (a.tokenEndpoint) payload.tokenEndpoint = a.tokenEndpoint;
+    if (a.issuerUrl) payload.issuerUrl = a.issuerUrl;
+    if (a.scopes) payload.scopes = a.scopes;
+    if (a.userId) payload.userId = a.userId;
+    if (a.profileArn) payload.profileArn = a.profileArn;
+    if (a.region) payload.region = a.region;
+    return payload;
+  }
+  function credentialImportPayloadFromExportAccount(a) {
+    const credentials = a.credentials || {};
+    return credentialImportPayloadFromFullAccount({
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      authMethod: credentials.authMethod || a.authMethod,
+      provider: credentials.provider || a.provider || a.idp,
+      tokenEndpoint: credentials.tokenEndpoint,
+      issuerUrl: credentials.issuerUrl,
+      scopes: credentials.scopes,
+      userId: a.userId,
+      profileArn: a.profileArn,
+      region: credentials.region || a.region
+    });
+  }
   async function copyAccountJSON(id, btn) {
     try {
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        return JSON.stringify(credentialImportPayloadFromFullAccount(a), null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -2174,10 +2207,6 @@
     const loginLabel = microsoftStage === 'microsoft' ? t('microsoft.providerStep') : t('microsoft.portalStep');
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.microsoftDesc')) + '</p>' +
-      '<div class="help-block microsoft-security-note">' +
-      '<p><b>' + escapeHtml(t('microsoft.securityNoteTitle')) + '</b></p>' +
-      '<p>' + escapeHtml(t('microsoft.securityNote')) + '</p>' +
-      '</div>' +
       (hasAuthorizeUrl ?
         '<div class="form-group"><label>' + escapeHtml(loginLabel) + '</label>' +
         '<div class="endpoint"><span id="microsoftAuthUrl" class="font-mono text-xs"></span></div>' +
@@ -2704,7 +2733,7 @@
         return;
       }
       if (d.account) {
-        finishMicrosoftLogin(d.account);
+        finishMicrosoftLogin(d.account, d.warning);
         return;
       }
       if (d.stage === 'microsoft' && d.authorizeUrl) {
@@ -2751,7 +2780,7 @@
         toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
         return;
       }
-      finishMicrosoftLogin(d.account);
+      finishMicrosoftLogin(d.account, d.warning);
     } catch (e) {
       if (generation === microsoftGeneration) {
         toastError(t('common.failed') + ': ' + (e.message || ''));
@@ -2763,12 +2792,13 @@
       }
     }
   }
-  function finishMicrosoftLogin(account) {
+  function finishMicrosoftLogin(account, warning) {
     resetMicrosoftFlow(false);
     closeModal();
     loadAccounts();
     loadStats();
     toastPrimary(t('microsoft.success') + ': ' + (account?.email || account?.id || ''));
+    if (warning) toastWarning(String(warning));
     autoRefreshNewAccount(account?.id);
   }
   async function autoRefreshNewAccount(id) {
@@ -2848,10 +2878,7 @@
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
-      const filtered = (data.accounts || []).map(a => {
-        const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
-        return { clientId, clientSecret, accessToken, refreshToken };
-      });
+      const filtered = (data.accounts || []).map(credentialImportPayloadFromExportAccount);
       return JSON.stringify(filtered, null, 2);
     });
     try {

@@ -330,6 +330,25 @@ func TestExternalIdpJSONImportRefreshesAndRoundTripsCompleteFields(t *testing.T)
 	previousAuthClient := auth.SetGlobalAuthClientForTest(authClient)
 	t.Cleanup(func() { auth.SetGlobalAuthClientForTest(previousAuthClient) })
 
+	// Import verifies supplied profileArn against ListAvailableProfiles for
+	// the refreshed external_idp token before persisting.
+	previousRestClient := kiroRestHttpStore.Load()
+	kiroRestHttpStore.Store(&http.Client{
+		Timeout: time.Second,
+		Transport: handlerMicrosoftRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.Path != "/ListAvailableProfiles" {
+				return nil, fmt.Errorf("unexpected Kiro REST request: %s %s", request.Method, request.URL)
+			}
+			return handlerMicrosoftJSONResponse(request, http.StatusOK, map[string]interface{}{
+				"profiles": []map[string]string{{
+					"arn":         profileARN,
+					"profileName": "Imported profile",
+				}},
+			}), nil
+		}),
+	})
+	t.Cleanup(func() { kiroRestHttpStore.Store(previousRestClient) })
+
 	importPayload := map[string]interface{}{
 		"id":            accountID,
 		"email":         "stale@example.com",

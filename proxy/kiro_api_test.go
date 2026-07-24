@@ -282,6 +282,58 @@ func TestRefreshAccountInfoDoesNotDisableBuilderIDWhenProfileLookupUnsupported(t
 	}
 }
 
+func TestListKiroProfilesFollowsNextTokenPagination(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	var pages []string
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/ListAvailableProfiles" {
+				t.Fatalf("unexpected path %s", req.URL.Path)
+			}
+			body, _ := io.ReadAll(req.Body)
+			pages = append(pages, string(body))
+			if strings.Contains(string(body), `"nextToken":"page-2"`) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body: io.NopCloser(strings.NewReader(`{
+						"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/two","profileName":"Two"}]
+					}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(`{
+					"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/one","profileName":"One"}],
+					"nextToken":"page-2"
+				}`)),
+			}, nil
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	profiles, err := listKiroProfilesInRegion(&config.Account{
+		AccessToken: "token",
+		AuthMethod:  "external_idp",
+		Region:      "us-east-1",
+	}, "us-east-1")
+	if err != nil {
+		t.Fatalf("list profiles: %v", err)
+	}
+	if len(pages) != 2 {
+		t.Fatalf("pages = %d (%v), want 2", len(pages), pages)
+	}
+	if len(profiles) != 2 || profiles[0].ARN == "" || profiles[1].ARN == "" {
+		t.Fatalf("profiles = %+v, want two ARNs across pages", profiles)
+	}
+	if !strings.Contains(pages[0], `"maxResults":50`) {
+		t.Fatalf("first page body = %s, want maxResults 50", pages[0])
+	}
+}
+
 func TestParseKiroProfileARNStrictly(t *testing.T) {
 	valid := "arn:aws:codewhisperer:eu-central-1:123456789012:profile/Profile_01"
 	canonical, region, ok := parseKiroProfileArn(" " + valid + " ")

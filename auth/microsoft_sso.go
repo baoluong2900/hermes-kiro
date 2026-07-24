@@ -97,12 +97,18 @@ var (
 	microsoftSSOSessionsMu sync.Mutex
 )
 
-// StartMicrosoftSSOLogin creates the Kiro portal PKCE request. No socket or
-// callback server is opened.
+// StartMicrosoftSSOLogin creates the Kiro portal request. No socket or callback
+// server is opened. The portal leg only returns an external-IdP descriptor on
+// the fixed localhost callback; it is not an OAuth code exchange for this
+// proxy, so no PKCE verifier is retained server-side. Microsoft's second leg
+// still uses a stored PKCE verifier.
 func StartMicrosoftSSOLogin() (sessionID, authorizationURL string, expiresIn int, err error) {
+	// code_challenge is still sent because Kiro's hosted sign-in URL expects the
+	// same query shape as other clients. There is no later code_verifier check
+	// for this portal leg.
 	verifier, err := randomURLSafe(32)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("generate PKCE verifier: %w", err)
+		return "", "", 0, fmt.Errorf("generate portal code_challenge material: %w", err)
 	}
 	state, err := randomURLSafe(32)
 	if err != nil {
@@ -160,7 +166,14 @@ func ContinueMicrosoftSSOLogin(sessionID, callbackURL string) (*MicrosoftSSOProg
 	}
 
 	session.mu.Lock()
-	defer session.mu.Unlock()
+	// If cancel ran while we waited for the lock (or during a network call that
+	// only set canceled), wipe PKCE/state material before returning any error.
+	defer func() {
+		if session.canceled.Load() {
+			clearMicrosoftSSOSessionLocked(session)
+		}
+		session.mu.Unlock()
+	}()
 
 	if session.canceled.Load() {
 		return nil, fmt.Errorf("Microsoft SSO session not found or expired")
