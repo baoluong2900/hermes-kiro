@@ -15,7 +15,7 @@
 - Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions`
 - 多账号池轮询负载均衡
 - 自动 Token 刷新、SSE 流式输出、Web 管理面板
-- 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
+- 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、Microsoft 企业 SSO、SSO Token、本地缓存、凭证 JSON、Kiro API Key（`ksk_...`）
 - 用量追踪、账号导入导出、中英双语
 - 支持设置出站代理（SOCKS5 / HTTP）
 
@@ -95,6 +95,21 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer any" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好！"}]}'
 ```
+
+### 添加 Kiro API Key 账号
+
+管理面板「添加账号」可选择 **API Key**，填写 `ksk_...`（也支持 `ksk_...|region`）。
+
+也可通过凭证导入接口添加：
+
+```bash
+curl -X POST http://localhost:8080/admin/api/auth/credentials \
+  -H "Content-Type: application/json" \
+  -H "Cookie: <admin-session>" \
+  -d '{"kiroApiKey":"ksk_your_key|us-east-1","authMethod":"api_key","nickname":"cli-key"}'
+```
+
+API Key 账号会走 Kiro CLI runtime（`https://runtime.{region}.kiro.dev/`），请求头带 `tokentype: API_KEY`，无需 OAuth 刷新，也不使用 `profileArn`。
 
 ## 思考模式
 

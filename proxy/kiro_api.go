@@ -264,6 +264,10 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
 	}
+	// API Key credentials do not use IDE profile ARNs.
+	if config.IsAPIKeyAccount(account) {
+		return "", nil
+	}
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 		return profileArn, nil
 	}
@@ -378,6 +382,10 @@ func isProfileArnResolutionSoftError(err error) bool {
 
 func ensureRestProfileArn(account *config.Account) error {
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
+		return nil
+	}
+	// Headless API keys do not use IDE profile ARNs; REST calls proceed without one.
+	if config.IsAPIKeyAccount(account) {
 		return nil
 	}
 	profileArn, err := ResolveProfileArn(account)

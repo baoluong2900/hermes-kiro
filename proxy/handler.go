@@ -29,6 +29,21 @@ const (
 	microsoftProfileDiscoveryTimeout      = 30 * time.Second
 )
 
+// looksLikeKiroAPIKey is a lightweight heuristic for plain-text imports.
+// Official keys currently use the ksk_ prefix; future formats can still be
+// imported via explicit authMethod/kiroApiKey fields.
+func looksLikeKiroAPIKey(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	// Convenience form: ksk_xxx|region
+	if idx := strings.IndexByte(value, '|'); idx > 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return strings.HasPrefix(value, "ksk_")
+}
+
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
 	Time      int64   `json:"time"`      // Unix timestamp
@@ -314,16 +329,22 @@ func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		if !account.Enabled {
+			continue
+		}
+		if accountBearerToken(account) == "" {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			if _, err := h.refreshAccountToken(account, false); err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				h.handleAccountFailure(account, err)
-				continue
+		// API Key accounts skip OAuth refresh; still sync usage/subscription.
+		if !config.IsAPIKeyAccount(account) {
+			// 检查 token 是否需要刷新
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				if _, err := h.refreshAccountToken(account, false); err != nil {
+					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+					h.handleAccountFailure(account, err)
+					continue
+				}
 			}
 		}
 
@@ -2147,6 +2168,26 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 	}
 	working := *latest
 
+	// API Key credentials never expire and cannot be OAuth-refreshed.
+	if config.IsAPIKeyAccount(&working) {
+		token := strings.TrimSpace(working.KiroApiKey)
+		if token == "" {
+			token = strings.TrimSpace(working.AccessToken)
+		}
+		if token == "" {
+			return false, fmt.Errorf("account %s has no kiroApiKey", working.ID)
+		}
+		h.pool.UpdateCredentialState(
+			account,
+			working.ID,
+			token,
+			"",
+			0,
+			"",
+		)
+		return false, nil
+	}
+
 	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-tokenRefreshSkewSeconds) {
 		h.pool.UpdateCredentialState(
 			account,
@@ -2195,6 +2236,12 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	if config.IsAPIKeyAccount(account) {
+		if accountBearerToken(account) == "" {
+			return fmt.Errorf("account %s has no kiroApiKey", account.ID)
+		}
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2368,7 +2415,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
-			"hasToken":          a.AccessToken != "",
+			"hasToken":          accountBearerToken(&a) != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -3253,7 +3300,9 @@ func (h *Handler) writeMicrosoftSSOCanceled(w http.ResponseWriter) {
 }
 
 func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error, rotatedRefreshToken ...string) {
-	if errors.Is(err, config.ErrDuplicateAccountID) || errors.Is(err, config.ErrDuplicateRefreshToken) {
+	if errors.Is(err, config.ErrDuplicateAccountID) ||
+		errors.Is(err, config.ErrDuplicateRefreshToken) ||
+		errors.Is(err, config.ErrDuplicateAPIKey) {
 		w.WriteHeader(http.StatusConflict)
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -3453,6 +3502,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		ProfileARN    string `json:"profileArn"`
 		AccessToken   string `json:"accessToken"`
 		RefreshToken  string `json:"refreshToken"`
+		KiroApiKey    string `json:"kiroApiKey"`
 		ClientID      string `json:"clientId"`
 		ClientSecret  string `json:"clientSecret"`
 		AuthMethod    string `json:"authMethod"`
@@ -3470,12 +3520,22 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
-	if req.RefreshToken == "" {
+	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	methodHint := strings.ToLower(strings.TrimSpace(req.AuthMethod))
+	isAPIKeyImport := req.KiroApiKey != "" ||
+		methodHint == "api_key" || methodHint == "apikey" ||
+		(req.RefreshToken == "" && looksLikeKiroAPIKey(req.AccessToken))
+	if isAPIKeyImport && req.KiroApiKey == "" {
+		// Allow plain-text / AccessToken-only API key imports.
+		req.KiroApiKey = req.AccessToken
+	}
+	if !isAPIKeyImport && req.RefreshToken == "" {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken is required"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken or kiroApiKey is required"})
 		return
 	}
-	if len(req.RefreshToken) > 512<<10 || len(req.AccessToken) > 512<<10 {
+	if len(req.RefreshToken) > 512<<10 || len(req.AccessToken) > 512<<10 || len(req.KiroApiKey) > 512<<10 {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "credential token is too long"})
 		return
@@ -3495,6 +3555,54 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// API Key import path: no OAuth refresh, no profileArn.
+	if isAPIKeyImport {
+		if accountID == "" {
+			accountID = auth.GenerateAccountID()
+		}
+		account := config.Account{
+			ID:         accountID,
+			Email:      strings.TrimSpace(req.Email),
+			UserId:     strings.TrimSpace(req.UserID),
+			Nickname:   strings.TrimSpace(req.Nickname),
+			KiroApiKey: req.KiroApiKey,
+			AuthMethod: "api_key",
+			Provider:   strings.TrimSpace(req.Provider),
+			Region:     strings.TrimSpace(req.Region),
+			Enabled:    true,
+		}
+		if err := config.NormalizeAPIKeyAccount(&account); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if config.AccountAPIKeyExists(account.KiroApiKey) {
+			h.writeAddAccountError(w, config.ErrDuplicateAPIKey)
+			return
+		}
+		if err := config.AddAccount(account); err != nil {
+			h.writeAddAccountError(w, err)
+			return
+		}
+		h.pool.Reload()
+		if account.Enabled && account.AccessToken != "" {
+			go func(acc config.Account) {
+				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for new API key account %s: %v", acc.Email, err)
+				}
+			}(account)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"account": map[string]interface{}{
+				"id":    account.ID,
+				"email": account.Email,
+			},
+		})
+		return
+	}
+
 	if config.AccountCredentialExists(originalRefreshToken) {
 		h.writeAddAccountError(w, config.ErrDuplicateRefreshToken)
 		return
@@ -3524,6 +3632,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			strings.TrimSpace(req.TokenEndpoint) != "" ||
 			strings.TrimSpace(req.IssuerURL) != "")
 	switch {
+	case method == "api_key" || method == "apikey":
+		req.AuthMethod = "api_key"
 	case method == "idc" || method == "builderid" || method == "enterprise":
 		req.AuthMethod = "idc"
 	case method == "social" || method == "google" || method == "github":
@@ -4383,6 +4493,40 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	exportAccounts := make([]ExportAccount, 0, len(accounts))
 	for _, a := range accounts {
+		// API Key accounts are not OAuth credentials; export a flat-compatible shape.
+		if config.IsAPIKeyAccount(&a) {
+			exportAccounts = append(exportAccounts, ExportAccount{
+				ID:         a.ID,
+				Email:      a.Email,
+				Nickname:   a.Nickname,
+				Idp:        "APIKey",
+				UserId:     a.UserId,
+				MachineId:  a.MachineId,
+				Credentials: ExportCredentials{
+					AccessToken:  a.KiroApiKey,
+					RefreshToken: "",
+					Region:       a.Region,
+					AuthMethod:   "api_key",
+					Provider:     "APIKey",
+				},
+				Subscription: ExportSubscription{
+					Type:  a.SubscriptionType,
+					Title: a.SubscriptionTitle,
+				},
+				Usage: ExportUsage{
+					Current:     a.UsageCurrent,
+					Limit:       a.UsageLimit,
+					PercentUsed: a.UsagePercent,
+					LastUpdated: a.LastRefresh,
+				},
+				Tags:       []string{"api_key"},
+				Status:     "active",
+				CreatedAt:  0,
+				LastUsedAt: a.LastUsed,
+			})
+			continue
+		}
+
 		// 映射 provider 到 idp
 		idp := a.Provider
 		if idp == "" {

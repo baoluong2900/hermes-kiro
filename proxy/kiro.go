@@ -50,6 +50,15 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
+// kiroCLIEndpoint is the headless / API Key path used by Kiro CLI:
+// POST https://runtime.{region}.kiro.dev/ with AWS JSON 1.0 protocol.
+var kiroCLIEndpoint = kiroEndpoint{
+	URL:       "https://runtime.us-east-1.kiro.dev/",
+	Origin:    "KIRO_CLI",
+	AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+	Name:      "Kiro CLI",
+}
+
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
@@ -248,12 +257,39 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 		return
 	}
 
+	// API Key credentials must not carry IDE/profile semantics.
+	if config.IsAPIKeyAccount(account) {
+		payload.ProfileArn = ""
+		return
+	}
+
 	payload.ProfileArn = strings.TrimSpace(payload.ProfileArn)
 	if account != nil {
 		if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 			payload.ProfileArn = profileArn
 		}
 	}
+}
+
+// endpointsForAccount returns the upstream endpoint list for a credential.
+// API Key accounts always use the CLI runtime protocol; OAuth accounts keep
+// the configured preferred-endpoint fallback chain.
+func endpointsForAccount(account *config.Account) []kiroEndpoint {
+	if config.IsAPIKeyAccount(account) {
+		return []kiroEndpoint{kiroCLIEndpoint}
+	}
+	return getSortedEndpoints(config.GetPreferredEndpoint())
+}
+
+// cliRuntimeURL builds the regional Kiro CLI runtime URL.
+func cliRuntimeURL(account *config.Account) string {
+	region := "us-east-1"
+	if account != nil {
+		if r := strings.TrimSpace(account.Region); r != "" {
+			region = r
+		}
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
@@ -322,7 +358,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		callback = &wrapped
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" && !config.IsAPIKeyAccount(account) {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else if isProfileArnResolutionSoftError(err) {
@@ -332,8 +368,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	// Build endpoint list ordered by configuration / credential type.
+	endpoints := endpointsForAccount(account)
+	isAPIKey := config.IsAPIKeyAccount(account)
 
 	var lastErr error
 	for _, ep := range endpoints {
@@ -341,7 +378,11 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
+		// API Key accounts use the CLI runtime host instead of IDE/Q hosts.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+		if isAPIKey {
+			epURL = cliRuntimeURL(account)
+		}
 
 		reqBody, _ := json.Marshal(payload)
 		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
@@ -356,14 +397,25 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 		headerValues := buildStreamingHeaderValues(account, host)
 
-		req.Header.Set("Content-Type", "application/json")
+		if isAPIKey {
+			req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+		} else {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		req.Header.Set("Accept", "*/*")
 		if ep.AmzTarget != "" {
 			req.Header.Set("X-Amz-Target", ep.AmzTarget)
 		}
 		applyKiroBaseHeaders(req, account, headerValues)
-		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		if !isAPIKey {
+			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+		}
+		// CLI captures use optout=false; IDE path keeps true.
+		if isAPIKey {
+			req.Header.Set("x-amzn-codewhisperer-optout", "false")
+		} else {
+			req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		}
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 

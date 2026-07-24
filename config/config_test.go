@@ -7,6 +7,65 @@ import (
 	"testing"
 )
 
+func TestNormalizeAPIKeyAccountPipeRegionAndMachineId(t *testing.T) {
+	account := Account{
+		KiroApiKey: " ksk_test_key|eu-central-1 ",
+		AuthMethod: "API KEY",
+	}
+	if err := NormalizeAPIKeyAccount(&account); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if account.KiroApiKey != "ksk_test_key" {
+		t.Fatalf("key = %q", account.KiroApiKey)
+	}
+	if account.AccessToken != "ksk_test_key" {
+		t.Fatalf("accessToken should mirror api key, got %q", account.AccessToken)
+	}
+	if account.AuthMethod != "api_key" {
+		t.Fatalf("authMethod = %q", account.AuthMethod)
+	}
+	if account.Region != "eu-central-1" {
+		t.Fatalf("region = %q", account.Region)
+	}
+	if account.RefreshToken != "" || account.ProfileArn != "" || account.ExpiresAt != 0 {
+		t.Fatalf("oauth fields should be cleared: %+v", account)
+	}
+	wantMachine := MachineIdFromAPIKey("ksk_test_key")
+	if account.MachineId != wantMachine {
+		t.Fatalf("machineId = %q, want %q", account.MachineId, wantMachine)
+	}
+	if !IsAPIKeyAccount(&account) {
+		t.Fatal("expected IsAPIKeyAccount true")
+	}
+}
+
+func TestAddAccountRejectsDuplicateAPIKey(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	first := Account{ID: "api-1", KiroApiKey: "ksk_dup", AuthMethod: "api_key", Enabled: true}
+	if err := AddAccount(first); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	second := Account{ID: "api-2", KiroApiKey: "ksk_dup", AuthMethod: "api_key", Enabled: true}
+	if err := AddAccount(second); err != ErrDuplicateAPIKey {
+		t.Fatalf("expected ErrDuplicateAPIKey, got %v", err)
+	}
+}
+
+func TestSplitKiroAPIKeyAndRegionValidation(t *testing.T) {
+	key, region, err := SplitKiroAPIKeyAndRegion("ksk_abc|us-east-1")
+	if err != nil || key != "ksk_abc" || region != "us-east-1" {
+		t.Fatalf("got key=%q region=%q err=%v", key, region, err)
+	}
+	if _, _, err := SplitKiroAPIKeyAndRegion("ksk_abc|us-east-1|extra"); err == nil {
+		t.Fatal("expected multi-pipe error")
+	}
+	if _, _, err := SplitKiroAPIKeyAndRegion("|us-east-1"); err == nil {
+		t.Fatal("expected empty key error")
+	}
+}
+
 func TestUpdateSettingsPatchPreservesOmittedAPIKeyFields(t *testing.T) {
 	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("init config: %v", err)

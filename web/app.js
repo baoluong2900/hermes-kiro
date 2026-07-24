@@ -890,6 +890,7 @@
     if (normalized === 'external_idp' || normalized === 'azuread') return t('auth.microsoft');
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
+    if (normalized === 'api_key' || normalized === 'apikey') return t('auth.apiKey');
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
@@ -2065,7 +2066,8 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-key'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2090,6 +2092,7 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2111,6 +2114,7 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2258,6 +2262,27 @@
       '</div>';
     $('importSsoBtn').addEventListener('click', importSsoToken);
   }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="help-block">' +
+      '<p>' + escapeHtml(t('apikey.hint')) + '</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx|eu-central-1</p>' +
+      '</div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.label')) + '</label>' +
+      '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('apikey.placeholder')) + '"></textarea></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + ' <small>' + escapeHtml(t('apikey.regionHint')) + '</small></label>' +
+      '<input type="text" id="kiroApiKeyRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
+      '<input type="text" id="kiroApiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
+  }
 
   function modalLocal(title, body) {
     title.textContent = t('modal.localTitle');
@@ -2356,6 +2381,39 @@
   }
 
   // Import handlers
+  async function importApiKey() {
+    const raw = ($('kiroApiKeyInput') && $('kiroApiKeyInput').value || '').trim();
+    if (!raw) return toastWarning(t('apikey.missing'));
+    let key = raw;
+    let regionFromKey = '';
+    if (raw.includes('|')) {
+      const parts = raw.split('|');
+      key = (parts[0] || '').trim();
+      regionFromKey = (parts[1] || '').trim();
+    }
+    if (!key) return toastWarning(t('apikey.missing'));
+    const region = regionFromKey || ($('kiroApiKeyRegion') && $('kiroApiKeyRegion').value.trim()) || 'us-east-1';
+    const nickname = ($('kiroApiKeyNickname') && $('kiroApiKeyNickname').value.trim()) || '';
+    const payload = {
+      kiroApiKey: key,
+      authMethod: 'api_key',
+      region,
+      nickname
+    };
+    try {
+      const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('apikey.importSuccess') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + (e.message || e));
+    }
+  }
   async function importLocalKiro() {
     const provider = $('localProvider').value;
     const tokenJson = $('localTokenJson').value.trim();
@@ -2413,11 +2471,33 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
-      if (!item.refreshToken) { fail++; continue; }
       const rawMethod = String(item.authMethod || '').trim();
       const rawProvider = String(item.provider || '').trim();
       const methodKey = rawMethod.toLowerCase();
       const providerKey = rawProvider.toLowerCase();
+      const kiroApiKey = String(item.kiroApiKey || '').trim();
+      const isApiKey = Boolean(kiroApiKey) || methodKey === 'api_key' || methodKey === 'apikey' ||
+        (!item.refreshToken && String(item.accessToken || '').trim().startsWith('ksk_'));
+      if (!isApiKey && !item.refreshToken) { fail++; continue; }
+      if (isApiKey) {
+        const payload = {
+          id: item.id || '',
+          email: item.email || '',
+          userId: item.userId || '',
+          nickname: item.nickname || '',
+          kiroApiKey: kiroApiKey || item.accessToken || '',
+          authMethod: 'api_key',
+          provider: rawProvider || 'APIKey',
+          region: item.region || 'us-east-1'
+        };
+        try {
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+          const d = await res.json();
+          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+          else fail++;
+        } catch { fail++; }
+        continue;
+      }
       const externalAliases = [
         'external_idp', 'external-idp', 'external', 'microsoft', 'm365', 'office365',
         'azure', 'azuread', 'azure-ad', 'azure_ad', 'entra', 'entra-id'
@@ -2458,7 +2538,8 @@
       } catch { fail++; }
     }
     closeModal(); loadAccounts(); loadStats();
-    let msg = t('sso.importSuccess', ok);
+    lekiroApiKey: value('kiroApiKey'),
+      t msg = t('sso.importSuccess', ok);
     if (fail > 0) msg += t('sso.importPartial', fail);
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });

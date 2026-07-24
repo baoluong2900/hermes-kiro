@@ -77,3 +77,28 @@ func TestApplyKiroBaseHeadersOmitsTokenTypeForAWSAuthentication(t *testing.T) {
 		t.Fatalf("expected no token type for AWS auth, got %q", got)
 	}
 }
+
+func TestApplyKiroBaseHeadersMarksAPIKeyCredentials(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://runtime.us-east-1.kiro.dev/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &config.Account{
+		KiroApiKey:  "ksk_test_key",
+		AccessToken: "should-not-win",
+		AuthMethod:  "api_key",
+	}
+
+	applyKiroBaseHeaders(req, account, buildStreamingHeaderValues(account, req.URL.Host))
+
+	if got := req.Header.Get("Authorization"); got != "Bearer ksk_test_key" {
+		t.Fatalf("expected API key bearer, got %q", got)
+	}
+	// net/http.Header is case-insensitive; either casing maps to the same entry.
+	if got := req.Header.Get("tokentype"); got != "API_KEY" {
+		t.Fatalf("expected tokentype API_KEY, got %q", got)
+	}
+	if got := req.Header.Get("TokenType"); got != "API_KEY" {
+		t.Fatalf("expected TokenType/tokentype API_KEY, got %q", got)
+	}
+}

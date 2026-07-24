@@ -137,3 +137,62 @@ func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 
 // authOidcURL captures the current oidc URL builder so the test can restore it.
 func authOidcURL() func(string) string { return auth.GetOIDCTokenURLForTest() }
+
+func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_test_import|eu-central-1","authMethod":"api_key","nickname":"cli-key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "api_key" || got.KiroApiKey != "ksk_test_import" {
+		t.Fatalf("unexpected account: %+v", got)
+	}
+	if got.AccessToken != "ksk_test_import" {
+		t.Fatalf("accessToken should mirror api key, got %q", got.AccessToken)
+	}
+	if got.Region != "eu-central-1" {
+		t.Fatalf("region = %q", got.Region)
+	}
+	if got.RefreshToken != "" || got.ExpiresAt != 0 || got.ProfileArn != "" {
+		t.Fatalf("oauth fields should be empty: %+v", got)
+	}
+	if got.MachineId != config.MachineIdFromAPIKey("ksk_test_import") {
+		t.Fatalf("machineId = %q", got.MachineId)
+	}
+}
+
+func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_dup_import","authMethod":"api_key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first import expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req2 := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec2 := httptest.NewRecorder()
+	h.apiImportCredentials(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("duplicate expected 409, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+}

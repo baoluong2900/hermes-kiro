@@ -24,6 +24,9 @@ var socialTokenURL = func() string {
 // RefreshToken 刷新 access token
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	if config.IsAPIKeyAccount(account) {
+		return "", "", 0, "", fmt.Errorf("API Key credentials do not support token refresh")
+	}
 	// Resolve per-account proxy: account.ProxyURL > global config
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
