@@ -273,18 +273,43 @@ func TestChunkByRunes_Multibyte(t *testing.T) {
 
 func TestShouldSearchRound(t *testing.T) {
 	web := []KiroToolUse{{Name: "web_search"}, {Name: "web_search"}}
-	if !shouldSearchRound(0, web) {
+	if !shouldSearchRound(0, web, maxWebSearchRounds) {
 		t.Fatal("pure web_search should continue")
 	}
-	if shouldSearchRound(maxWebSearchRounds, web) {
+	if shouldSearchRound(maxWebSearchRounds, web, maxWebSearchRounds) {
 		t.Fatal("at limit should stop")
 	}
+	if shouldSearchRound(1, web, 1) {
+		t.Fatal("max_uses=1 must stop after first search round index")
+	}
 	mixed := []KiroToolUse{{Name: "web_search"}, {Name: "Bash"}}
-	if shouldSearchRound(0, mixed) {
+	if shouldSearchRound(0, mixed, maxWebSearchRounds) {
 		t.Fatal("mixed tools should not continue loop")
 	}
-	if shouldSearchRound(0, nil) {
+	if shouldSearchRound(0, nil, maxWebSearchRounds) {
 		t.Fatal("empty tool uses should not continue")
+	}
+}
+
+func TestResolveWebSearchMaxUses(t *testing.T) {
+	if got := resolveWebSearchMaxUses(nil); got != maxWebSearchRounds {
+		t.Fatalf("nil tools: got %d", got)
+	}
+	if got := resolveWebSearchMaxUses([]ClaudeTool{
+		{Type: "web_search_20250305", Name: "web_search", MaxUses: 2},
+		{Name: "Bash"},
+	}); got != 2 {
+		t.Fatalf("max_uses=2: got %d", got)
+	}
+	if got := resolveWebSearchMaxUses([]ClaudeTool{
+		{Type: "web_search_20250305", Name: "web_search", MaxUses: 99},
+	}); got != maxWebSearchRounds {
+		t.Fatalf("max_uses must be capped at %d, got %d", maxWebSearchRounds, got)
+	}
+	if got := resolveWebSearchMaxUses([]ClaudeTool{
+		{Type: "web_search_20250305", Name: "web_search"},
+	}); got != maxWebSearchRounds {
+		t.Fatalf("omitted max_uses: got %d", got)
 	}
 }
 
@@ -420,5 +445,117 @@ func TestBuildWebSearchContentBlocks(t *testing.T) {
 	}
 	if blocks[2]["type"] != "web_search_tool_result" {
 		t.Errorf("block2 type = %v", blocks[2]["type"])
+	}
+}
+
+// Regression: appendSearchRound must store content in a shape ClaudeToKiro can
+// extract (tool_use + tool_result pairing). Previously []map was dropped.
+func TestAppendSearchRound_ContentSurvivesClaudeToKiro(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "search something"},
+		},
+		Tools: []ClaudeTool{
+			{Type: "web_search_20250305", Name: "web_search", MaxUses: 3},
+			{Name: "Bash", Description: "run", InputSchema: map[string]interface{}{"type": "object"}},
+		},
+	}
+	round := &webSearchRoundOutcome{
+		text: "Looking it up.",
+		toolUses: []KiroToolUse{
+			{
+				ToolUseID: "toolu_ws_1",
+				Name:      "web_search",
+				Input:     map[string]interface{}{"query": "golang generics"},
+			},
+		},
+	}
+	snippet := "Go 1.18 introduced generics"
+	searched := []*WebSearchResults{
+		{Results: []WebSearchResult{{Title: "Generics", URL: "https://go.dev", Snippet: &snippet}}},
+	}
+	presentation := make([]map[string]interface{}, 0)
+	appendSearchRound(req, round, searched, &presentation)
+
+	if len(req.Messages) != 3 {
+		t.Fatalf("messages len = %d, want 3 (user + assistant + tool_result user)", len(req.Messages))
+	}
+	if len(presentation) != 2 {
+		t.Fatalf("presentation len = %d, want server_tool_use + web_search_tool_result", len(presentation))
+	}
+
+	// Direct extract on the in-memory shapes.
+	aText, aUses := extractClaudeAssistantContent(req.Messages[1].Content)
+	if aText != "Looking it up." || len(aUses) != 1 || aUses[0].ToolUseID != "toolu_ws_1" {
+		t.Fatalf("assistant extract failed: text=%q uses=%+v", aText, aUses)
+	}
+	_, _, uResults := extractClaudeUserContent(req.Messages[2].Content)
+	if len(uResults) != 1 || uResults[0].ToolUseID != "toolu_ws_1" {
+		t.Fatalf("user tool_result extract failed: %+v", uResults)
+	}
+	if len(uResults[0].Content) == 0 || !strings.Contains(uResults[0].Content[0].Text, "golang generics") {
+		t.Fatalf("tool_result summary missing query: %+v", uResults[0].Content)
+	}
+
+	// Full ClaudeToKiro must keep the active tool turn (history tool_use ↔ current toolResults).
+	payload := ClaudeToKiro(req, false)
+	if payload == nil {
+		t.Fatal("nil payload")
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) == 0 {
+		t.Fatal("ClaudeToKiro dropped tool_results after appendSearchRound")
+	}
+	if ctx.ToolResults[0].ToolUseID != "toolu_ws_1" {
+		t.Fatalf("tool result id = %q", ctx.ToolResults[0].ToolUseID)
+	}
+	// History last assistant must carry matching tool_use.
+	hist := payload.ConversationState.History
+	if len(hist) == 0 {
+		t.Fatal("expected history")
+	}
+	last := hist[len(hist)-1]
+	if last.AssistantResponseMessage == nil || len(last.AssistantResponseMessage.ToolUses) == 0 {
+		t.Fatalf("last history assistant missing tool_use: %+v", last.AssistantResponseMessage)
+	}
+	if last.AssistantResponseMessage.ToolUses[0].ToolUseID != "toolu_ws_1" {
+		t.Fatalf("history tool_use id = %q", last.AssistantResponseMessage.ToolUses[0].ToolUseID)
+	}
+}
+
+func TestExtractClaudeContent_MapSliceShape(t *testing.T) {
+	// Defense in depth: []map[string]interface{} must work even without []interface{}.
+	user := []map[string]interface{}{
+		{"type": "tool_result", "tool_use_id": "id1", "content": "ok"},
+	}
+	_, _, results := extractClaudeUserContent(user)
+	if len(results) != 1 || results[0].ToolUseID != "id1" {
+		t.Fatalf("map-slice user content: %+v", results)
+	}
+	asst := []map[string]interface{}{
+		{"type": "text", "text": "hi"},
+		{"type": "tool_use", "id": "id1", "name": "web_search", "input": map[string]interface{}{"query": "q"}},
+	}
+	text, uses := extractClaudeAssistantContent(asst)
+	if text != "hi" || len(uses) != 1 || uses[0].Name != "web_search" {
+		t.Fatalf("map-slice assistant content: text=%q uses=%+v", text, uses)
+	}
+}
+
+func TestParseSearchResults_EmptyResultsArrayIsValid(t *testing.T) {
+	// Empty results is a legitimate MCP success; only unparseable/error payloads are nil.
+	inner := `{"results":[],"totalResults":0,"query":"q"}`
+	mcpResp := &McpResponse{
+		Result: &McpResult{
+			Content: []McpContent{{Type: "text", Text: inner}},
+		},
+	}
+	results := parseSearchResults(mcpResp)
+	if results == nil {
+		t.Fatal("empty results array must parse as non-nil success")
+	}
+	if len(results.Results) != 0 {
+		t.Fatalf("results len = %d", len(results.Results))
 	}
 }

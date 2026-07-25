@@ -358,6 +358,9 @@ func parseSearchResults(mcpResp *McpResponse) *WebSearchResults {
 // performWebSearch runs MCP web_search across the account pool for the given model.
 // On total failure it returns (nil, lastErr) so callers can choose to error out
 // instead of silently fabricating empty results (the issue #120 symptom).
+// A 200 JSON-RPC envelope whose search payload cannot be parsed is also treated
+// as failure (retry next account) — only a well-formed results object (including
+// an empty results array) counts as success.
 func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, string, *config.Account, error) {
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -383,6 +386,15 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 			continue
 		}
 		results := parseSearchResults(mcpResp)
+		if results == nil {
+			// HTTP/RPC succeeded but payload is unusable — do not RecordSuccess or
+			// return a silent empty summary (issue #120 class of bugs).
+			lastErr = fmt.Errorf("MCP web_search returned unparseable or error search payload")
+			logger.Warnf("[WebSearch] %v on account %s", lastErr, account.Email)
+			excluded[account.ID] = true
+			h.handleAccountFailure(account, lastErr)
+			continue
+		}
 		h.pool.RecordSuccess(account.ID)
 		return results, toolUseID, account, nil
 	}
@@ -390,6 +402,29 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 		lastErr = fmt.Errorf("no available accounts for web_search")
 	}
 	return nil, "", nil, lastErr
+}
+
+// resolveWebSearchMaxUses returns the effective search budget for a request.
+// Native Anthropic tools may set max_uses; when omitted or non-positive, fall
+// back to maxWebSearchRounds. The value is also capped by maxWebSearchRounds
+// so a large client max_uses cannot open an unbounded agentic loop.
+func resolveWebSearchMaxUses(tools []ClaudeTool) int {
+	maxUses := 0
+	for _, t := range tools {
+		if !isNativeWebSearchTool(t) {
+			continue
+		}
+		if t.MaxUses > maxUses {
+			maxUses = t.MaxUses
+		}
+	}
+	if maxUses <= 0 {
+		return maxWebSearchRounds
+	}
+	if maxUses > maxWebSearchRounds {
+		return maxWebSearchRounds
+	}
+	return maxUses
 }
 
 // ==================== Summary & content blocks ====================

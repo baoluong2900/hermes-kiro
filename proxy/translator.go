@@ -631,42 +631,58 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 		return s, nil, nil
 	}
 
-	if blocks, ok := content.([]interface{}); ok {
-		for _, b := range blocks {
-			block, ok := b.(map[string]interface{})
-			if !ok {
-				continue
+	// Accept both JSON-decoded []interface{} and in-memory []map[string]interface{}
+	// (agentic loops append the latter without a JSON round-trip).
+	for _, block := range contentBlocksAsMaps(content) {
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text", "input_text":
+			if t, ok := block["text"].(string); ok {
+				text += t
 			}
-
-			blockType, _ := block["type"].(string)
-			switch blockType {
-			case "text", "input_text":
-				if t, ok := block["text"].(string); ok {
-					text += t
-				}
-			case "image", "image_url", "input_image":
-				if img := extractImageFromClaudeBlock(block); img != nil {
-					images = append(images, *img)
-				}
-			case "tool_result":
-				toolUseID, _ := block["tool_use_id"].(string)
-				resultContent, resultImages := extractToolResultContent(block["content"])
-				if len(resultImages) > 0 {
-					images = append(images, resultImages...)
-					if strings.TrimSpace(resultContent) == "" {
-						resultContent = toolResultImagePlaceholder
-					}
-				}
-				toolResults = append(toolResults, KiroToolResult{
-					ToolUseID: toolUseID,
-					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
-				})
+		case "image", "image_url", "input_image":
+			if img := extractImageFromClaudeBlock(block); img != nil {
+				images = append(images, *img)
 			}
+		case "tool_result":
+			toolUseID, _ := block["tool_use_id"].(string)
+			resultContent, resultImages := extractToolResultContent(block["content"])
+			if len(resultImages) > 0 {
+				images = append(images, resultImages...)
+				if strings.TrimSpace(resultContent) == "" {
+					resultContent = toolResultImagePlaceholder
+				}
+			}
+			toolResults = append(toolResults, KiroToolResult{
+				ToolUseID: toolUseID,
+				Content:   []KiroResultContent{{Text: resultContent}},
+				Status:    "success",
+			})
 		}
 	}
 
 	return text, images, toolResults
+}
+
+// contentBlocksAsMaps normalizes Claude content arrays for extraction.
+// JSON unmarshaling yields []interface{}; in-process builders often use
+// []map[string]interface{}. Both must be accepted so tool_use/tool_result
+// feedback from agentic loops is not dropped.
+func contentBlocksAsMaps(content interface{}) []map[string]interface{} {
+	switch c := content.(type) {
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(c))
+		for _, b := range c {
+			if block, ok := b.(map[string]interface{}); ok {
+				out = append(out, block)
+			}
+		}
+		return out
+	case []map[string]interface{}:
+		return c
+	default:
+		return nil
+	}
 }
 
 func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
@@ -748,32 +764,27 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		return s, nil
 	}
 
-	if blocks, ok := content.([]interface{}); ok {
-		for _, b := range blocks {
-			block, ok := b.(map[string]interface{})
-			if !ok {
-				continue
+	// Same dual-shape support as extractClaudeUserContent (JSON []interface{}
+	// and in-memory []map[string]interface{} from agentic loop feedback).
+	for _, block := range contentBlocksAsMaps(content) {
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text":
+			if t, ok := block["text"].(string); ok {
+				text += t
 			}
-
-			blockType, _ := block["type"].(string)
-			switch blockType {
-			case "text":
-				if t, ok := block["text"].(string); ok {
-					text += t
-				}
-			case "tool_use":
-				id, _ := block["id"].(string)
-				name, _ := block["name"].(string)
-				input, _ := block["input"].(map[string]interface{})
-				if input == nil {
-					input = make(map[string]interface{})
-				}
-				toolUses = append(toolUses, KiroToolUse{
-					ToolUseID: id,
-					Name:      name,
-					Input:     input,
-				})
+		case "tool_use":
+			id, _ := block["id"].(string)
+			name, _ := block["name"].(string)
+			input, _ := block["input"].(map[string]interface{})
+			if input == nil {
+				input = make(map[string]interface{})
 			}
+			toolUses = append(toolUses, KiroToolUse{
+				ToolUseID: id,
+				Name:      name,
+				Input:     input,
+			})
 		}
 	}
 

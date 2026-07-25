@@ -43,8 +43,13 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 	var totalCredits float64
 	reqStart := time.Now()
 	fallbackInput := estimatedInputTokens
+	// Respect native max_uses (capped by maxWebSearchRounds).
+	maxUses := resolveWebSearchMaxUses(req.Tools)
+	searchCount := 0
 
-	for roundIdx := 0; roundIdx <= maxWebSearchRounds; roundIdx++ {
+	// Allow one extra iteration so a terminal flush can run after the last
+	// search-only round (same pattern as 0..=MAX_WEB_SEARCH_ROUNDS in kiro-rs).
+	for roundIdx := 0; roundIdx <= maxUses; roundIdx++ {
 		round, account, err := h.callUpstreamForWebSearch(&working, thinking, fallbackInput)
 		if err != nil {
 			logger.Warnf("[WebSearchLoop] upstream round %d failed: %v", roundIdx, err)
@@ -70,7 +75,10 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		}
 		totalCredits += round.credits
 
-		if shouldSearchRound(roundIdx, round.toolUses) {
+		// Continue only when every tool_use is web_search, budget remains, and
+		// this round's searches fit under max_uses.
+		roundSearchN := countWebSearchToolUses(round.toolUses)
+		if shouldSearchRound(roundIdx, round.toolUses, maxUses) && searchCount+roundSearchN <= maxUses {
 			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses)
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
@@ -78,16 +86,22 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+searchErr.Error())
 				return
 			}
+			searchCount += roundSearchN
 			appendSearchRound(&working, round, searched, &presentation)
 			continue
 		}
 
 		// Terminal round: execute any remaining web_search (mixed with client tools
-		// or round-limit), present them as server_tool_use, pass client tools through.
+		// or round/max_uses limit), present them as server_tool_use, pass client tools through.
+		// Honor remaining max_uses budget for final-round web_search executions.
 		searched := make([]*WebSearchResults, len(round.toolUses))
 		for i, tu := range round.toolUses {
 			if tu.Name != webSearchToolName {
 				continue
+			}
+			if searchCount >= maxUses {
+				logger.Warnf("[WebSearchLoop] max_uses=%d reached; skipping further web_search", maxUses)
+				break
 			}
 			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input))
 			if sErr != nil {
@@ -97,6 +111,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 				return
 			}
 			searched[i] = results
+			searchCount++
 		}
 
 		content := buildFlushContent(presentation, round.text, round.toolUses, searched)
@@ -210,9 +225,12 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 }
 
 // shouldSearchRound continues the loop only when every tool_use is web_search
-// and the round limit has not been reached.
-func shouldSearchRound(roundIdx int, toolUses []KiroToolUse) bool {
-	if len(toolUses) == 0 || roundIdx >= maxWebSearchRounds {
+// and the max_uses / round budget has not been reached.
+func shouldSearchRound(roundIdx int, toolUses []KiroToolUse, maxUses int) bool {
+	if maxUses <= 0 {
+		maxUses = maxWebSearchRounds
+	}
+	if len(toolUses) == 0 || roundIdx >= maxUses {
 		return false
 	}
 	for _, tu := range toolUses {
@@ -221,6 +239,16 @@ func shouldSearchRound(roundIdx int, toolUses []KiroToolUse) bool {
 		}
 	}
 	return true
+}
+
+func countWebSearchToolUses(toolUses []KiroToolUse) int {
+	n := 0
+	for _, tu := range toolUses {
+		if tu.Name == webSearchToolName {
+			n++
+		}
+	}
+	return n
 }
 
 // searchAllWebUses runs MCP for each tool_use in order (all are web_search).
@@ -238,13 +266,18 @@ func (h *Handler) searchAllWebUses(model string, toolUses []KiroToolUse) ([]*Web
 
 // appendSearchRound feeds assistant(text + web_search tool_use) + user(tool_result)
 // into the working messages and appends presentation blocks for the client.
+//
+// Content is stored as []interface{} (not []map[string]interface{}) so that
+// ClaudeToKiro's extractClaude* helpers — which historically only accepted the
+// JSON-decoded []interface{} shape — always see tool_use/tool_result blocks.
+// extractClaude* also accepts []map now as defense in depth.
 func appendSearchRound(
 	req *ClaudeRequest,
 	round *webSearchRoundOutcome,
 	searched []*WebSearchResults,
 	presentation *[]map[string]interface{},
 ) {
-	assistantContent := make([]map[string]interface{}, 0)
+	assistantContent := make([]interface{}, 0)
 	if strings.TrimSpace(round.text) != "" {
 		assistantContent = append(assistantContent, map[string]interface{}{
 			"type": "text",
@@ -268,7 +301,7 @@ func appendSearchRound(
 		Content: assistantContent,
 	})
 
-	userContent := make([]map[string]interface{}, 0, len(round.toolUses))
+	userContent := make([]interface{}, 0, len(round.toolUses))
 	for i, tu := range round.toolUses {
 		var results *WebSearchResults
 		if i < len(searched) {
