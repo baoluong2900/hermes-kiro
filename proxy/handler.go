@@ -874,11 +874,26 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
+	apiKeyID := apiKeyIDFromContext(r.Context())
+
+	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
+	if hasWebSearchTool(&req) {
+		h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID)
+		return
+	}
+
+	// Mixed tools including native web_search: agentic loop digests web_search internally
+	// and returns client tool_use blocks as-is.
+	if hasWebSearchAmongTools(&req) {
+		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
+		h.runWebSearchLoop(w, &req, thinking, estimatedInputTokens, apiKeyID)
+		return
+	}
+
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// Stream or non-stream
-	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
