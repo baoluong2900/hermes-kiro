@@ -79,8 +79,12 @@ func kiroRegionForProfile(account *config.Account, profileArn string) string {
 		if r := regionFromProfileArn(account.ProfileArn); r != "" {
 			return r
 		}
-		if r := strings.TrimSpace(account.Region); r != "" {
-			return r
+		// API Key credentials use Region for the CLI runtime data plane.
+		// OAuth credentials use Region for authentication only.
+		if config.IsAPIKeyAccount(account) {
+			if r := strings.TrimSpace(account.Region); r != "" {
+				return r
+			}
 		}
 	}
 	return "us-east-1"
@@ -134,22 +138,12 @@ func kiroProfileRegionCandidates(account *config.Account) []string {
 	}
 
 	if account != nil {
-		add(account.Region)
+		// Profile ARN is authoritative. Account.Region is the authentication
+		// region and may not host an Amazon Q Developer profile.
+		add(regionFromProfileArn(account.ProfileArn))
 	}
-
-	// Established AWS auth methods already have an authoritative region and
-	// retain their historical single-region behavior. Microsoft external_idp
-	// accounts do not: their profile may live in either Kiro data plane.
-	probeFallbacks := account == nil ||
-		strings.TrimSpace(account.Region) == "" ||
-		strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
-	if probeFallbacks {
-		for _, region := range defaultKiroProfileRegions {
-			add(region)
-		}
-	}
-	if len(candidates) == 0 {
-		add("us-east-1")
+	for _, region := range defaultKiroProfileRegions {
+		add(region)
 	}
 	return candidates
 }

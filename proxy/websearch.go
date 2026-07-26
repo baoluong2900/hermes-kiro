@@ -250,9 +250,6 @@ func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, erro
 		return nil, fmt.Errorf("nil MCP request")
 	}
 
-	region := kiroRegion(account)
-	endpoint := fmt.Sprintf("https://q.%s.amazonaws.com/mcp", region)
-
 	// Ensure profile ARN is available for non-API-key accounts (header required by MCP).
 	profileArn := ""
 	if account != nil {
@@ -265,6 +262,9 @@ func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, erro
 			logger.Debugf("[MCP] ProfileArn resolve for %s: %v", accountEmailForLog(account), err)
 		}
 	}
+
+	region := kiroRegionForProfile(account, profileArn)
+	endpoint := fmt.Sprintf("https://q.%s.amazonaws.com/mcp", region)
 
 	reqBody, err := json.Marshal(mcpReq)
 	if err != nil {

@@ -57,6 +57,18 @@ func TestRegionalizeURLForProfileUsesPayloadProfileArnRegion(t *testing.T) {
 	}
 }
 
+func TestRegionalizeURLDoesNotUseOAuthAuthenticationRegion(t *testing.T) {
+	account := &config.Account{
+		AuthMethod: "idc",
+		Region:     "ap-southeast-2",
+	}
+
+	rawURL := "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+	if got := regionalizeURL(rawURL, account); got != rawURL {
+		t.Fatalf("expected missing profile ARN to keep the safe default endpoint, got %q", got)
+	}
+}
+
 func TestResolveProfileArnFetchesAndCachesProfile(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(configPath); err != nil {
@@ -371,8 +383,13 @@ func TestKiroProfileRegionCandidatesExternalIncludesBothDataPlanes(t *testing.T)
 
 	awsAccount := &config.Account{AuthMethod: "idc", Region: "ap-southeast-2"}
 	got = kiroProfileRegionCandidates(awsAccount)
-	if len(got) != 1 || got[0] != "ap-southeast-2" {
-		t.Fatalf("expected established AWS auth to stay single-region, got %v", got)
+	if len(got) != len(want) {
+		t.Fatalf("expected IAM Identity Center candidates %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected IAM Identity Center candidates %v, got %v", want, got)
+		}
 	}
 }
 
