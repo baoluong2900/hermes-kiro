@@ -6,17 +6,17 @@
 
 Convert Kiro accounts to OpenAI / Anthropic compatible API service.
 
-[English](README.md) | [中文](README_CN.md)
+[English](README.md) | [中文](README_CN.md) | [Tiếng Việt](README_VI.md)
 
 If this project helps you, a Star would mean a lot.
 
 ## Features
 
-- Anthropic `/v1/messages` & OpenAI `/v1/chat/completions`
+- Anthropic `/v1/messages`, OpenAI `/v1/chat/completions` & OpenAI `/v1/responses`
 - Multi-account pool with round-robin load balancing
 - Auto token refresh, SSE streaming, Web admin panel
 - Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, local cache, credentials JSON, Kiro API Key
-- Usage tracking, account import/export, i18n (CN / EN)
+- Usage tracking, account import/export, i18n (CN / EN / VI)
 - Support configuring outbound proxy (SOCKS5 / HTTP)
 
 ## Quick Start

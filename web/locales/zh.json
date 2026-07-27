@@ -421,6 +421,7 @@
   "theme.status": "主题：{0}",
   "lang.zh": "中文",
   "lang.en": "EN",
+  "lang.vi": "VI",
   "api.claude": "Claude API",
   "api.openai": "OpenAI API",
   "api.openaiResponses": "OpenAI Responses API",
