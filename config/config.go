@@ -174,6 +174,36 @@ type ApiKeyEntry struct {
 	RequestsCount int64   `json:"requestsCount,omitempty"`
 }
 
+// ProxyEntry is one saved outbound proxy. Credentials live in Username/Password
+// rather than in the URL so the secret is easy to mask in API responses.
+type ProxyEntry struct {
+	ID       string `json:"id"`
+	Country  string `json:"country"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Scheme   string `json:"scheme"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Enabled  bool   `json:"enabled"`
+}
+
+// URL renders the entry as a proxy URL usable by net/http.
+func (e ProxyEntry) URL() string {
+	scheme := strings.ToLower(strings.TrimSpace(e.Scheme))
+	if scheme == "" {
+		scheme = "http"
+	}
+	host := strings.TrimSpace(e.Host)
+	if host == "" {
+		return ""
+	}
+	auth := ""
+	if e.Username != "" {
+		auth = url.UserPassword(e.Username, e.Password).String() + "@"
+	}
+	return fmt.Sprintf("%s://%s%s:%d", scheme, auth, host, e.Port)
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
@@ -210,6 +240,10 @@ type Config struct {
 	//         "http://host:port",  "http://user:pass@host:port"
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// Proxies is the saved outbound-proxy inventory. Disabled entries are kept
+	// for reference but are never used for routing.
+	Proxies []ProxyEntry `json:"proxies,omitempty"`
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
@@ -1185,6 +1219,87 @@ func UpdateProxySettings(proxyURL string) error {
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
 	return Save()
+}
+
+// GetProxies returns a copy of the saved proxy inventory.
+func GetProxies() []ProxyEntry {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	out := make([]ProxyEntry, len(cfg.Proxies))
+	copy(out, cfg.Proxies)
+	return out
+}
+
+// AddProxy appends an inventory entry and persists it. The ID is assigned here
+// so callers cannot collide.
+func AddProxy(entry ProxyEntry) (ProxyEntry, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	entry.ID = GenerateMachineId()
+	cfg.Proxies = append(cfg.Proxies, entry)
+	if err := Save(); err != nil {
+		cfg.Proxies = cfg.Proxies[:len(cfg.Proxies)-1]
+		return ProxyEntry{}, err
+	}
+	return entry, nil
+}
+
+// SetProxyEnabled flips the enabled flag of one inventory entry.
+func SetProxyEnabled(id string, enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Proxies {
+		if cfg.Proxies[i].ID == id {
+			cfg.Proxies[i].Enabled = enabled
+			return Save()
+		}
+	}
+	return errProxyNotFound
+}
+
+// RemoveProxy deletes one inventory entry.
+func RemoveProxy(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Proxies {
+		if cfg.Proxies[i].ID == id {
+			cfg.Proxies = append(cfg.Proxies[:i], cfg.Proxies[i+1:]...)
+			return Save()
+		}
+	}
+	return errProxyNotFound
+}
+
+var errProxyNotFound = errors.New("proxy not found")
+
+// ErrProxyNotFound reports that an inventory id does not exist.
+func ErrProxyNotFound() error { return errProxyNotFound }
+
+// EnabledProxyURLs returns the usable proxy URLs from the inventory, deduped and
+// in stable order. It is what per-account routing hashes over.
+func EnabledProxyURLs() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(cfg.Proxies))
+	out := make([]string, 0, len(cfg.Proxies))
+	for _, e := range cfg.Proxies {
+		if !e.Enabled {
+			continue
+		}
+		raw := e.URL()
+		if raw == "" || seen[raw] {
+			continue
+		}
+		seen[raw] = true
+		out = append(out, raw)
+	}
+	return out
 }
 
 // GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.

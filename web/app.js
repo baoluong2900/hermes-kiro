@@ -1688,7 +1688,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadProxyList(), loadPromptFilter(), loadApiKeys(), loadExternalApiConfig()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadPromptFilter(), loadApiKeys(), loadExternalApiConfig()]);
     refreshCustomSelects();
   }
 
@@ -1807,9 +1807,10 @@
       const rows = $('proxyListRows');
       rows.replaceChildren();
       const proxies = data.proxies || [];
-      status.textContent = proxies.length + ' saved · Routing inactive on Cloudflare Worker';
+      const active = proxies.filter(p => p.enabled).length;
+      status.textContent = t('settings.proxyCount', proxies.length, active);
       if (!proxies.length) {
-        rows.textContent = 'No proxies saved.';
+        rows.textContent = t('settings.proxyNone');
         return;
       }
       for (const item of proxies) {
@@ -1817,16 +1818,17 @@
         row.className = 'proxy-inventory-row';
         const label = document.createElement('span');
         label.textContent = item.country + ' · ' + item.scheme + '://' + item.host + ':' + item.port +
-          (item.username ? ' · user ' + item.username : '') + (item.enabled ? '' : ' · disabled');
+          (item.username ? ' · ' + t('settings.proxyUserTag', item.username) : '') +
+          (item.enabled ? '' : ' · ' + t('settings.proxyDisabledTag'));
         const toggle = document.createElement('button');
         toggle.type = 'button'; toggle.className = 'btn btn-outline btn-sm';
-        toggle.textContent = item.enabled ? 'Disable' : 'Enable';
+        toggle.textContent = item.enabled ? t('settings.proxyDisable') : t('settings.proxyEnable');
         toggle.addEventListener('click', () => updateProxyList(item.id, 'PATCH', { enabled: !item.enabled }));
         const remove = document.createElement('button');
         remove.type = 'button'; remove.className = 'btn btn-danger btn-sm';
-        remove.textContent = 'Remove';
+        remove.textContent = t('common.remove');
         remove.addEventListener('click', async () => {
-          if (await confirmAction('Remove this proxy from the inventory?', { variant: 'danger' })) {
+          if (await confirmAction(t('settings.proxyRemoveConfirm'), { variant: 'danger' })) {
             await updateProxyList(item.id, 'DELETE');
           }
         });
@@ -1850,12 +1852,12 @@
   async function addProxyList() {
     const field = $('proxyBulkInput');
     const lines = field.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    if (!lines.length) { toast('Enter at least one proxy', 'warning'); return; }
+    if (!lines.length) { toast(t('settings.proxyEnterOne'), 'warning'); return; }
     const parsed = [];
     for (const line of lines) {
       const match = line.match(/^(ID|VN)\|([^:|\s]+):(\d{1,5}):([^:\s]+):([^\s]+)$/i);
       if (!match || Number(match[3]) > 65535 || Number(match[3]) < 1) {
-        toast('Invalid line. Use ID|host:port:username:password or VN|host:port:username:password', 'warning');
+        toast(t('settings.proxyInvalidLine'), 'warning');
         return;
       }
       parsed.push({ country: match[1].toUpperCase(), host: match[2], port: Number(match[3]),
@@ -1867,14 +1869,14 @@
       for (const entry of parsed) {
         const res = await api('/proxy-list', { method: 'POST', body: JSON.stringify(entry) });
         const data = await parseApiResponse(res);
-        if (!res.ok || !data.success) throw new Error(data.error || 'Save failed');
+        if (!res.ok || !data.success) throw new Error(data.error || t('common.saveFailed'));
       }
       field.value = '';
       await loadProxyList();
-      toast(parsed.length + ' proxies saved to inventory', 'success');
+      toast(t('settings.proxySavedCount', parsed.length), 'success');
     } catch (err) {
       await loadProxyList();
-      toast('Import stopped: ' + err.message, 'error');
+      toast(t('settings.proxyImportStopped', err.message), 'error');
     } finally { button.disabled = false; }
   }
   async function loadProxyConfig() {
@@ -3887,6 +3889,7 @@
     if (tab === 'logs') loadLogs();
     if (tab === 'apiKeys') loadApiKeys().then(refreshApiKeyTrace);
     if (tab === 'channels') loadChannelStatus();
+    if (tab === 'proxy') { loadProxyConfig(); loadProxyList(); }
   }
 
   // Event wiring

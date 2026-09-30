@@ -3323,6 +3323,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
 		h.apiUpdateProxy(w, r)
+	case path == "/proxy-list" && r.Method == "GET":
+		h.apiListProxies(w, r)
+	case path == "/proxy-list" && r.Method == "POST":
+		h.apiAddProxy(w, r)
+	case strings.HasPrefix(path, "/proxy-list/") && r.Method == "PATCH":
+		h.apiUpdateProxyEntry(w, r, strings.TrimPrefix(path, "/proxy-list/"))
+	case strings.HasPrefix(path, "/proxy-list/") && r.Method == "DELETE":
+		h.apiDeleteProxyEntry(w, r, strings.TrimPrefix(path, "/proxy-list/"))
 	case path == "/prompt-filter" && r.Method == "GET":
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
@@ -5562,6 +5570,159 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	applyProxyConfig(req.ProxyURL)
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiListProxies lists the saved proxy inventory. Passwords are masked; the
+// response never contains a stored credential.
+func (h *Handler) apiListProxies(w http.ResponseWriter, r *http.Request) {
+	entries := config.GetProxies()
+	items := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, proxyEntryView(e))
+	}
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "proxies": items})
+}
+
+// apiAddProxy adds one or more inventory entries. The body may be either a
+// single object or {"proxies": [ ... ]}. Each entry is validated the same way
+// the Cloudflare worker validates it, so an entry saved on either runtime is
+// dialable.
+func (h *Handler) apiAddProxy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Country  string              `json:"country"`
+		Host     string              `json:"host"`
+		Port     int                 `json:"port"`
+		Scheme   string              `json:"scheme"`
+		Username string              `json:"username"`
+		Password string              `json:"password"`
+		Proxies  []config.ProxyEntry `json:"proxies"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeProxyErr(w, 400, "Invalid JSON")
+		return
+	}
+
+	entries := req.Proxies
+	if len(entries) == 0 {
+		entries = []config.ProxyEntry{{
+			Country:  req.Country,
+			Host:     req.Host,
+			Port:     req.Port,
+			Scheme:   req.Scheme,
+			Username: req.Username,
+			Password: req.Password,
+		}}
+	}
+
+	added := make([]map[string]any, 0, len(entries))
+	for _, raw := range entries {
+		entry, err := normalizeProxyEntry(raw)
+		if err != nil {
+			writeProxyErr(w, 400, err.Error())
+			return
+		}
+		saved, err := config.AddProxy(entry)
+		if err != nil {
+			writeProxyErr(w, 500, err.Error())
+			return
+		}
+		added = append(added, proxyEntryView(saved))
+	}
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "proxies": added})
+}
+
+// apiUpdateProxyEntry enables or disables one inventory entry.
+func (h *Handler) apiUpdateProxyEntry(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enabled == nil {
+		writeProxyErr(w, 400, "enabled must be a boolean")
+		return
+	}
+	if err := config.SetProxyEnabled(id, *req.Enabled); err != nil {
+		writeProxyErr(w, 404, "Proxy not found")
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+// apiDeleteProxyEntry removes one inventory entry.
+func (h *Handler) apiDeleteProxyEntry(w http.ResponseWriter, r *http.Request, id string) {
+	if err := config.RemoveProxy(id); err != nil {
+		writeProxyErr(w, 404, "Proxy not found")
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+// proxyEntryView masks the credential before an entry leaves the process.
+func proxyEntryView(e config.ProxyEntry) map[string]any {
+	scheme := strings.ToLower(strings.TrimSpace(e.Scheme))
+	if scheme == "" {
+		scheme = "http"
+	}
+	view := map[string]any{
+		"id":      e.ID,
+		"country": e.Country,
+		"host":    e.Host,
+		"port":    e.Port,
+		"scheme":  scheme,
+		"enabled": e.Enabled,
+		"hasAuth": e.Username != "",
+	}
+	if e.Username != "" {
+		view["username"] = e.Username
+	}
+	return view
+}
+
+// normalizeProxyEntry validates and canonicalizes one inbound entry.
+func normalizeProxyEntry(raw config.ProxyEntry) (config.ProxyEntry, error) {
+	country := strings.ToUpper(strings.TrimSpace(raw.Country))
+	if country != "ID" && country != "VN" {
+		return config.ProxyEntry{}, errors.New("country must be ID or VN")
+	}
+	host := strings.TrimSpace(raw.Host)
+	if host == "" || strings.ContainsAny(host, " /:@") {
+		return config.ProxyEntry{}, errors.New("invalid proxy host")
+	}
+	if raw.Port < 1 || raw.Port > 65535 {
+		return config.ProxyEntry{}, errors.New("port must be between 1 and 65535")
+	}
+	scheme := strings.ToLower(strings.TrimSpace(raw.Scheme))
+	if scheme == "" {
+		scheme = "http"
+	}
+	if !validProxyScheme(scheme) {
+		return config.ProxyEntry{}, errors.New("scheme must be http, https, socks5 or socks5h")
+	}
+	if len(raw.Username) > 256 || len(raw.Password) > 256 {
+		return config.ProxyEntry{}, errors.New("credentials too long")
+	}
+	return config.ProxyEntry{
+		Country:  country,
+		Host:     host,
+		Port:     raw.Port,
+		Scheme:   scheme,
+		Username: raw.Username,
+		Password: raw.Password,
+		Enabled:  true,
+	}, nil
+}
+
+func validProxyScheme(scheme string) bool {
+	switch scheme {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeProxyErr(w http.ResponseWriter, code int, msg string) {
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]any{"success": false, "error": msg})
 }
 
 // apiGetVersion 获取版本信息
