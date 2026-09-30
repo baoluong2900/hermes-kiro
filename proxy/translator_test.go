@@ -407,40 +407,63 @@ func TestParseModelAndThinking(t *testing.T) {
 		wantThinking bool
 	}{
 		// Format normalization: dash → dot for new versions without code changes.
+		{"new opus 5.5 dot form", "claude-opus-5.5", "claude-opus-5.5", false},
+		{"new opus 5.5 thinking", "claude-opus-5.5-thinking", "claude-opus-5.5", true},
+		{"claude-opus alias", "claude-opus", "claude-opus-5", false},
+		{"claude-opus thinking", "claude-opus-thinking", "claude-opus-5", true},
+		{"opus alias", "opus", "claude-opus-5", false},
+		{"opus thinking", "opus-thinking", "claude-opus-5", true},
 		{"new opus dash form", "claude-opus-4-8", "claude-opus-4.8", false},
 		{"new opus dot form", "claude-opus-4.8", "claude-opus-4.8", false},
 		{"existing opus dash form", "claude-opus-4-7", "claude-opus-4.7", false},
 		{"existing opus dot form", "claude-opus-4.7", "claude-opus-4.7", false},
-		{"sonnet dash form", "claude-sonnet-4-6", "claude-sonnet-4.6", false},
-		{"sonnet dot form", "claude-sonnet-4.6", "claude-sonnet-4.6", false},
-		{"haiku dash form", "claude-haiku-4-5", "claude-haiku-4.5", false},
-		{"haiku dot form", "claude-haiku-4.5", "claude-haiku-4.5", false},
-		{"sonnet 5 alias with version suffix", "claude-sonnet-5-0", "claude-sonnet-4.5", false},
 		{"opus 5 pass through", "claude-opus-5", "claude-opus-5", false},
 		{"opus 5 thinking pass through", "claude-opus-5-thinking", "claude-opus-5", true},
+		{"sonnet 5 dot-zero spelling canonicalizes", "claude-sonnet-5-0", "claude-sonnet-5", false},
+		{"sonnet 5 passes through, never downgraded", "claude-sonnet-5", "claude-sonnet-5", false},
 
-		// Bare family name passes through (no minor to normalize).
+		// Live generations pass through unchanged. These ids are in Kiro's
+		// ListAvailableModels, so folding them would silently run a different
+		// model than the caller selected (claude-haiku-4.5 → Sonnet was a
+		// cross-family substitution). Both spellings resolve identically because
+		// normalization runs before the alias table.
+		{"live sonnet 4.6 dash form", "claude-sonnet-4-6", "claude-sonnet-4.6", false},
+		{"live sonnet 4.6 dot form", "claude-sonnet-4.6", "claude-sonnet-4.6", false},
+		{"live haiku 4.5 dash form", "claude-haiku-4-5", "claude-haiku-4.5", false},
+		{"live haiku 4.5 dot form", "claude-haiku-4.5", "claude-haiku-4.5", false},
+		{"live opus 4.6 dash form", "claude-opus-4-6", "claude-opus-4.6", false},
+		{"live opus 4.6 dot form", "claude-opus-4.6", "claude-opus-4.6", false},
+		{"live opus 4.5 dot form", "claude-opus-4.5", "claude-opus-4.5", false},
+		{"live sonnet 4.5 dot form", "claude-sonnet-4.5", "claude-sonnet-4.5", false},
 		{"bare sonnet 4", "claude-sonnet-4", "claude-sonnet-4", false},
 
-		// Dated snapshot must hit the alias before the regex rewrites it.
+		// Dated snapshots collapse to the same live generation rather than to a
+		// different one. The Opus form used to normalize into the nonexistent
+		// "claude-opus-4.5-20251101" and be forwarded verbatim.
 		{"dated sonnet snapshot", "claude-sonnet-4-20250514", "claude-sonnet-4", false},
+		{"dated opus snapshot", "claude-opus-4-5-20251101", "claude-opus-4.5", false},
 
 		// Cross-family legacy IDs.
-		{"claude 3.5 sonnet", "claude-3-5-sonnet", "claude-sonnet-4.5", false},
-		{"claude 3 opus", "claude-3-opus", "claude-opus-4.6", false},
-		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-4", false},
-		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5", false},
+		{"claude 3.5 sonnet", "claude-3-5-sonnet", "claude-sonnet-5", false},
+		{"claude 3 opus", "claude-3-opus", "claude-opus-4.7", false},
+		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-5", false},
+		{"claude 3 haiku", "claude-3-haiku", "claude-sonnet-5", false},
 
 		// Non-Anthropic fallbacks.
-		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
-		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
-		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
-		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5", false},
+		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-5", false},
+		{"gpt-4o", "gpt-4o", "claude-sonnet-5", false},
+		{"gpt-4", "gpt-4", "claude-sonnet-5", false},
+		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-5", false},
+
+		// The real Kiro gpt tiers are live ids and must survive untouched.
+		{"gpt-5.6-sol passes through", "gpt-5.6-sol", "gpt-5.6-sol", false},
+		{"gpt-5.6-terra passes through", "gpt-5.6-terra", "gpt-5.6-terra", false},
+		{"auto passes through", "auto", "auto", false},
 
 		// Thinking suffix is stripped before mapping.
 		{"thinking suffix on dash form", "claude-opus-4-8-thinking", "claude-opus-4.8", true},
 		{"thinking suffix on dot form", "claude-sonnet-4.5-thinking", "claude-sonnet-4.5", true},
-		{"thinking suffix on legacy alias", "claude-3-5-sonnet-thinking", "claude-sonnet-4.5", true},
+		{"thinking suffix on legacy alias", "claude-3-5-sonnet-thinking", "claude-sonnet-5", true},
 
 		// Unknown models pass through unchanged.
 		{"unknown model", "some-other-model", "some-other-model", false},
@@ -461,12 +484,18 @@ func TestParseModelAndThinking(t *testing.T) {
 }
 
 func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
-	// Guards the \b boundary in claudeVersionPattern: without it, the regex would
-	// rewrite "claude-sonnet-4-20250514" to "claude-sonnet-4.20250514" before the
-	// alias table could redirect it.
+	// Guards the \b boundary in claudeVersionPattern. Asserted on the regex itself
+	// rather than on ParseModelAndThinking's result: the alias table now folds this
+	// id onto a live model either way, so a result-only assertion would stay green
+	// after the boundary was dropped.
+	normalized := claudeVersionPattern.ReplaceAllString("claude-sonnet-4-20250514", "claude-$1-$2.$3")
+	if normalized != "claude-sonnet-4-20250514" {
+		t.Fatalf("dated snapshot must not be version-normalized, got %q", normalized)
+	}
+
 	got, _ := ParseModelAndThinking("claude-sonnet-4-20250514", "-thinking")
 	if got != "claude-sonnet-4" {
-		t.Fatalf("dated snapshot must alias to claude-sonnet-4, got %q", got)
+		t.Fatalf("dated snapshot must resolve to its live generation, got %q", got)
 	}
 	if strings.Contains(got, ".") {
 		t.Fatalf("dated snapshot must not be rewritten with a dot, got %q", got)

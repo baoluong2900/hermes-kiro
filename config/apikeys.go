@@ -106,6 +106,8 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
+	cfg.ApiKeys[idx].ExpiresAt = patch.ExpiresAt
+	cfg.ApiKeys[idx].ExpiryPreset = patch.ExpiryPreset
 	if patch.Migrated {
 		cfg.ApiKeys[idx].Migrated = true
 	}
@@ -173,6 +175,38 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 				cfg.ApiKeys[i].CreditsUsed += credits
 			}
 			cfg.ApiKeys[i].RequestsCount++
+			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
+			return saveLocked()
+		}
+	}
+	return errors.New("api key not found")
+}
+
+// RecordApiKeyPartialUsage adds tokens and credits without incrementing
+// RequestsCount, for an upstream attempt that consumed real quota but did not
+// produce a delivered response — a stream that broke mid-answer, or an attempt
+// that failed and was retried on another account.
+//
+// Those cost money upstream and must land on the key's balance, but they are not
+// separate client requests: counting them would report one user request as several
+// and make the per-request averages in the admin panel meaningless.
+func RecordApiKeyPartialUsage(id string, tokens int64, credits float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	if tokens <= 0 && credits <= 0 {
+		return nil
+	}
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].ID == id {
+			if tokens > 0 {
+				cfg.ApiKeys[i].TokensUsed += tokens
+			}
+			if credits > 0 {
+				cfg.ApiKeys[i].CreditsUsed += credits
+			}
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
 			return saveLocked()
 		}

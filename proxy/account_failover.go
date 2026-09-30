@@ -74,6 +74,12 @@ func upstreamErrorHTTPStatus(err error) int {
 	if err == nil {
 		return http.StatusServiceUnavailable
 	}
+	// A modeled exception frame already knows its own status. Checked before the
+	// string heuristics below so throttling does not fall through to a blanket
+	// 502, which clients treat as transient and retry immediately.
+	if ue, ok := AsUpstreamError(err); ok {
+		return ue.StatusCode()
+	}
 	msg := err.Error()
 	switch {
 	case isQuotaErrorMessage(msg):
@@ -106,8 +112,11 @@ func isOverageErrorMessage(msg string) bool {
 
 func isSuspensionErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
+	// Covers both "temporarily is suspended" (REST/IDE) and the CLI runtime's
+	// "User ID is temporarily suspended" word order, plus the underscore form.
 	return strings.Contains(msg, "temporarily_suspended") ||
 		strings.Contains(msg, "temporarily is suspended") ||
+		strings.Contains(msg, "temporarily suspended") ||
 		strings.Contains(msg, "account suspended")
 }
 
@@ -173,6 +182,31 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	}
 
 	errMsg := err.Error()
+
+	// An exception frame carries its own classification, so use it rather than
+	// pattern matching the message. Without this a ThrottlingException fell
+	// through to the default branch and got no cooldown, so the same credential
+	// was hammered on the very next request.
+	if ue, ok := AsUpstreamError(err); ok {
+		t := strings.ToLower(ue.ExceptionType)
+		switch {
+		case containsAny(t, "throttl", "toomanyrequests", "servicequota", "limitexceed"):
+			h.pool.RecordErrorWithCooldown(account.ID, defaultQuotaCooldown)
+		case containsAny(t, "accessdenied", "unauthorized", "forbidden", "expiredtoken", "invalidtoken"):
+			h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
+		default:
+			// Includes EmptyUpstreamResponse: request/stream failure rather than
+			// broken account credentials. Do not accumulate towards consecutive error
+			// cooldown to prevent account pool starvation.
+			if ue.ExceptionType == "EmptyUpstreamResponse" {
+				logger.Warnf("[AccountFailover] Soft failure (%s) on %s, not incrementing account error count", ue.ExceptionType, account.Email)
+				return
+			}
+			h.pool.RecordError(account.ID, false)
+		}
+		return
+	}
+
 	switch {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)

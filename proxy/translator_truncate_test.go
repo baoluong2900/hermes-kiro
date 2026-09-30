@@ -7,9 +7,9 @@ import (
 )
 
 // TestClaudeToKiroTruncatesOversizedHistory builds a conversation whose history
-// far exceeds the upstream input limit and verifies the converted payload is
-// trimmed below maxPayloadBytes, that a truncation placeholder is inserted, and
-// that the current message is preserved.
+// far exceeds the model's input budget and verifies the converted payload is
+// trimmed below payloadByteLimitForModel, that a truncation placeholder is
+// inserted, and that the current message is preserved.
 func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	// ~2KB chunk repeated across many turns to blow past the byte limit.
 	big := strings.Repeat("lorem ipsum dolor sit amet ", 80) // ~2.1KB
@@ -17,7 +17,9 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	msgs := []ClaudeMessage{
 		{Role: "user", Content: "start the long task"},
 	}
-	for i := 0; i < 800; i++ {
+	// claude-opus-4.8 is a 1M-window model, so the budget is 5x the 200K
+	// baseline; the history must exceed that larger budget to force truncation.
+	for i := 0; i < 1400; i++ {
 		msgs = append(msgs,
 			ClaudeMessage{Role: "assistant", Content: "step result: " + big},
 			ClaudeMessage{Role: "user", Content: "next: " + big},
@@ -37,8 +39,9 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
-	if len(raw) > maxPayloadBytes {
-		t.Fatalf("payload size %d exceeds limit %d after truncation", len(raw), maxPayloadBytes)
+	limit := payloadByteLimitForModel(req.Model)
+	if len(raw) > limit {
+		t.Fatalf("payload size %d exceeds limit %d after truncation", len(raw), limit)
 	}
 
 	// The current message must be preserved.

@@ -26,6 +26,8 @@ func TestGetContextWindowSize(t *testing.T) {
 		{"claude-sonnet-5", 1_000_000},
 		{"claude-haiku-5", 1_000_000},
 		{"claude-opus-6", 1_000_000},
+		{"claude-fable-5", 1_000_000},
+		{"claude-fable-5-thinking", 1_000_000},
 		{"claude-opus-4.5", 200_000},
 		{"claude-sonnet-4.5", 200_000},
 		{"claude-sonnet-4", 200_000},

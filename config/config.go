@@ -154,13 +154,15 @@ type PromptFilterRule struct {
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
 type ApiKeyEntry struct {
-	ID         string `json:"id"`                 // Unique identifier (UUID)
-	Name       string `json:"name,omitempty"`     // Human-readable label
-	Key        string `json:"key"`                // The actual key value clients send
-	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
-	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
-	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
-	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+	ID           string `json:"id"`                 // Unique identifier (UUID)
+	Name         string `json:"name,omitempty"`     // Human-readable label
+	Key          string `json:"key"`                // The actual key value clients send
+	Enabled      bool   `json:"enabled"`            // Whether this key may authenticate
+	Migrated     bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
+	CreatedAt    int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
+	LastUsedAt   int64  `json:"lastUsedAt,omitempty"`
+	ExpiresAt    int64  `json:"expiresAt,omitempty"` // 0 = never; Unix seconds otherwise
+	ExpiryPreset string `json:"expiryPreset,omitempty"`
 
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
@@ -289,7 +291,13 @@ var (
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
+	// Guard cfgPath with cfgLock: a detached background writer (e.g. the
+	// goroutine pool.UpdateStats spawns, which calls Save under cfgLock) may
+	// still be reading cfgPath when Init runs. Setting it lock-free raced with
+	// that reader under -race. Load() re-acquires the lock, so release it first.
+	cfgLock.Lock()
 	cfgPath = path
+	cfgLock.Unlock()
 	return Load()
 }
 

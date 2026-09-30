@@ -173,6 +173,16 @@ pre,
   font-family: var(--font-mono);
 }
 
+.proxy-inventory-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-color, #333);
+  flex-wrap: wrap;
+}
+.proxy-inventory-row > span { flex: 1; min-width: 200px; overflow-wrap: anywhere; }
+
 .clipboard-proxy {
   position: fixed;
   opacity: 0;
@@ -1100,6 +1110,29 @@ img.brand-icon {
   gap: 0.625rem;
   min-width: 0;
 }
+.source-switcher {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--secondary);
+  color: var(--secondary-foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  padding: 0.25rem 1.4rem 0.25rem 0.5rem;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath fill='%23737373' d='M0 0l4 5 4-5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.45rem center;
+}
+.source-switcher:hover {
+  border-color: var(--border-focus);
+}
+.source-switcher:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
 .brand-status {
   display: inline-flex;
   align-items: center;
@@ -1299,7 +1332,10 @@ img.brand-icon {
 }
 .logs-list {
   max-height: 60vh;
-  overflow-y: auto;
+  /* Scroll both axes INSIDE the log panel. With only overflow-y, a wide table
+     made the whole page scroll sideways. */
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
   border-top: 1px solid var(--border);
 }
 .logs-table {
@@ -1323,20 +1359,22 @@ img.brand-icon {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
+  /* A long unbroken error string (JSON, URLs) otherwise sets the cell's
+     min-content width and forces the table — and the page — to grow. */
+  overflow-wrap: anywhere;
 }
 .logs-table tr:last-child td {
   border-bottom: none;
 }
 .logs-table .log-msg {
-  max-width: 360px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--destructive);
-}
-.logs-table .log-msg:hover {
+  /* Wrap instead of nowrap+ellipsis, and do NOT change layout on hover: the old
+     nowrap→normal hover rule made the row jump as the pointer moved. */
+  display: inline;
+  max-width: 100%;
   white-space: normal;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  color: var(--destructive);
 }
 .log-status {
   display: inline-block;

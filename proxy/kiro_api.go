@@ -9,6 +9,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	neturl "net/url"
 	"regexp"
@@ -257,6 +258,26 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	return result.Models, nil
 }
 
+// publishProfileArn records a resolved profile ARN in both places it is read
+// from.
+//
+// The account pointer handed to the resolver is now a detached snapshot (see
+// pool.detachedAccount), so writing only to the caller's copy would leave the
+// fast path at the top of ResolveProfileArn cold forever and every request would
+// re-resolve the ARN across candidate regions over the network. Writing only to
+// the pool would leave this request's own later reads (withProfileArnQuery,
+// regionalizeURL) seeing an empty ARN. Both are required.
+//
+// The pool publish is a no-op when the account is not in the global pool, so
+// isolated test pools and non-pooled accounts are unaffected.
+func publishProfileArn(account *config.Account, profileArn string) {
+	if account == nil || strings.TrimSpace(profileArn) == "" {
+		return
+	}
+	account.ProfileArn = profileArn
+	pool.GetPool().UpdateProfileArn(account.ID, profileArn)
+}
+
 // ResolveProfileArn returns the account profile ARN, fetching and caching it
 // when it is missing. First tries ListAvailableProfiles; if that returns empty,
 // falls back to refreshing the token (which returns profileArn in the response).
@@ -284,7 +305,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
 				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
 			}
-			account.ProfileArn = profileArn
+			publishProfileArn(account, profileArn)
 			return profileArn, nil
 		}
 		profileUnsupportedErr = err
@@ -396,7 +417,7 @@ func ensureRestProfileArn(account *config.Account) error {
 		}
 		return err
 	}
-	account.ProfileArn = profileArn
+	publishProfileArn(account, profileArn)
 	return nil
 }
 
@@ -510,10 +531,10 @@ func listKiroProfilesInRegionContext(
 	seen := make(map[string]struct{})
 	invalidCount := 0
 	nextToken := ""
-	// Bound pagination so a misbehaving upstream cannot loop forever. 20 pages
-	// of 50 is far above any realistic Kiro profile count.
+	// Bound pagination so a misbehaving upstream cannot loop forever.
+	// AWS CodeWhisperer ListAvailableProfiles caps maxResults at 10.
 	const maxProfilePages = 20
-	const pageSize = 50
+	const pageSize = 10
 	for page := 0; page < maxProfilePages; page++ {
 		requestBody := map[string]interface{}{"maxResults": pageSize}
 		if nextToken != "" {

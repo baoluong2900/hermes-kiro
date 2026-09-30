@@ -128,8 +128,16 @@ func (h *Handler) handleResponsesNonStream(
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
+	if !admitted {
+		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		return
+	}
+	defer func() { releaseCredit(0) }()
+
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -140,6 +148,7 @@ func (h *Handler) handleResponsesNonStream(
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -170,6 +179,7 @@ func (h *Handler) handleResponsesNonStream(
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -210,7 +220,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.recordFailureWithDetails("responses", model, lastAccountID, lastErr)
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
@@ -277,6 +287,13 @@ func (h *Handler) handleResponsesStream(
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
+	if !admitted {
+		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		return
+	}
+	defer func() { releaseCredit(0) }()
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -293,6 +310,27 @@ func (h *Handler) handleResponsesStream(
 			return
 		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
+		flusher.Flush()
+	}
+
+	// sendFailure terminates the stream with response.failed followed by the
+	// [DONE] sentinel. The success path emits [DONE] (see the end of the attempt
+	// loop); every failure path used to return right after response.failed, so a
+	// client waiting on the sentinel hung on an open stream that would never
+	// produce another event. One helper keeps all failure exits in sync.
+	sendFailure := func(message string) {
+		send("response.failed", map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id":     respID,
+				"status": "failed",
+				"error": map[string]string{
+					"type":    "server_error",
+					"message": message,
+				},
+			},
+		})
+		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	}
 
@@ -315,6 +353,7 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	responseStarted := false
 	reqStart := time.Now()
 
@@ -326,6 +365,7 @@ func (h *Handler) handleResponsesStream(
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -476,21 +516,15 @@ func (h *Handler) handleResponsesStream(
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
+				lastAccountID = account.ID
 				h.handleAccountFailure(account, err)
 				continue
 			}
-			send("response.failed", map[string]interface{}{
-				"type": "response.failed",
-				"response": map[string]interface{}{
-					"id":     respID,
-					"status": "failed",
-					"error": map[string]string{
-						"type":    "server_error",
-						"message": err.Error(),
-					},
-				},
-			})
+			sendFailure(err.Error())
 			h.recordFailureWithDetails("responses", model, account.ID, err)
+			// Partial output was already generated and metered upstream; attribute
+			// it instead of dropping the request from the key's usage entirely.
+			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 			return
 		}
 
@@ -560,29 +594,9 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
-		send("response.failed", map[string]interface{}{
-			"type": "response.failed",
-			"response": map[string]interface{}{
-				"id":     respID,
-				"status": "failed",
-				"error": map[string]string{
-					"type":    "server_error",
-					"message": "No available accounts",
-				},
-			},
-		})
+		sendFailure("No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
-	send("response.failed", map[string]interface{}{
-		"type": "response.failed",
-		"response": map[string]interface{}{
-			"id":     respID,
-			"status": "failed",
-			"error": map[string]string{
-				"type":    "server_error",
-				"message": lastErr.Error(),
-			},
-		},
-	})
+	h.recordFailureWithDetails("responses", model, lastAccountID, lastErr)
+	sendFailure(lastErr.Error())
 }

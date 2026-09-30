@@ -27,12 +27,8 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	if config.IsAPIKeyAccount(account) {
 		return "", "", 0, "", fmt.Errorf("API Key credentials do not support token refresh")
 	}
-	// Resolve per-account proxy: account.ProxyURL > global config
-	proxyURL := account.ProxyURL
-	if proxyURL == "" {
-		proxyURL = config.GetProxyURL()
-	}
-	client := GetAuthClientForProxy(proxyURL)
+	// Keep OAuth refresh on the same account-specific exit as inference.
+	client := GetAuthClientForProxy(config.AccountProxyURL(account))
 
 	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), MicrosoftSSOAuthMethod) {
 		return refreshExternalIdpToken(

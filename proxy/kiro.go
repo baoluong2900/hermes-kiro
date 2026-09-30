@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -107,13 +108,9 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 	return client
 }
 
-// ResolveAccountProxyURL returns the effective proxy URL for an account.
-// Falls back to global config.GetProxyURL() if the account has no per-account proxy.
+// ResolveAccountProxyURL returns the stable outbound proxy for this account.
 func ResolveAccountProxyURL(account *config.Account) string {
-	if account != nil && account.ProxyURL != "" {
-		return account.ProxyURL
-	}
-	return config.GetProxyURL()
+	return config.AccountProxyURL(account)
 }
 
 // streamResponseHeaderTimeout bounds how long we wait for the upstream to send
@@ -393,6 +390,33 @@ func cliRuntimeURL(account *config.Account) string {
 	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
+// transientModelRejectionPattern matches the 400 ValidationException Kiro sends
+// instead of 429 when a premium model is throttled:
+//
+//	{"message":"Invalid model. Please select a different model to continue.",
+//	 "reason":"INVALID_MODEL_ID"}
+//
+// The model id is provably valid — the identical request succeeds on an immediate
+// retry, a burst of concurrent Opus 5 calls fails this way roughly a third of the
+// time while the same burst on the gpt-5.6 tier never does, and spacing the calls
+// out never fails at all. Surfacing it as a plain 400 tells clients the request
+// was malformed and must not be retried, which is what made the premium models
+// unusable under any concurrency.
+var transientModelRejectionPattern = regexp.MustCompile(`(?i)INVALID_MODEL_ID|select a different model`)
+
+func isTransientModelRejection(s string) bool {
+	return transientModelRejectionPattern.MatchString(s)
+}
+
+// modelThrottleBackoffs is the retry ramp for the above. The throttle clears in
+// well under a second, so a short bounded ramp recovers it without holding the
+// caller's request open for long.
+var modelThrottleBackoffs = []time.Duration{
+	350 * time.Millisecond,
+	900 * time.Millisecond,
+	2 * time.Second,
+}
+
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
@@ -423,6 +447,84 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 		}
 	}
 	return result
+}
+
+// sendKiroRequest builds and dispatches a single upstream attempt.
+func sendKiroRequest(account *config.Account, reqBody []byte, ep kiroEndpoint, epURL string, isAPIKey bool) (*http.Response, error) {
+	req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+
+	host := ""
+	if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
+		host = parsedURL.Host
+	}
+	headerValues := buildStreamingHeaderValues(account, host)
+
+	if isAPIKey {
+		req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "*/*")
+	if ep.AmzTarget != "" {
+		req.Header.Set("X-Amz-Target", ep.AmzTarget)
+	}
+	applyKiroBaseHeaders(req, account, headerValues)
+	if !isAPIKey {
+		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+	}
+	// CLI captures use optout=false; IDE path keeps true.
+	if isAPIKey {
+		req.Header.Set("x-amzn-codewhisperer-optout", "false")
+	} else {
+		req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	}
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+	return GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+}
+
+// sendKiroRequestWithModelRetry absorbs the throttle Kiro reports as a 400
+// INVALID_MODEL_ID validation error (see transientModelRejectionPattern).
+//
+// The retry has to reuse the same endpoint and the same credential, because the
+// throttle is per-account upstream state. The endpoint-fallback loop could not
+// provide that: API Key credentials are pinned to the single Kiro CLI endpoint, so
+// there was nothing to fall back to and every throttle reached the caller intact.
+//
+// Classifying the failure consumes the response body, so it is restored on the
+// returned response and the caller reads it exactly as it did before.
+func sendKiroRequestWithModelRetry(account *config.Account, reqBody []byte, ep kiroEndpoint, epURL string, isAPIKey bool) (*http.Response, error) {
+	resp, err := sendKiroRequest(account, reqBody, ep, epURL, isAPIKey)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, backoff := range modelThrottleBackoffs {
+		if resp.StatusCode != http.StatusBadRequest {
+			return resp, nil
+		}
+
+		errBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil || !isTransientModelRejection(string(errBody)) {
+			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			return resp, nil
+		}
+
+		logger.Warnf("[KiroAPI] Endpoint %s throttled the model as INVALID_MODEL_ID, retrying in %v", ep.Name, backoff)
+		time.Sleep(backoff)
+
+		resp, err = sendKiroRequest(account, reqBody, ep, epURL, isAPIKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return resp, nil
 }
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
@@ -488,41 +590,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 
 		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		host := ""
-		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
-			host = parsedURL.Host
-		}
-		headerValues := buildStreamingHeaderValues(account, host)
-
-		if isAPIKey {
-			req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-		} else {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		req.Header.Set("Accept", "*/*")
-		if ep.AmzTarget != "" {
-			req.Header.Set("X-Amz-Target", ep.AmzTarget)
-		}
-		applyKiroBaseHeaders(req, account, headerValues)
-		if !isAPIKey {
-			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		}
-		// CLI captures use optout=false; IDE path keeps true.
-		if isAPIKey {
-			req.Header.Set("x-amzn-codewhisperer-optout", "false")
-		} else {
-			req.Header.Set("x-amzn-codewhisperer-optout", "true")
-		}
-		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+		resp, err := sendKiroRequestWithModelRetry(account, reqBody, ep, epURL, isAPIKey)
 		if err != nil {
 			lastErr = err
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
@@ -546,7 +614,20 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			text := fmt.Sprintf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			// A modeled exception in the body carries its own meaning. Typing it here
+			// means "your request was invalid" reaches the client as 400 instead of
+			// a blanket 502, which clients treat as transient and retry. Text is kept
+			// verbatim so the existing message-based account-health checks still fire.
+			if name := upstreamExceptionTypeFromBody(errBody); name != "" {
+				lastErr = &KiroUpstreamError{
+					ExceptionType: name,
+					HTTPStatus:    resp.StatusCode,
+					Text:          text,
+				}
+			} else {
+				lastErr = fmt.Errorf("%s", text)
+			}
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
@@ -557,6 +638,11 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		err = parseEventStream(resp.Body, callback)
 		resp.Body.Close()
+		if err == ErrEmptyUpstreamResponse {
+			logger.Warnf("[KiroAPI] Endpoint %s returned HTTP 200 with empty body/stream. Trying next endpoint...", ep.Name)
+			lastErr = err
+			continue
+		}
 		return err
 	}
 
@@ -573,7 +659,156 @@ func accountEmailForLog(account *config.Account) string {
 	return account.Email
 }
 
+// ==================== Upstream Exception Handling ====================
+
+// KiroUpstreamError is a modeled error that arrived inside a 200 event stream.
+//
+// AWS event streams do not signal failures with an HTTP status: Smithy sends a
+// frame carrying ":message-type: exception" plus ":exception-type: <MemberName>"
+// and no ":event-type" at all. A parser keyed only on ":event-type" therefore saw
+// an unknown frame and dropped it, and the stream then ended cleanly with no
+// content. Callers received a well formed empty answer, which clients treat as a
+// transient glitch and retry immediately — one upstream rejection turned into a
+// tight retry loop.
+type KiroUpstreamError struct {
+	ExceptionType string
+	Message       string
+	// HTTPStatus is set when the exception arrived as a non-200 response rather
+	// than as an in-stream frame. Upstream's own status is more authoritative
+	// than classifying by exception name.
+	HTTPStatus int
+	// Text preserves the original error string. Existing callers pattern match on
+	// phrases like "HTTP 401" and "quota", so replacing the message would break
+	// account-health decisions that predate this type.
+	Text string
+}
+
+func (e *KiroUpstreamError) Error() string {
+	if e.Text != "" {
+		return e.Text
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("%s: %s", e.ExceptionType, e.Message)
+	}
+	return e.ExceptionType
+}
+
+// StatusCode maps the upstream exception onto the HTTP status a client should see.
+// Answering 502 for everything invites another retry, because clients treat 502
+// as transient.
+func (e *KiroUpstreamError) StatusCode() int {
+	// Checked before HTTPStatus on purpose: upstream's own status for a throttled
+	// model is 400, and that misreport is exactly what is being corrected. 429 is
+	// the status clients know how to obey.
+	if e.IsModelThrottle() {
+		return http.StatusTooManyRequests
+	}
+	if e.HTTPStatus >= 400 && e.HTTPStatus < 600 {
+		return e.HTTPStatus
+	}
+	t := strings.ToLower(e.ExceptionType)
+	switch {
+	case containsAny(t, "throttl", "toomanyrequests", "servicequota", "limitexceed"):
+		return http.StatusTooManyRequests
+	case containsAny(t, "accessdenied", "unauthorized", "forbidden", "expiredtoken", "invalidtoken"):
+		return http.StatusUnauthorized
+	case containsAny(t, "validation", "invalidrequest", "contentlengthexceed", "inputtoolong", "payloadtoolarge", "contextwindow"):
+		return http.StatusBadRequest
+	case containsAny(t, "serviceunavailable", "internalserver"):
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+// Retryable reports whether another account could plausibly succeed. A request
+// upstream rejected on its own merits (oversized context, bad auth) is rejected
+// identically everywhere, so retrying only burns the pool.
+func (e *KiroUpstreamError) Retryable() bool {
+	// A throttled model is worth another attempt even though it arrives typed as a
+	// ValidationException, which the list below otherwise treats as permanent.
+	if e.IsModelThrottle() {
+		return true
+	}
+	t := strings.ToLower(e.ExceptionType)
+	return !containsAny(t,
+		"validation", "invalidrequest", "accessdenied", "unauthorized", "forbidden",
+		"expiredtoken", "invalidtoken", "contentlengthexceed", "inputtoolong",
+		"payloadtoolarge", "contextwindow")
+}
+
+// IsModelThrottle reports whether upstream dressed a throttle up as a model
+// validation failure. Both fields are inspected because the reason code arrives in
+// the raw response body on the HTTP path and in Message on the in-stream path;
+// ExceptionType only ever says "ValidationException" and cannot distinguish them.
+func (e *KiroUpstreamError) IsModelThrottle() bool {
+	return isTransientModelRejection(e.Text) || isTransientModelRejection(e.Message)
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrEmptyUpstreamResponse marks a 200 event stream that carried no text, no
+// tool call, no token count and no metering. That is not an answer, and
+// forwarding it as an empty assistant turn is what makes clients spin.
+var ErrEmptyUpstreamResponse = &KiroUpstreamError{
+	ExceptionType: "EmptyUpstreamResponse",
+	Message:       "upstream returned no content, tokens or metering",
+}
+
+// upstreamExceptionTypeFromBody pulls the Smithy exception name out of a non-200
+// error body, e.g. {"__type":"com.amazon.kiro.runtimeservice#ValidationException"}.
+// Returns "" when the body is not a recognisable modeled error.
+func upstreamExceptionTypeFromBody(body []byte) string {
+	var probe struct {
+		Type string `json:"__type"`
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return ""
+	}
+	name := probe.Type
+	if name == "" {
+		name = probe.Code
+	}
+	if i := strings.LastIndexByte(name, '#'); i >= 0 {
+		name = name[i+1:]
+	}
+	if !strings.HasSuffix(name, "Exception") {
+		return ""
+	}
+	return name
+}
+
+// AsUpstreamError extracts a *KiroUpstreamError from an error chain.
+func AsUpstreamError(err error) (*KiroUpstreamError, bool) {
+	var ue *KiroUpstreamError
+	if errors.As(err, &ue) {
+		return ue, true
+	}
+	return nil, false
+}
+
 // ==================== Event Stream Parsing ====================
+
+// minEventStreamFrameSize is the smallest legal AWS event-stream frame: the
+// 12-byte prelude plus the 4-byte trailing CRC, with no headers and no payload.
+const minEventStreamFrameSize = 16
+
+// maxEventStreamFrameSize caps how large a single declared frame may be before
+// it is treated as corruption. The prelude length is attacker-influenced in the
+// sense that any mid-stream corruption or spliced connection produces an
+// arbitrary 4-byte value, and that value was passed straight to make([]byte,
+// totalLength-12) — a single bogus header could request up to 4 GiB and take the
+// whole process down with an OOM. Real Kiro frames carry a handful of JSON
+// deltas and stay far below 1 MiB, so 16 MiB leaves generous headroom while
+// still bounding one allocation.
+const maxEventStreamFrameSize = 16 * 1024 * 1024
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
@@ -585,6 +820,34 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var inputTokens, outputTokens int
 	var totalCredits float64
 	var currentToolUse *toolUseState
+	// Whether upstream actually produced anything. A 200 stream with no text, no
+	// tool call, no tokens and no metering is not an answer, and passing it on as
+	// an empty assistant turn is what makes clients retry in a tight loop.
+	producedOutput := false
+
+	// Usage reported by upstream is real cost the moment it arrives, but it used to
+	// be handed to the caller only after the loop finished cleanly, so every
+	// mid-stream read error discarded the metering and token counts accumulated so
+	// far. The caller then saw credits == 0 and attributed nothing, making a broken
+	// or cancelled stream free. Flush exactly once on every exit path instead.
+	//
+	// Deliberately excludes finishToolUse: emitting a half-parsed tool call to the
+	// client on an error path would hand it malformed arguments. Only the
+	// accounting callbacks are safe to run after a failure.
+	flushed := false
+	flushUsage := func() {
+		if flushed {
+			return
+		}
+		flushed = true
+		if callback.OnCredits != nil && totalCredits > 0 {
+			callback.OnCredits(totalCredits)
+		}
+		if callback.OnComplete != nil {
+			callback.OnComplete(inputTokens, outputTokens)
+		}
+	}
+	defer flushUsage()
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -600,8 +863,33 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
 
-		if totalLength < 16 {
-			continue
+		// A well-formed frame is at least 16 bytes (12-byte prelude + 4-byte
+		// trailer CRC) and never exceeds maxEventStreamFrameSize. Declaring
+		// anything outside that range means the stream is corrupt from here on.
+		//
+		// This used to `continue`, which is wrong in a way that silently eats the
+		// rest of the answer: the short frame's body was still sitting unread in
+		// the stream, so the next iteration read those leftover bytes as a
+		// prelude, desynchronised, and every subsequent event decoded as garbage
+		// or hit an unexpected EOF. The client had already received whatever text
+		// streamed before the bad frame, so it looked like the reply was simply
+		// cut off mid-sentence with no error. Returning surfaces it through the
+		// caller's error path, which terminates the SSE envelope properly.
+		if totalLength < minEventStreamFrameSize || totalLength > maxEventStreamFrameSize {
+			logger.Warnf("[KiroAPI] malformed event-stream frame: totalLength=%d outside [%d,%d], aborting stream",
+				totalLength, minEventStreamFrameSize, maxEventStreamFrameSize)
+			return &KiroUpstreamError{
+				ExceptionType: "MalformedEventStreamFrame",
+				Message:       fmt.Sprintf("event-stream frame declared an impossible length (%d bytes)", totalLength),
+			}
+		}
+		if headersLength < 0 || headersLength > totalLength {
+			logger.Warnf("[KiroAPI] malformed event-stream frame: headersLength=%d exceeds totalLength=%d, aborting stream",
+				headersLength, totalLength)
+			return &KiroUpstreamError{
+				ExceptionType: "MalformedEventStreamFrame",
+				Message:       fmt.Sprintf("event-stream frame declared headers longer than the frame (%d > %d)", headersLength, totalLength),
+			}
 		}
 
 		// Read the remaining message bytes.
@@ -616,14 +904,49 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
-		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
-		if len(payloadBytes) == 0 {
-			continue
+		frameHeaders := parseFrameHeaders(msgBuf[0:headersLength])
+		eventType := frameHeaders[":event-type"]
+		messageType := frameHeaders[":message-type"]
+		exceptionType := frameHeaders[":exception-type"]
+		if exceptionType == "" {
+			exceptionType = frameHeaders[":error-code"]
 		}
+		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 
 		var event map[string]interface{}
-		if err := json.Unmarshal(payloadBytes, &event); err != nil {
+		if len(payloadBytes) > 0 {
+			if err := json.Unmarshal(payloadBytes, &event); err != nil {
+				event = nil
+			}
+		}
+
+		// Errors are not ":event-type" frames. Returning here rather than skipping
+		// is the whole point: the deferred flushUsage still reports whatever
+		// upstream already metered, so a failure that cost money is still billed.
+		if messageType == "exception" || messageType == "error" || exceptionType != "" ||
+			strings.HasSuffix(eventType, "Exception") {
+			name := exceptionType
+			if name == "" {
+				name = eventType
+			}
+			if name == "" {
+				name = "UpstreamException"
+			}
+			msg := frameHeaders[":error-message"]
+			for _, field := range []string{"message", "Message", "errorMessage", "reason"} {
+				if event == nil {
+					break
+				}
+				if v, ok := event[field].(string); ok && v != "" {
+					msg = v
+					break
+				}
+			}
+			logger.Warnf("[KiroAPI] upstream exception frame: %s: %s (headers: %v, payload: %s)", name, msg, frameHeaders, string(payloadBytes))
+			return &KiroUpstreamError{ExceptionType: name, Message: msg}
+		}
+
+		if event == nil {
 			continue
 		}
 
@@ -647,17 +970,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// "1833" into "183", on both streams.
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				producedOutput = true
 				if callback.OnText != nil {
 					callback.OnText(content, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
+				producedOutput = true
 				if callback.OnText != nil {
 					callback.OnText(text, true)
 				}
 			}
 		case "toolUseEvent":
+			producedOutput = true
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
@@ -676,13 +1002,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		finishToolUse(currentToolUse, callback)
 	}
 
-	if callback.OnCredits != nil && totalCredits > 0 {
-		callback.OnCredits(totalCredits)
+	flushUsage()
+
+	// Clean EOF but nothing came back. Report it so the caller can fail over or
+	// return a real error status, instead of handing the client an empty turn.
+	// Metering is checked too: if upstream charged for the request it did work,
+	// even when the visible output was empty.
+	if !producedOutput && outputTokens == 0 && totalCredits == 0 {
+		logger.Warnf("[KiroAPI] upstream returned an empty response (no content, tokens or metering)")
+		return ErrEmptyUpstreamResponse
 	}
 
-	if callback.OnComplete != nil {
-		callback.OnComplete(inputTokens, outputTokens)
-	}
 	return nil
 }
 
@@ -739,27 +1069,45 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	return inputTokens, outputTokens
 }
 
+// defaultContextWindow is the window assumed for models that neither upstream
+// nor the version heuristic identifies as large-context.
+const defaultContextWindow = 200_000
+
+// largeContextWindow is the 1M-token window advertised by Claude 4.6+ / 5.x.
+const largeContextWindow = 1_000_000
+
 // getContextWindowSize returns the context window size (in tokens) for a model.
 //
-// Per Kiro's ListAvailableModels, the 1M-token context window applies to
-// Claude 4.6 and newer (sonnet-4.6, opus-4.6, opus-4.7, opus-4.8, and future
-// 4.x releases), while 4.5 and earlier (opus-4.5, sonnet-4.5, sonnet-4,
-// haiku-4.5) use a 200K window. This value is used to convert the upstream
-// contextUsagePercentage into an absolute input-token count that clients rely
-// on to decide when to compact; an undersized window under-reports tokens and
-// prevents clients from compacting in time.
+// The authoritative source is Kiro's ListAvailableModels response
+// (tokenLimits.maxInputTokens), recorded per model when the models cache is
+// refreshed. When upstream has not reported a limit yet (cold start, alias
+// models, offline fallback list) the version heuristic below is used: the
+// 1M-token window applies to Claude 4.6 and newer (sonnet-4.6, opus-4.6,
+// opus-4.7, opus-4.8, opus-5 and later), while 4.5 and earlier (opus-4.5,
+// sonnet-4.5, sonnet-4, haiku-4.5) use a 200K window.
+//
+// This value is used to convert the upstream contextUsagePercentage into an
+// absolute input-token count and to size the request payload budget. An
+// undersized window under-reports tokens, makes clients compact early, and
+// truncates history that the model could still have accepted.
 func getContextWindowSize(model string) int {
-	if isLargeContextModel(model) {
-		return 1_000_000
+	if lim, ok := lookupModelLimits(model); ok && lim.maxInput > 0 {
+		return lim.maxInput
 	}
-	return 200_000
+	if isLargeContextModel(model) {
+		return largeContextWindow
+	}
+	return defaultContextWindow
 }
 
 // claudeVersionExtractor matches "claude-<family>-<major>[.<minor>]" (dot or
 // dash form) and is used to classify 1M-window models by version. The minor
 // component is optional so major-only identifiers such as "claude-opus-5"
 // classify correctly instead of falling through to the 200K default.
-var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\d+)(?:[.-](\d+))?`)
+//
+// "fable" is included because claude-fable-5 also ships a 1M window; leaving the
+// family out made it fall through to the 200K default.
+var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d+))?`)
 
 func isLargeContextModel(model string) bool {
 	m := strings.ToLower(model)
@@ -931,12 +1279,17 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 }
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.
-func extractEventType(headers []byte) string {
+// parseFrameHeaders decodes every string-valued prelude header of an AWS event
+// stream frame.
+//
+// The previous implementation returned as soon as it matched ":event-type", so
+// ":message-type" and ":exception-type" were never read. Exception frames carry
+// those two and no ":event-type" at all, which made them indistinguishable from
+// an unknown event and got them silently discarded.
+func parseFrameHeaders(headers []byte) map[string]string {
+	out := make(map[string]string, 4)
 	offset := 0
 	for offset < len(headers) {
-		if offset >= len(headers) {
-			break
-		}
 		nameLen := int(headers[offset])
 		offset++
 		if offset+nameLen > len(headers) {
@@ -959,11 +1312,8 @@ func extractEventType(headers []byte) string {
 			if offset+valueLen > len(headers) {
 				break
 			}
-			value := string(headers[offset : offset+valueLen])
+			out[name] = string(headers[offset : offset+valueLen])
 			offset += valueLen
-			if name == ":event-type" {
-				return value
-			}
 			continue
 		}
 
@@ -981,5 +1331,9 @@ func extractEventType(headers []byte) string {
 			break
 		}
 	}
-	return ""
+	return out
+}
+
+func extractEventType(headers []byte) string {
+	return parseFrameHeaders(headers)[":event-type"]
 }

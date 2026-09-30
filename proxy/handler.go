@@ -12,6 +12,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -250,7 +251,7 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 		if role == "" {
 			continue
 		}
-		if role != "system" {
+		if role != "system" && role != "developer" {
 			hasNonSystem = true
 			lastRole = role
 		}
@@ -298,6 +299,8 @@ func NewHandler() *Handler {
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
+	// Credential renewal must not wait for the slow model/usage refresh cycle.
+	go h.backgroundTokenRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
@@ -320,6 +323,39 @@ func (h *Handler) backgroundRefresh() {
 		case <-ticker.C:
 			h.refreshModelsCache()
 			h.refreshAllAccounts()
+		case <-h.stopRefresh:
+			return
+		}
+	}
+}
+
+// Renew before the pool's two-minute exclusion window.
+const proactiveTokenRefreshSeconds int64 = 5 * 60
+
+func (h *Handler) backgroundTokenRefresh() {
+	// OAuth tokens are short-lived; renew them well before pool selection
+	// excludes an account at the expiry skew boundary.
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	refresh := func() {
+		accounts := config.GetAccounts()
+		for i := range accounts {
+			account := &accounts[i]
+			if !account.Enabled || config.IsAPIKeyAccount(account) || accountBearerToken(account) == "" {
+				continue
+			}
+			if account.ExpiresAt > 0 && time.Now().Unix() >= account.ExpiresAt-proactiveTokenRefreshSeconds {
+				if _, err := h.refreshAccountTokenBefore(account, false, proactiveTokenRefreshSeconds); err != nil {
+					logger.Warnf("[TokenRefresh] Failed for %s: %v", account.Email, err)
+				}
+			}
+		}
+	}
+	refresh()
+	for {
+		select {
+		case <-ticker.C:
+			refresh()
 		case <-h.stopRefresh:
 			return
 		}
@@ -524,8 +560,17 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = fallbackAnthropicModels(thinkingSuffix)
 	}
 
-	// 添加别名模型
-	models = append(models,
+	// 添加别名模型（去重）
+	existing := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			existing[id] = true
+		}
+	}
+
+	aliases := []map[string]interface{}{
+		buildModelInfo("claude-opus-5.5", "anthropic", true),
+		buildModelInfo("claude-opus-5.5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-5", "anthropic", true),
 		buildModelInfo("claude-opus-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.8", "anthropic", true),
@@ -533,11 +578,16 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("claude-sonnet-5", "anthropic", true),
 		buildModelInfo("claude-sonnet-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("auto", "anthropic", true),
-		buildModelInfo("gpt-4o", "anthropic", true),
-		buildModelInfo("gpt-4", "anthropic", true),
-		buildModelInfo("kimi-k3-free", "moonshot", false),
-		buildModelInfo("moonshotai/kimi-k3-free", "moonshot", false),
-	)
+		buildModelInfo("gpt-5.6-sol", "openai", true),
+		buildModelInfo("gpt-5.6-terra", "openai", true),
+		buildModelInfo("gpt-5.6-luna", "openai", true),
+	}
+	for _, a := range aliases {
+		if id, ok := a["id"].(string); ok && !existing[id] {
+			models = append(models, a)
+			existing[id] = true
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -564,24 +614,34 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	return models
 }
 
+// fallbackAnthropicModels is the catalog served when the upstream
+// ListAvailableModels call has not populated the cache yet.
+//
+// Only models Kiro still serves are advertised. It used to list Claude 4.6 / 4.5
+// / 4 / haiku-4.5, which Kiro retired: a client that picked one of those from
+// this list got a genuine INVALID_MODEL_ID, and the list was the only place it
+// could have learned the name from. Retired names still resolve through
+// modelAliases, they are just not offered.
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("auto", "anthropic", true),
+		buildModelInfo("claude-opus-5.5", "anthropic", true),
+		buildModelInfo("claude-opus-5.5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus", "anthropic", true),
+		buildModelInfo("claude-opus"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("opus", "anthropic", true),
+		buildModelInfo("opus"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-5", "anthropic", true),
+		buildModelInfo("claude-opus-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.8", "anthropic", true),
 		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.7", "anthropic", true),
+		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-5", "anthropic", true),
+		buildModelInfo("claude-sonnet-5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("gpt-5.6-sol", "openai", true),
+		buildModelInfo("gpt-5.6-terra", "openai", true),
+		buildModelInfo("gpt-5.6-luna", "openai", true),
 	}
 }
 
@@ -605,7 +665,14 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"output": []string{"text"},
 	}
 
-	return map[string]interface{}{
+	// Advertise the real context window so clients size their context and
+	// compaction thresholds correctly. Clients disagree on the field name, so the
+	// same value is published under the common aliases; without any of them most
+	// clients assume a small default and never use the full 1M window.
+	contextWindow := getContextWindowSize(id)
+	maxOutput := modelMaxOutputTokens(id)
+
+	info := map[string]interface{}{
 		"id":               id,
 		"type":             "model",
 		"object":           "model",
@@ -615,6 +682,9 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"supports_image":   supportsImage,
 		"input_modalities": modalities,
 		"modalities":       modalitiesMap,
+		"context_window":   contextWindow,
+		"context_length":   contextWindow,
+		"max_input_tokens": contextWindow,
 		"capabilities": map[string]bool{
 			"vision":       supportsImage,
 			"image":        supportsImage,
@@ -622,6 +692,8 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		},
 		"info": map[string]interface{}{
 			"meta": map[string]interface{}{
+				"context_window": contextWindow,
+				"context_length": contextWindow,
 				"capabilities": map[string]bool{
 					"vision":       supportsImage,
 					"image_vision": supportsImage,
@@ -629,6 +701,15 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 			},
 		},
 	}
+
+	// Only published when upstream actually reported an output ceiling; guessing
+	// one would cap clients that would otherwise use the model's default.
+	if maxOutput > 0 {
+		info["max_output_tokens"] = maxOutput
+		info["max_tokens"] = maxOutput
+	}
+
+	return info
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
@@ -659,6 +740,7 @@ func (h *Handler) refreshModelsCache() {
 			modelIDs = append(modelIDs, m.ModelId)
 		}
 		h.pool.SetModelList(account.ID, modelIDs)
+		recordModelTokenLimits(models)
 		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
@@ -686,6 +768,7 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 		modelIDs = append(modelIDs, m.ModelId)
 	}
 	h.pool.SetModelList(account.ID, modelIDs)
+	recordModelTokenLimits(models)
 
 	// 合并到聚合缓存
 	h.modelsCacheMu.Lock()
@@ -879,6 +962,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	for i := range req.Tools {
+		req.Tools[i].InputSchema = ensureObjectSchema(req.Tools[i].InputSchema)
+	}
 	normalizeStopHookJSON := isClaudeCodeStopHookEvaluatorRequest(&req)
 
 	// 优先检查外部 URL API 配置
@@ -1005,6 +1091,7 @@ func (h *Handler) proxyExternalClaude(w http.ResponseWriter, r *http.Request, bo
 		if normalizeStopHookJSON {
 			payload["stream"] = false
 		}
+		normalizeClaudePayloadTools(payload)
 		if updated, err := json.Marshal(payload); err == nil {
 			body = updated
 		}
@@ -1066,10 +1153,7 @@ func (h *Handler) proxyExternalClaude(w http.ResponseWriter, r *http.Request, bo
 		return true
 	}
 
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
+	publishUpstreamHeaders(w, resp)
 
 	var externalInputTokens, externalOutputTokens int
 	if req.Stream {
@@ -1114,6 +1198,58 @@ func (h *Handler) proxyExternalClaude(w http.ResponseWriter, r *http.Request, bo
 		h.recordFailureWithDuration("claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 	}
 	return true
+}
+
+func normalizeClaudePayloadTools(payload map[string]interface{}) {
+	toolsRaw, ok := payload["tools"].([]interface{})
+	if !ok || len(toolsRaw) == 0 {
+		return
+	}
+	for _, tRaw := range toolsRaw {
+		tool, ok := tRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if schemaRaw, exists := tool["input_schema"]; exists {
+			tool["input_schema"] = ensureObjectSchema(schemaRaw)
+		} else if schemaRaw, exists := tool["inputSchema"]; exists {
+			tool["inputSchema"] = ensureObjectSchema(schemaRaw)
+		} else if fnRaw, exists := tool["function"]; exists {
+			if fnMap, ok := fnRaw.(map[string]interface{}); ok {
+				if params, exists := fnMap["parameters"]; exists {
+					fnMap["parameters"] = ensureObjectSchema(params)
+				}
+			}
+		}
+	}
+}
+
+// publishUpstreamHeaders copies an upstream response's headers to the client
+// but deliberately drops Content-Length.
+//
+// These external-proxy branches rewrite the body after the headers are copied:
+// the model name is swapped with bytes.ReplaceAll (see proxyExternalClaude and
+// proxyExternalOpenAI), which changes the body length whenever the mapped and
+// requested model names differ in size. Publishing upstream's original
+// Content-Length then desynchronises the response, and the symptom is exactly a
+// truncated answer:
+//
+//	replacement shorter -> client waits for bytes that never arrive (unexpected EOF)
+//	replacement longer  -> net/http cuts the body back to the stale length
+//
+// Verified with a real proxy harness: before the fix a small JSON body came
+// back as "Content-Length: 276, 267 bytes read, unexpected EOF" and the longer
+// direction delivered 0 bytes. Omitting the header lets net/http derive the
+// correct length from what we actually write. Chunked/streaming responses carry
+// no Content-Length, so this is a no-op on the SSE path.
+func publishUpstreamHeaders(w http.ResponseWriter, resp *http.Response) {
+	for k, v := range resp.Header {
+		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
 }
 
 func copyExternalClaudeHeaders(dst, src http.Header) {
@@ -1311,6 +1447,16 @@ func claudeResponseText(resp *ClaudeResponse) string {
 
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, rawBody []byte, req *ClaudeRequest, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, normalizeStopHookJSON bool) {
+	// Reserve credit before any bytes are written so concurrent requests cannot
+	// all pass the ceiling on the same stale balance. defer guarantees release
+	// on every exit path, including panics.
+	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
+	if !admitted {
+		h.sendClaudeError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		return
+	}
+	defer func() { releaseCredit(0) }()
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1329,6 +1475,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
@@ -1360,6 +1507,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -1690,9 +1838,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-				if realInputTokens > 15000 {
-					realInputTokens = 15000
-				}
 			},
 		}
 
@@ -1700,11 +1845,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
+				// The next attempt gets a fresh accounting scope, so anything this
+				// attempt already had metered upstream has to be booked now or it is
+				// lost. Nothing was delivered to the client, so this is not counted
+				// as a separate request.
+				h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
+			// Upstream already metered whatever it streamed before dying, so the
+			// key owes for it. Without this the request left no usage trace at all.
+			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 			// The upstream died after we already streamed part of the answer, so we
 			// cannot retry on another account without duplicating emitted content.
 			// Terminate the SSE stream properly instead: an unterminated stream
@@ -1782,7 +1936,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 		return
 	}
@@ -1962,6 +2116,27 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 }
 
+// recordPartialUsageForApiKey attributes usage for a request that failed after the
+// upstream had already produced (and metered) part of an answer.
+//
+// Upstream bills what it generated, so a stream that dies mid-answer still costs
+// real credits. Returning early on those paths without attributing anything let a
+// key consume upstream quota for free, and made a cancel-heavy client look idle no
+// matter how much it actually spent. Only called when there is something metered;
+// a request that produced nothing stays unbilled.
+func (h *Handler) recordPartialUsageForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+	if credits <= 0 && inputTokens <= 0 && outputTokens <= 0 {
+		return
+	}
+	h.addCredits(credits)
+	if apiKeyID == "" {
+		return
+	}
+	if err := config.RecordApiKeyPartialUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+		logger.Warnf("[ApiKey] failed to record partial usage for key %s: %v", apiKeyID, err)
+	}
+}
+
 // recordFailureWithDetails records a failure and stores it in the request logs.
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	h.recordFailureWithDuration(endpoint, model, accountID, err, 0)
@@ -2054,8 +2229,16 @@ func (h *Handler) getRequestLogs() []RequestLog {
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, rawBody []byte, req *ClaudeRequest, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, normalizeStopHookJSON bool) {
+	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
+	if !admitted {
+		h.sendClaudeError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		return
+	}
+	defer func() { releaseCredit(0) }()
+
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -2066,6 +2249,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2098,9 +2282,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-				if realInputTokens > 15000 {
-					realInputTokens = 15000
-				}
 			},
 		}
 
@@ -2108,6 +2289,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2181,7 +2363,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 		return
 	}
@@ -2280,10 +2462,7 @@ func (h *Handler) proxyExternalOpenAI(w http.ResponseWriter, r *http.Request, bo
 		return true
 	}
 
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
+	publishUpstreamHeaders(w, resp)
 
 	var externalInputTokens, externalOutputTokens int
 	if req.Stream {
@@ -2363,6 +2542,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	// OpenAI-style clients (Hermes among them) ask for extended reasoning with
+	// reasoning_effort rather than a model-name suffix. Honor it, otherwise a
+	// request for "high" silently ran without thinking.
+	if !thinking && strings.TrimSpace(req.ReasoningEffort) != "" {
+		thinking = true
+	}
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
@@ -2377,6 +2562,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 // handleOpenAIStream OpenAI 流式响应
 func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
+	if !admitted {
+		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		return
+	}
+	defer func() { releaseCredit(0) }()
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2393,6 +2585,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -2403,6 +2596,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2685,9 +2879,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-				if realInputTokens > 15000 {
-					realInputTokens = 15000
-				}
 			},
 		}
 
@@ -2695,11 +2886,44 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
+				// Same reason as the Claude stream: book what upstream already
+				// metered before the retry resets the accounting scope.
+				h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 				continue
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
+			// Partial output was already generated and metered upstream; attribute
+			// it instead of dropping the request from the key's usage entirely.
+			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+			// The stream is already open, so the HTTP status cannot change. Without
+			// a terminal chunk the client keeps waiting for a finish_reason that
+			// never arrives and renders the reply as still generating — the same
+			// "cut off mid-sentence" symptom the Claude path fixes with
+			// closeClaudeStreamAfterError. Emit an error chunk plus [DONE] so the
+			// OpenAI SSE contract is closed.
+			errChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "stop",
+				}},
+				"error": map[string]string{
+					"type":    "server_error",
+					"message": err.Error(),
+				},
+			}
+			if data, mErr := json.Marshal(errChunk); mErr == nil {
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+			}
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			return
 		}
 
@@ -2765,15 +2989,23 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
+	if !admitted {
+		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		return
+	}
+	defer func() { releaseCredit(0) }()
+
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -2784,6 +3016,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2808,9 +3041,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-				if realInputTokens > 15000 {
-					realInputTokens = 15000
-				}
 			},
 		}
 
@@ -2818,6 +3048,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			lastAccountID = account.ID
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2853,7 +3084,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
@@ -2875,6 +3106,10 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 // across accounts because refreshes are rare and this keeps every refresh entry
 // point consistent.
 func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool, error) {
+	return h.refreshAccountTokenBefore(account, force, tokenRefreshSkewSeconds)
+}
+
+func (h *Handler) refreshAccountTokenBefore(account *config.Account, force bool, refreshBeforeSeconds int64) (bool, error) {
 	if account == nil || strings.TrimSpace(account.ID) == "" {
 		return false, fmt.Errorf("account is required for token refresh")
 	}
@@ -2915,7 +3150,7 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 		return false, nil
 	}
 
-	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-tokenRefreshSkewSeconds) {
+	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-refreshBeforeSeconds) {
 		h.pool.UpdateCredentialState(
 			account,
 			working.ID,
@@ -3072,6 +3307,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
 		h.apiClearLogs(w, r)
+	case path == "/channels" && r.Method == "GET":
+		h.apiGetChannels(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":
@@ -3105,6 +3342,9 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/reset-usage") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/reset-usage")
 		h.apiResetApiKeyUsage(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/expire") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/expire")
+		h.apiExpireApiKey(w, r, id)
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "GET":
 		h.apiGetApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "PUT":
@@ -4715,6 +4955,175 @@ func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogs = h.requestLogs[:0]
 	h.requestLogsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// channelHealthWindow aggregates request-log outcomes for one account over a window.
+type channelHealthWindow struct {
+	Total        int            `json:"total"`
+	OK           int            `json:"ok"`
+	Err          int            `json:"err"`
+	ErrRate      float64        `json:"errRate"`
+	AvgLatencyMs int64          `json:"avgLatencyMs"`
+	Codes        map[string]int `json:"codes"`
+}
+
+func newChannelHealthWindow() channelHealthWindow {
+	return channelHealthWindow{Codes: map[string]int{}}
+}
+
+// apiGetChannels reports per-account (per-channel) request health: last ping
+// result plus 1h/24h/7d error rate and average latency, so an operator can see
+// which credential is actually failing without reading the raw log table.
+//
+// Aggregation is over the in-memory request-log ring buffer (capped at
+// requestLogsMaxSize entries), the same source /admin/api/logs uses. On a busy
+// gateway that buffer can hold less than 24h/7d of traffic and is reset on
+// restart; the response's "sampleWindowLimited" flag says so explicitly rather
+// than presenting a short sample as a true 7-day rate.
+func (h *Handler) apiGetChannels(w http.ResponseWriter, r *http.Request) {
+	accounts := config.GetAccounts()
+	logs := h.getRequestLogs() // newest first
+
+	now := time.Now().Unix()
+	const (
+		hour = int64(3600)
+		day  = int64(86400)
+	)
+
+	type accum struct {
+		h1, h24, d7      channelHealthWindow
+		lastOK, lastErr  int64
+		lastTime         int64
+		lastStatus       string
+		lastError        string
+		lastErrorType    string
+		lastModel        string
+		lastEndpoint     string
+		lastDurationMs   int64
+		oldestSampleUnix int64
+	}
+	byAccount := make(map[string]*accum)
+	oldestOverall := now
+	for _, l := range logs {
+		if l.AccountID == "" {
+			continue
+		}
+		a, ok := byAccount[l.AccountID]
+		if !ok {
+			a = &accum{h1: newChannelHealthWindow(), h24: newChannelHealthWindow(), d7: newChannelHealthWindow(), oldestSampleUnix: now}
+			byAccount[l.AccountID] = a
+		}
+		if l.Time < a.oldestSampleUnix {
+			a.oldestSampleUnix = l.Time
+		}
+		if l.Time < oldestOverall {
+			oldestOverall = l.Time
+		}
+		isOK := l.Status == "success"
+		age := now - l.Time
+		addTo := func(win *channelHealthWindow) {
+			win.Total++
+			if isOK {
+				win.OK++
+			} else {
+				win.Err++
+				code := l.ErrorType
+				if code == "" {
+					code = "unknown"
+				}
+				win.Codes[code]++
+			}
+			if l.Duration > 0 {
+				// Running average without storing every sample: total/count.
+				win.AvgLatencyMs = (win.AvgLatencyMs*int64(win.Total-1) + l.Duration) / int64(win.Total)
+			}
+		}
+		if age <= hour {
+			addTo(&a.h1)
+		}
+		if age <= day {
+			addTo(&a.h24)
+		}
+		if age <= 7*day {
+			addTo(&a.d7)
+		}
+		if l.Time > a.lastTime {
+			a.lastTime = l.Time
+			a.lastStatus = l.Status
+			a.lastError = l.Error
+			a.lastErrorType = l.ErrorType
+			a.lastModel = l.Model
+			a.lastEndpoint = l.Endpoint
+			a.lastDurationMs = l.Duration
+		}
+		if isOK && l.Time > a.lastOK {
+			a.lastOK = l.Time
+		}
+		if !isOK && l.Time > a.lastErr {
+			a.lastErr = l.Time
+		}
+	}
+
+	finalizeRate := func(win channelHealthWindow) channelHealthWindow {
+		if win.Total > 0 {
+			win.ErrRate = math.Round((float64(win.Err)/float64(win.Total))*10000) / 100
+		}
+		return win
+	}
+
+	channels := make([]map[string]interface{}, 0, len(accounts))
+	for _, a := range accounts {
+		acc := byAccount[a.ID]
+		var last map[string]interface{}
+		var lastOKUnix, lastErrUnix int64
+		h1, h24, d7 := newChannelHealthWindow(), newChannelHealthWindow(), newChannelHealthWindow()
+		if acc != nil {
+			h1, h24, d7 = finalizeRate(acc.h1), finalizeRate(acc.h24), finalizeRate(acc.d7)
+			lastOKUnix, lastErrUnix = acc.lastOK, acc.lastErr
+			if acc.lastTime > 0 {
+				last = map[string]interface{}{
+					"ok":        acc.lastStatus == "success",
+					"atUnix":    acc.lastTime,
+					"error":     acc.lastError,
+					"errorType": acc.lastErrorType,
+					"model":     acc.lastModel,
+					"endpoint":  acc.lastEndpoint,
+					"latencyMs": acc.lastDurationMs,
+				}
+			}
+		}
+		channels = append(channels, map[string]interface{}{
+			"id":         a.ID,
+			"email":      a.Email,
+			"authMethod": a.AuthMethod,
+			"region":     a.Region,
+			"enabled":    a.Enabled,
+			"banStatus":  a.BanStatus,
+			"health": map[string]interface{}{
+				"last":        last,
+				"lastOkUnix":  lastOKUnix,
+				"lastErrUnix": lastErrUnix,
+				"h1":          h1,
+				"h24":         h24,
+				"d7":          d7,
+				"serverTime":  now,
+			},
+		})
+	}
+
+	// The log buffer covers less than a day: 24h/7d figures only reflect
+	// whatever fits in the ring, not the true window. Flag it instead of
+	// silently under-reporting a longer, quieter period as error-free.
+	sampleWindowLimited := len(logs) >= requestLogsMaxSize && (now-oldestOverall) < 24*3600
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":                  true,
+		"success":             true,
+		"channels":            channels,
+		"sampleWindowLimited": sampleWindowLimited,
+		"sampleWindowSeconds": now - oldestOverall,
+		"logBufferCapacity":   requestLogsMaxSize,
+	})
 }
 
 // apiGenerateMachineId 生成新的机器码

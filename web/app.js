@@ -583,12 +583,43 @@
     return pending;
   }
 
+  // Active data source: 'kirogo' (this worker) or 'kiropool' (kiro-pool-proxy KV)
+  let activeSource = localStorage.getItem('kiro_admin_source') || 'kirogo';
+
   // Fetch wrapper
   function api(path, opts) {
     opts = opts || {};
-    opts.headers = Object.assign({ 'X-Admin-Password': password }, opts.headers || {});
+    opts.headers = Object.assign({ 'X-Admin-Password': password, 'X-Kiro-Source': activeSource }, opts.headers || {});
     if (opts.body && !opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';
     return fetch('/admin/api' + path, opts);
+  }
+  async function parseApiResponse(res) {
+    const ctype = (res.headers.get('content-type') || '').toLowerCase();
+    const text = await res.text();
+    const trimmed = (text || '').trim();
+    if (!trimmed) throw new Error('Empty response (HTTP ' + res.status + ')');
+    const cf = trimmed.match(/error code:\s*(\d+)/i);
+    if (cf) throw new Error('Cloudflare error ' + cf[1] + ' (HTTP ' + res.status + ')');
+    const looksHtml = ctype.indexOf('text/html') !== -1 || trimmed.charAt(0) === '<';
+    if (looksHtml) {
+      const title = trimmed.match(/<title>([^<]+)<\/title>/i);
+      throw new Error('Expected JSON from admin API, got HTML' + (title ? ' (' + title[1].trim() + ')' : '') + ' (HTTP ' + res.status + ')');
+    }
+    try {
+      return JSON.parse(trimmed);
+    } catch (e) {
+      throw new Error('Invalid JSON (HTTP ' + res.status + '): ' + trimmed.slice(0, 120));
+    }
+  }
+  function normalizeModelIds(payload) {
+    const raw = Array.isArray(payload)
+      ? payload
+      : (payload && Array.isArray(payload.models) ? payload.models : []);
+    return [...new Set(raw.map((item) => {
+      if (typeof item === 'string') return item.trim();
+      if (!item || typeof item !== 'object') return '';
+      return String(item.modelId || item.id || item.modelName || item.name || '').trim();
+    }).filter(Boolean))].sort();
   }
 
   // Login
@@ -705,6 +736,29 @@
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
+  function formatLogDuration(l) {
+    if (!l) return '-';
+    const val = l.duration ?? l.latencyMs ?? l.durationMs ?? l.latency;
+    if (val !== undefined && val !== null && val !== '' && !isNaN(Number(val))) {
+      return Math.max(0, Math.round(Number(val))) + 'ms';
+    }
+    return '-';
+  }
+
+  function normalizeLogItem(l) {
+    if (!l || typeof l !== 'object') return l;
+    const rawDur = l.duration ?? l.latencyMs ?? l.durationMs ?? l.latency;
+    const dur = (rawDur !== undefined && rawDur !== null && rawDur !== '' && !isNaN(Number(rawDur)))
+      ? Math.max(0, Math.round(Number(rawDur)))
+      : null;
+    return {
+      ...l,
+      duration: dur != null ? dur : l.duration,
+      latencyMs: dur != null ? dur : l.latencyMs,
+      durationMs: dur != null ? dur : l.durationMs,
+    };
+  }
+
   function accountLabel(id) {
     if (!id) return '-';
     const acc = accountsData.find(a => a.id === id);
@@ -718,7 +772,8 @@
     try {
       const res = await api('/logs');
       const d = await res.json();
-      const logs = d.logs || [];
+      const rawLogs = Array.isArray(d) ? d : (d.logs || d.data || []);
+      const logs = rawLogs.map(normalizeLogItem);
       renderLogs(logs);
     } catch (e) {
       // silent
@@ -726,20 +781,25 @@
   }
 
   function renderLogs(logs) {
-    logsCache = logs;
+    logsCache = logs || [];
     const list = $('logsList');
     const summary = $('logsSummary');
     if (!list) return;
 
-    const total = logs.length;
-    const okCount = logs.filter(l => l.status === 'success').length;
+    const total = logsCache.length;
+    const okCount = logsCache.filter(l => l.status === 'success' || l.status === 200 || l.statusCode === 200 || l.success === true).length;
     const errCount = total - okCount;
     summary.innerHTML =
       '<span>' + escapeHtml(t('logs.total')) + ': <strong>' + total + '</strong></span>' +
       '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
       '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>';
 
-    const filtered = logs.filter(l => logsFilter === 'all' || l.status === logsFilter);
+    const filtered = logsCache.filter(l => {
+      const isSuccess = l.status === 'success' || l.status === 200 || l.statusCode === 200 || l.success === true;
+      if (logsFilter === 'success') return isSuccess;
+      if (logsFilter === 'error') return !isSuccess;
+      return true;
+    });
 
     if (!filtered.length) {
       list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>';
@@ -749,6 +809,8 @@
     let html = '<table class="logs-table"><thead><tr>' +
       '<th>' + escapeHtml(t('logs.time')) + '</th>' +
       '<th>' + escapeHtml(t('logs.status')) + '</th>' +
+      '<th>IP</th>' +
+      '<th>API Key</th>' +
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
@@ -757,25 +819,33 @@
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
     for (const l of filtered) {
-      const isErr = l.status === 'error';
-      const statusCell = '<span class="log-status log-status--' + escapeAttr(l.status) + '">' +
-        escapeHtml(isErr ? t('logs.statusError') : t('logs.statusSuccess')) + '</span>';
+      const isSuccess = l.status === 'success' || l.status === 200 || l.statusCode === 200 || l.success === true;
+      const statusCell = '<span class="log-status ' + (isSuccess ? 'log-status--success' : 'log-status--error') + '">' +
+        escapeHtml(isSuccess ? t('logs.statusSuccess') : t('logs.statusError')) + '</span>';
+      const ipCell = '<span class="text-xs font-mono">' + escapeHtml(l.ip || '—') + '</span>';
+      const keyCell = '<span class="text-xs font-mono" title="' + escapeAttr(l.apiKey || '') + '">' + escapeHtml(l.apiKey || l.apiKeyName || (l.apiKeyId ? l.apiKeyId.slice(0, 12) : '—')) + '</span>';
       let detailCell;
-      if (isErr) {
+      if (!isSuccess) {
         detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
           escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
-          '<span class="log-msg" title="' + escapeAttr(l.error) + '">' + escapeHtml(l.error) + '</span>';
+          '<span class="log-msg" title="' + escapeAttr(l.error || '') + '">' + escapeHtml(l.error || 'Failed') + '</span>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
+        detailCell = '<span class="text-muted">' + (l.credits ? (Number(l.credits).toFixed(4) + ' cr') : '-') + '</span>';
       }
+      const timeVal = l.time || l.timeUnix || 0;
+      const tokensVal = (l.inputTokens != null && l.outputTokens != null && (l.inputTokens > 0 || l.outputTokens > 0))
+        ? (formatNum(l.inputTokens) + ' / ' + formatNum(l.outputTokens))
+        : (l.tokens ? formatNum(l.tokens) : (l.totalTokens ? formatNum(l.totalTokens) : '-'));
       html += '<tr>' +
-        '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
+        '<td>' + escapeHtml(formatLogTime(timeVal)) + '</td>' +
         '<td>' + statusCell + '</td>' +
-        '<td>' + escapeHtml(l.endpoint) + '</td>' +
+        '<td>' + ipCell + '</td>' +
+        '<td>' + keyCell + '</td>' +
+        '<td>' + escapeHtml(l.endpoint || (l.kind === 'claude' ? '/v1/messages' : '/v1/chat/completions')) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
-        '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
-        '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
-        '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
+        '<td>' + escapeHtml(accountLabel(l.accountId) || l.account || '-') + '</td>' +
+        '<td>' + escapeHtml(tokensVal) + '</td>' +
+        '<td>' + escapeHtml(formatLogDuration(l)) + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';
     }
@@ -935,6 +1005,38 @@
       el.style.width = pct + '%';
     });
   }
+  // Worker admin payloads often omit usagePercent and only send
+  // usageCurrent/usageLimit. Derive the bar fill from the ratio so the
+  // track is not left at width:0 (looks like an uncolored bar).
+  function quotaBarPercent(current, limit, fraction) {
+    const lim = Number(limit);
+    const cur = Number(current);
+    if (Number.isFinite(lim) && lim > 0 && Number.isFinite(cur)) {
+      return Math.max(0, Math.min(100, (cur / lim) * 100));
+    }
+    const f = Number(fraction);
+    if (!Number.isFinite(f) || f <= 0) return 0;
+    return Math.max(0, Math.min(100, f <= 1 ? f * 100 : f));
+  }
+
+  function formatAccountTokens(a) {
+    if (a.totalTokens == null) return '—';
+    return Number(a.totalTokens).toLocaleString('en-US');
+  }
+  function accountTokensHint(a) {
+    if (a.totalTokens == null) return 'Historical account tokens were not recorded.';
+    return a.tokensTrackedSince
+      ? 'Tokens recorded since ' + new Date(a.tokensTrackedSince * 1000).toLocaleString() + '; earlier usage is unavailable.'
+      : (a.tokensIncomplete ? 'Earlier account token usage is unavailable.' : '');
+  }
+  function formatAccountCredits(a) {
+    return Number(a.totalCredits ?? a.credits ?? 0).toFixed(4);
+  }
+  function accountCreditsHint(a) {
+    return a.linkedCredentialCount > 1
+      ? 'Gateway-recorded credits for this Kiro account, shared across ' + a.linkedCredentialCount + ' credentials. This is not Kiro Main Quota.'
+      : 'Gateway-recorded credits for this credential. This is not Kiro Main Quota.';
+  }
 
   function renderAccounts() {
     const container = $('accountsList');
@@ -945,9 +1047,9 @@
       return;
     }
     container.innerHTML = filtered.map(a => {
-      const usagePct = (a.usagePercent || 0) * 100;
+      const usagePct = quotaBarPercent(a.usageCurrent, a.usageLimit, a.usagePercent);
       const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
-      const trialPct = (a.trialUsagePercent || 0) * 100;
+      const trialPct = quotaBarPercent(a.trialUsageCurrent, a.trialUsageLimit, a.trialUsagePercent);
       const trialClass = trialPct > 90 ? 'critical' : trialPct > 70 ? 'high' : '';
       const isSelected = selectedAccounts.has(a.id);
       const weight = a.weight || 0;
@@ -975,6 +1077,7 @@
         weightBadge +
         overageBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
+        (a.linkedCredentialCount > 1 ? '<span class="badge badge-info" title="Gateway usage is shared across credentials for this Kiro account">Shared account · ' + a.linkedCredentialCount + ' credentials</span>' : '') +
         getStatusBadge(a) +
         '</div>' +
         '</div>' +
@@ -994,19 +1097,19 @@
         (a.usageLimit > 0 ?
           '<div class="account-usage">' +
           '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +
-          '<div class="usage-bar"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '"></div></div>' +
+          '<div class="usage-bar"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '" style="width:' + usagePct + '%"></div></div>' +
           '<div class="usage-text"><span>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + '</span><span>' + usagePct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
         (a.trialUsageLimit > 0 ?
           '<div class="account-usage">' +
           '<div class="usage-label">' + escapeHtml(t('accounts.trialQuota')) + ' ' + escapeHtml(formatTrialExpiry(a.trialExpiresAt)) + '</div>' +
-          '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
+          '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '" style="width:' + trialPct + '%"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-value" title="' + escapeAttr(accountTokensHint(a)) + '">' + formatAccountTokens(a) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-value" title="' + escapeAttr(accountCreditsHint(a)) + '">' + formatAccountCredits(a) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
         '</div>' +
         '</div>';
@@ -1276,8 +1379,8 @@
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.statistics')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.requestCount'), a.requestCount || 0) +
       detailItem(t('detail.errorCount'), a.errorCount || 0) +
-      detailItem(t('detail.totalTokens'), formatNum(a.totalTokens || 0)) +
-      detailItem(t('detail.totalCredits'), (a.totalCredits || 0).toFixed(2)) +
+      detailItem(t('detail.totalTokens'), formatAccountTokens(a)) +
+      detailItem(t('detail.totalCredits'), formatAccountCredits(a) + ' — ' + accountCreditsHint(a)) +
       '</div></div>' +
 
       '<div class="detail-section">' +
@@ -1532,9 +1635,16 @@
     renderTestModal();
     openDialog('testModal');
     try {
-      const res = await api('/accounts/' + id + '/models/cached');
-      const d = await res.json();
-      testModalModels = Array.isArray(d.models) ? d.models.slice().sort() : [];
+      let res = await api('/accounts/' + id + '/models/cached');
+      let d;
+      try {
+        d = await parseApiResponse(res);
+      } catch (cachedErr) {
+        res = await api('/accounts/' + id + '/models');
+        d = await parseApiResponse(res);
+      }
+      testModalModels = normalizeModelIds(d);
+      if (!testModalModels.length && !res.ok) testModalModelError = true;
     } catch (e) {
       testModalModelError = true;
     } finally {
@@ -1559,8 +1669,8 @@
       const startTime = Date.now();
       const res = await api('/accounts/' + id + '/test', { method: 'POST', body: JSON.stringify({ model }) });
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      const d = await res.json();
-      if (d.success) {
+      const d = await parseApiResponse(res);
+      if (d.success || d.ok) {
         addTestLog(t('accounts.testLog.success', email, elapsed, d.reply), 'ok');
       } else {
         addTestLog(t('accounts.testLog.failed', email, elapsed, d.error || t('common.unknownError')), 'err');
@@ -1578,7 +1688,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadExternalApiConfig()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadProxyList(), loadPromptFilter(), loadApiKeys(), loadExternalApiConfig()]);
     refreshCustomSelects();
   }
 
@@ -1688,6 +1798,85 @@
     if (d.success) toast(t('settings.endpointSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  async function loadProxyList() {
+    const status = $('proxyListStatus');
+    try {
+      const res = await api('/proxy-list');
+      const data = await parseApiResponse(res);
+      if (!res.ok || !data.success) throw new Error(data.error || 'Failed to load proxy inventory');
+      const rows = $('proxyListRows');
+      rows.replaceChildren();
+      const proxies = data.proxies || [];
+      status.textContent = proxies.length + ' saved · Routing inactive on Cloudflare Worker';
+      if (!proxies.length) {
+        rows.textContent = 'No proxies saved.';
+        return;
+      }
+      for (const item of proxies) {
+        const row = document.createElement('div');
+        row.className = 'proxy-inventory-row';
+        const label = document.createElement('span');
+        label.textContent = item.country + ' · ' + item.scheme + '://' + item.host + ':' + item.port +
+          (item.username ? ' · user ' + item.username : '') + (item.enabled ? '' : ' · disabled');
+        const toggle = document.createElement('button');
+        toggle.type = 'button'; toggle.className = 'btn btn-outline btn-sm';
+        toggle.textContent = item.enabled ? 'Disable' : 'Enable';
+        toggle.addEventListener('click', () => updateProxyList(item.id, 'PATCH', { enabled: !item.enabled }));
+        const remove = document.createElement('button');
+        remove.type = 'button'; remove.className = 'btn btn-danger btn-sm';
+        remove.textContent = 'Remove';
+        remove.addEventListener('click', async () => {
+          if (await confirmAction('Remove this proxy from the inventory?', { variant: 'danger' })) {
+            await updateProxyList(item.id, 'DELETE');
+          }
+        });
+        row.append(label, toggle, remove);
+        rows.append(row);
+      }
+    } catch (err) {
+      status.textContent = err.message;
+    }
+  }
+  async function updateProxyList(id, method, body) {
+    try {
+      const res = await api('/proxy-list/' + encodeURIComponent(id), {
+        method, ...(body ? { body: JSON.stringify(body) } : {})
+      });
+      const data = await parseApiResponse(res);
+      if (!res.ok || !data.success) throw new Error(data.error || 'Failed to update proxy');
+      await loadProxyList();
+    } catch (err) { toast(err.message, 'error'); }
+  }
+  async function addProxyList() {
+    const field = $('proxyBulkInput');
+    const lines = field.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!lines.length) { toast('Enter at least one proxy', 'warning'); return; }
+    const parsed = [];
+    for (const line of lines) {
+      const match = line.match(/^(ID|VN)\|([^:|\s]+):(\d{1,5}):([^:\s]+):([^\s]+)$/i);
+      if (!match || Number(match[3]) > 65535 || Number(match[3]) < 1) {
+        toast('Invalid line. Use ID|host:port:username:password or VN|host:port:username:password', 'warning');
+        return;
+      }
+      parsed.push({ country: match[1].toUpperCase(), host: match[2], port: Number(match[3]),
+        username: match[4], password: match[5], scheme: 'http' });
+    }
+    const button = $('addProxyListBtn');
+    button.disabled = true;
+    try {
+      for (const entry of parsed) {
+        const res = await api('/proxy-list', { method: 'POST', body: JSON.stringify(entry) });
+        const data = await parseApiResponse(res);
+        if (!res.ok || !data.success) throw new Error(data.error || 'Save failed');
+      }
+      field.value = '';
+      await loadProxyList();
+      toast(parsed.length + ' proxies saved to inventory', 'success');
+    } catch (err) {
+      await loadProxyList();
+      toast('Import stopped: ' + err.message, 'error');
+    } finally { button.disabled = false; }
+  }
   async function loadProxyConfig() {
     const res = await api('/proxy');
     const d = await res.json();
@@ -1789,8 +1978,27 @@
   }
   // Multi API Key management
   let apiKeysCache = [];
+  const apiKeySecrets = new Map();
   let apiKeyEditingId = '';
   let apiKeyModalSubmitting = false;
+  let apiKeysAutoTimer = null;
+
+  // Auto-refresh the API Keys tab so credit/token usage updates without a manual F5.
+  function toggleApiKeysAutoRefresh() {
+    const cb = $('apiKeysAutoRefresh');
+    const on = !!(cb && cb.checked);
+    localStorage.setItem('kiro_apikeys_auto', on ? '1' : '0');
+    if (apiKeysAutoTimer) { clearInterval(apiKeysAutoTimer); apiKeysAutoTimer = null; }
+    if (!on) return;
+    apiKeysAutoTimer = setInterval(() => {
+      const tab = $('tabApiKeys');
+      if (!tab || tab.classList.contains('hidden')) return;
+      // Skip while a key modal is open so the refresh cannot clobber in-progress edits.
+      const modal = $('apiKeyModal');
+      if (modal && modal.classList.contains('active')) return;
+      loadApiKeys();
+    }, 5000);
+  }
 
   async function loadApiKeys() {
     const list = $('apiKeysList');
@@ -1800,6 +2008,11 @@
       if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
       apiKeysCache = Array.isArray(d.apiKeys) ? d.apiKeys : [];
+      apiKeysCache.forEach(item => {
+        if (item && item.id && typeof item.key === 'string' && item.key && !item.key.includes('•')) {
+          apiKeySecrets.set(item.id, item.key);
+        }
+      });
       renderApiKeys();
     } catch (e) {
       apiKeysCache = [];
@@ -1817,11 +2030,12 @@
     if (!limit || limit <= 0) return '';
     const ratio = Math.max(0, Math.min(1, used / limit));
     const pct = (ratio * 100).toFixed(1);
-    let color = '#3b82f6';
+    let color = '#10b981';
     if (ratio >= 0.95) color = '#ef4444';
-    else if (ratio >= 0.8) color = '#f59e0b';
+    else if (ratio >= 0.75) color = '#f59e0b';
+    const displayWidth = ratio > 0 ? Math.max(2, parseFloat(pct)) : 0;
     return '<div style="height:6px;background:rgba(127,127,127,0.2);border-radius:3px;overflow:hidden;margin-top:4px;">' +
-      '<div style="height:100%;width:' + pct + '%;background:' + color + ';transition:width 0.3s;"></div>' +
+      '<div style="height:100%;width:' + displayWidth + '%;background:' + color + ';transition:width 0.3s;"></div>' +
       '</div>';
   }
 
@@ -1834,11 +2048,40 @@
     return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
   }
 
+  function apiKeyExpiryHtml(item) {
+    if (!item.expiresAt) {
+      return '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.expires')) + ': ' + escapeHtml(t('apiKeys.expiryNever')) + '</div>';
+    }
+    const expired = item.expired || Math.floor(Date.now() / 1000) >= Number(item.expiresAt);
+    const date = new Date(Number(item.expiresAt) * 1000);
+    return '<div class="text-xs" style="color:' + (expired ? '#ef4444' : '#f59e0b') + ';font-weight:' + (expired ? '600' : '500') + ';">' +
+      escapeHtml(expired ? t('apiKeys.expiredAt') : t('apiKeys.expires')) + ': ' + escapeHtml(date.toLocaleString()) + '</div>';
+  }
+
+  async function copyApiKeyEntry(id) {
+    const item = apiKeysCache.find(x => x.id === id);
+    const key = apiKeySecrets.get(id) || (item && typeof item.key === 'string' ? item.key : '');
+    if (!key || key.includes('•')) {
+      toast(t('apiKeys.copyUnavailable'), 'error');
+      return;
+    }
+    try {
+      await copyText(key);
+      toast(t('apiKeys.copySuccess'), 'success');
+    } catch (_) {
+      toast(t('common.failed'), 'error');
+    }
+  }
+
   function renderApiKeys() {
     const list = $('apiKeysList');
     if (!list) return;
     if (!apiKeysCache.length) {
-      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
+      const emptyHtml = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
+      list.innerHTML = emptyHtml;
+      const tabList = $('apiKeysTabList');
+      if (tabList && tabList !== list) tabList.innerHTML = emptyHtml;
+      refreshApiKeyTrace();
       return;
     }
     const html = apiKeysCache.map(item => {
@@ -1854,6 +2097,7 @@
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
+      const expiryLine = apiKeyExpiryHtml(item);
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
@@ -1862,24 +2106,268 @@
             disabled +
             '<span class="text-xs muted-text font-mono">' + masked + '</span>' +
           '</div>' +
-          '<div class="flex items-center gap-2">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
             '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
               '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
               '<span class="slider"></span>' +
             '</label>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
-            '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '"><i class="fa-solid fa-pen-to-square"></i> ' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
+            '<button class="btn btn-warning btn-sm" type="button" data-apikey-action="expire" data-id="' + id + '"><i class="fa-solid fa-hourglass-end"></i> ' + escapeHtml(t('apiKeys.actionExpire') || 'Hết hạn') + '</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="copy" data-id="' + id + '"><i class="fa-regular fa-copy"></i> ' + escapeHtml(t('apiKeys.copyBtn')) + '</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '"><i class="fa-solid fa-rotate-left"></i> ' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
+            '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '"><i class="fa-solid fa-trash"></i> ' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
           '</div>' +
         '</div>' +
         '<div style="margin-top:0.5rem;display:grid;gap:0.35rem;">' +
           tokensLine +
           creditsLine +
           requestsLine +
+          expiryLine +
         '</div>' +
       '</div>';
     }).join('');
     list.innerHTML = html;
+    // Mirror the same cards into the dedicated API Keys tab (if present).
+    const tabList = $('apiKeysTabList');
+    if (tabList && tabList !== list) tabList.innerHTML = html;
+    refreshApiKeyTrace();
+  }
+
+  // Build the per-key trace (logs filtered by apiKeyId) inside the API Keys tab.
+  function refreshApiKeyTrace() {
+    const sel = $('apiKeyTraceSelect');
+    const summary = $('apiKeyTraceSummary');
+    const listBox = $('apiKeyTraceList');
+    if (!sel || !listBox) return;
+
+    const options = ['<option value="">' + escapeHtml(t('apiKeys.traceAll')) + '</option>'].concat(
+      apiKeysCache.map(k => '<option value="' + escapeAttr(k.id || '') + '">' +
+        escapeHtml((k.name || k.id) + ' — ' + (k.keyMasked || '')) + '</option>')
+    );
+    const prev = sel.dataset.prevValue || '';
+    sel.innerHTML = options.join('');
+    if (prev && apiKeysCache.some(k => k.id === prev)) { sel.value = prev; } else { sel.dataset.prevValue = ''; }
+    const selected = sel.value;
+
+    const logs = (typeof logsCache !== 'undefined' && Array.isArray(logsCache)) ? logsCache : [];
+    const filtered = selected ? logs.filter(l => l.apiKeyId === selected || l.apiKey === selected) : logs;
+
+    if (summary) {
+      const total = filtered.length;
+      const okCount = filtered.filter(l => l.status === 'success' || l.status === 200 || l.statusCode === 200 || l.success === true).length;
+      const errCount = total - okCount;
+      const tokens = filtered.reduce((s, l) => s + (Number(l.totalTokens || l.tokens || 0) || 0), 0);
+      const credits = filtered.reduce((s, l) => s + (Number(l.credits || 0) || 0), 0);
+      summary.innerHTML =
+        '<div class="logs-summary" style="margin-bottom:0.5rem;">' +
+          '<span>' + escapeHtml(t('logs.total')) + ': <strong>' + total + '</strong></span>' +
+          '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
+          '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>' +
+          '<span>' + escapeHtml(t('stats.tokens')) + ': <strong>' + formatNumber(tokens) + '</strong></span>' +
+          '<span>' + escapeHtml(t('apiKeys.credits')) + ': <strong>' + credits.toFixed(4) + '</strong></span>' +
+        '</div>';
+    }
+
+    if (!filtered.length) {
+      listBox.innerHTML = '<p class="text-muted">' + escapeHtml(selected ? t('apiKeys.traceEmpty') : t('logs.empty')) + '</p>';
+      return;
+    }
+
+    let html = '<table class="logs-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('logs.time')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.status')) + '</th>' +
+      '<th>IP</th>' +
+      '<th>' + escapeHtml(t('logs.model')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
+      '</tr></thead><tbody>';
+    for (const l of filtered.slice(0, 100)) {
+      const isSuccess = l.status === 'success' || l.status === 200 || l.statusCode === 200 || l.success === true;
+      const statusCell = '<span class="log-status ' + (isSuccess ? 'log-status--success' : 'log-status--error') + '">' +
+        escapeHtml(isSuccess ? t('logs.statusSuccess') : t('logs.statusError')) + '</span>';
+      const ipCell = '<span class="text-xs font-mono">' + escapeHtml(l.ip || '—') + '</span>';
+      const tokensVal = (l.inputTokens != null && l.outputTokens != null && (l.inputTokens > 0 || l.outputTokens > 0))
+        ? (formatNum(l.inputTokens) + ' / ' + formatNum(l.outputTokens))
+        : (l.tokens ? formatNum(l.tokens) : (l.totalTokens ? formatNum(l.totalTokens) : '-'));
+      let detailCell;
+      if (!isSuccess) {
+        detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
+          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
+          '<span class="log-msg" title="' + escapeAttr(l.error || '') + '">' + escapeHtml(l.error || 'Failed') + '</span>';
+      } else {
+        detailCell = '<span class="text-muted">' + (l.credits ? (Number(l.credits).toFixed(4) + ' cr') : '-') + '</span>';
+      }
+      html += '<tr>' +
+        '<td>' + escapeHtml(formatLogTime(l.time || l.timeUnix || 0)) + '</td>' +
+        '<td>' + statusCell + '</td>' +
+        '<td>' + ipCell + '</td>' +
+        '<td>' + escapeHtml(l.model || '-') + '</td>' +
+        '<td>' + escapeHtml(tokensVal) + '</td>' +
+        '<td>' + escapeHtml(formatLogDuration(l)) + '</td>' +
+        '<td>' + detailCell + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    listBox.innerHTML = html;
+  }
+
+  // ===== Channel Status (per-account ping health) =====
+  let channelsCache = [];
+  let channelsWindow = localStorage.getItem('kiro_channels_window') || 'h24';
+  let channelsMeta = { sampleWindowLimited: false, sampleWindowSeconds: 0, logBufferCapacity: 0 };
+
+  function channelStatusBadge(health, enabled) {
+    if (!enabled) {
+      return '<span class="badge badge-info">' + escapeHtml(t('channels.statusDisabled')) + '</span>';
+    }
+    const last = health && health.last;
+    if (!last) {
+      return '<span class="badge badge-info">' + escapeHtml(t('channels.statusUnknown')) + '</span>';
+    }
+    if (last.ok) {
+      return '<span class="badge badge-success">' + escapeHtml(t('channels.statusHealthy')) + '</span>';
+    }
+    return '<span class="badge badge-error">' + escapeHtml(t('channels.statusFailing')) + '</span>';
+  }
+
+  function channelErrRateClass(rate) {
+    if (rate >= 20) return 'critical';
+    if (rate >= 5) return 'high';
+    return '';
+  }
+
+  // A compact bar per window so 1h / 24h / 7d are all visible at a glance
+  // without switching the selector. Bar length tracks the error rate.
+  function channelWindowBars(health) {
+    const defs = [
+      ['h1', t('channels.window1hShort')],
+      ['h24', t('channels.window24hShort')],
+      ['d7', t('channels.window7dShort')],
+    ];
+    return '<div style="margin-top:0.5rem;display:grid;gap:0.3rem;">' + defs.map(([key, label]) => {
+      const w = (health && health[key]) || { total: 0, err: 0, errRate: 0 };
+      const rate = Math.max(0, Math.min(100, Number(w.errRate) || 0));
+      const cls = channelErrRateClass(rate);
+      const color = cls === 'critical' ? '#ef4444' : (cls === 'high' ? '#f59e0b' : '#10b981');
+      const width = rate > 0 ? Math.max(2, rate) : 0;
+      return '<div class="flex items-center gap-2">' +
+        '<span class="text-xs muted-text" style="min-width:4.5rem;">' + escapeHtml(label) + '</span>' +
+        '<div style="flex:1;height:6px;background:rgba(127,127,127,0.2);border-radius:3px;overflow:hidden;">' +
+          '<div style="height:100%;width:' + width + '%;background:' + color + ';transition:width 0.3s;"></div>' +
+        '</div>' +
+        '<span class="text-xs" style="min-width:4.5rem;text-align:right;color:' + color + ';">' +
+          rate.toFixed(2) + '% <span class="muted-text">(' + formatNumber(w.total) + ')</span>' +
+        '</span>' +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
+  async function loadChannelStatus() {
+    const list = $('channelsList');
+    if (!list) return;
+    try {
+      const res = await api('/channels');
+      const d = await res.json();
+      channelsCache = Array.isArray(d.channels) ? d.channels : [];
+      channelsMeta = {
+        sampleWindowLimited: Boolean(d.sampleWindowLimited),
+        sampleWindowSeconds: Number(d.sampleWindowSeconds) || 0,
+        logBufferCapacity: Number(d.logBufferCapacity) || 0,
+      };
+      renderChannelStatus();
+    } catch (e) {
+      channelsCache = [];
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.loadFailed')) + '</div>';
+    }
+  }
+
+  function renderChannelStatus() {
+    const list = $('channelsList');
+    const summary = $('channelsSummary');
+    const notice = $('channelsNotice');
+    if (!list) return;
+
+    if (notice) {
+      notice.innerHTML = channelsMeta.sampleWindowLimited
+        ? '<div class="text-xs" style="color:#f59e0b;margin:0.35rem 0;">' +
+          escapeHtml(t('channels.sampleWindowWarning', formatDuration(channelsMeta.sampleWindowSeconds))) + '</div>'
+        : '';
+    }
+
+    if (!channelsCache.length) {
+      const emptyHtml = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('channels.empty')) + '</div>';
+      list.innerHTML = emptyHtml;
+      if (summary) summary.innerHTML = '';
+      return;
+    }
+
+    const win = channelsWindow;
+    let totalReq = 0, totalErr = 0;
+    channelsCache.forEach(c => {
+      const w = c.health && c.health[win];
+      if (w) { totalReq += Number(w.total) || 0; totalErr += Number(w.err) || 0; }
+    });
+    const overallRate = totalReq > 0 ? ((totalErr / totalReq) * 100).toFixed(2) : '0.00';
+    if (summary) {
+      summary.innerHTML =
+        '<span>' + escapeHtml(t('channels.totalChannels')) + ': <strong>' + channelsCache.length + '</strong></span>' +
+        '<span>' + escapeHtml(t('channels.totalRequests')) + ': <strong>' + formatNumber(totalReq) + '</strong></span>' +
+        '<span>' + escapeHtml(t('channels.overallErrorRate')) + ': <strong>' + overallRate + '%</strong></span>';
+    }
+
+    list.innerHTML = channelsCache.map(c => {
+      const h = c.health || {};
+      const w = h[win] || { total: 0, ok: 0, err: 0, errRate: 0, avgLatencyMs: 0, codes: {} };
+      const displayEmail = getDisplayEmail(c.email, c.id);
+      const idAttr = escapeAttr(c.id || '');
+      const last = h.last;
+      const lastLine = last
+        ? escapeHtml(t(last.ok ? 'channels.lastOk' : 'channels.lastError', formatRelativeTimeLabel(last.atUnix))) +
+          (!last.ok && last.error ? ' — <span class="text-xs muted-text" title="' + escapeAttr(last.error) + '">' + escapeHtml((last.error || '').slice(0, 80)) + '</span>' : '')
+        : escapeHtml(t('channels.neverPinged'));
+      const errRatePct = Number(w.errRate) || 0;
+      const errClass = channelErrRateClass(errRatePct);
+      const codesBadges = Object.entries(w.codes || {}).slice(0, 4).map(([code, n]) =>
+        '<span class="badge badge-warning" style="margin-right:4px;">' + escapeHtml(code) + ': ' + n + '</span>'
+      ).join('');
+
+      return '<div class="card" data-channel-id="' + idAttr + '" style="margin-top:0.5rem;padding:0.75rem;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+            '<span class="font-semibold">' + escapeHtml(displayEmail) + '</span>' +
+            channelStatusBadge(h, c.enabled) +
+            '<span class="text-xs muted-text">' + escapeHtml(c.region || '') + '</span>' +
+          '</div>' +
+          '<div class="text-xs muted-text">' + lastLine + '</div>' +
+        '</div>' +
+        '<div style="margin-top:0.5rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0.5rem;">' +
+          '<div class="account-stat"><div class="account-stat-value">' + formatNumber(w.total) + '</div><div class="account-stat-label">' + escapeHtml(t('channels.requests')) + '</div></div>' +
+          '<div class="account-stat"><div class="account-stat-value ' + (errClass ? 'danger-text' : '') + '">' + errRatePct.toFixed(2) + '%</div><div class="account-stat-label">' + escapeHtml(t('channels.errorRate')) + '</div></div>' +
+          '<div class="account-stat"><div class="account-stat-value">' + formatNumber(w.avgLatencyMs || 0) + 'ms</div><div class="account-stat-label">' + escapeHtml(t('channels.avgLatency')) + '</div></div>' +
+          '<div class="account-stat"><div class="account-stat-value">' + formatNumber(w.ok) + '</div><div class="account-stat-label">' + escapeHtml(t('channels.okCount')) + '</div></div>' +
+        '</div>' +
+        (codesBadges ? '<div style="margin-top:0.5rem;">' + codesBadges + '</div>' : '') +
+        channelWindowBars(h) +
+        '</div>';
+    }).join('');
+  }
+
+  function formatDuration(seconds) {
+    seconds = Number(seconds) || 0;
+    if (seconds < 3600) return Math.round(seconds / 60) + 'm';
+    if (seconds < 86400) return (seconds / 3600).toFixed(1) + 'h';
+    return (seconds / 86400).toFixed(1) + 'd';
+  }
+
+  function formatRelativeTimeLabel(unixSeconds) {
+    if (!unixSeconds) return '—';
+    const diff = Math.floor(Date.now() / 1000) - Number(unixSeconds);
+    if (diff < 10) return t('channels.justNow') || 'just now';
+    if (diff < 60) return diff + 's';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+    return Math.floor(diff / 86400) + 'd';
   }
 
   function openApiKeyModal(entry) {
@@ -1887,16 +2375,25 @@
     const titleEl = $('apiKeyModalTitle');
     titleEl.textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : 'apiKeys.modalTitleCreate');
     $('apiKeyForm_name').value = entry ? (entry.name || '') : '';
-    const keyEl = $('apiKeyForm_key');
-    if (apiKeyEditingId) {
-      keyEl.value = entry.keyMasked || '';
-      keyEl.readOnly = true;
+    const expirySel = $('apiKeyForm_expiryPreset');
+    const expiryDate = $('apiKeyForm_expiryDate');
+    if (entry && entry.expiresAt && Math.floor(Date.now() / 1000) < entry.expiresAt) {
+      // Still-valid fixed expiry -> offer it as a custom datetime.
+      expirySel.value = 'custom';
+      const dt = new Date(entry.expiresAt * 1000);
+      expiryDate.value = new Date(dt.getTime() - dt.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      expiryDate.classList.remove('hidden');
+    } else if (entry && entry.expiryPreset && entry.expiryPreset !== 'custom' && !entry.expired) {
+      expirySel.value = entry.expiryPreset;
+      expiryDate.value = '';
+      expiryDate.classList.add('hidden');
     } else {
-      keyEl.value = '';
-      keyEl.readOnly = false;
+      expirySel.value = entry && entry.expired ? 'custom' : 'never';
+      expiryDate.value = entry && entry.expired && entry.expiresAt
+        ? new Date(entry.expiresAt * 1000).toISOString().slice(0, 16)
+        : '';
+      expiryDate.classList.toggle('hidden', !(entry && entry.expired && entry.expiresAt));
     }
-    $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
-    $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
@@ -1917,14 +2414,32 @@
     saveBtn.disabled = true;
     try {
       const name = $('apiKeyForm_name').value.trim();
-      const enabled = $('apiKeyForm_enabled').checked;
-      const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      const expiryPreset = $('apiKeyForm_expiryPreset').value;
+      const expiryDateValue = $('apiKeyForm_expiryDate').value;
+      let expiresAt = 0;
+      if (expiryPreset === '8h') {
+        expiresAt = Math.floor((Date.now() + 8 * 3600 * 1000) / 1000);
+      } else if (expiryPreset === '1d') {
+        expiresAt = Math.floor((Date.now() + 24 * 3600 * 1000) / 1000);
+      } else if (expiryPreset === 'eom') {
+        const now = new Date();
+        expiresAt = Math.floor(new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).getTime() / 1000);
+      } else if (expiryPreset === 'custom') {
+        const expiryMs = Date.parse(expiryDateValue);
+        if (!expiryDateValue || !Number.isFinite(expiryMs)) {
+          throw new Error(t('apiKeys.expiryRequired'));
+        }
+        expiresAt = Math.floor(expiryMs / 1000);
+      }
+      if (expiresAt > 0 && expiresAt <= Math.floor(Date.now() / 1000)) {
+        throw new Error(t('apiKeys.expiryFuture'));
+      }
       const payload = {
         name: name,
-        enabled: enabled,
-        tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
-        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
+        expiryPreset: expiryPreset,
+        expiresAt: expiresAt,
+        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit,
       };
       let res, d;
       if (apiKeyEditingId) {
@@ -1935,15 +2450,17 @@
         closeApiKeyModal();
         await loadApiKeys();
       } else {
-        const keyVal = $('apiKeyForm_key').value.trim();
-        if (keyVal) payload.key = keyVal;
+        payload.enabled = true;
         res = await api('/api-keys', { method: 'POST', body: JSON.stringify(payload) });
         d = await res.json().catch(() => ({}));
         if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
         toast(t('apiKeys.created'), 'success');
         closeApiKeyModal();
         await loadApiKeys();
-        if (d.key) showNewApiKey(d.key);
+        if (d.key) {
+          if (d.id) apiKeySecrets.set(d.id, d.key);
+          showNewApiKey(d.key);
+        }
       }
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
@@ -1978,6 +2495,25 @@
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
       toast(t('apiKeys.deleteSuccess'), 'success');
+      apiKeySecrets.delete(id);
+      await loadApiKeys();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function expireApiKeyEntry(id, name) {
+    const ok = await confirmAction(t('apiKeys.confirmExpire', name || t('apiKeys.unnamed')), {
+      title: t('apiKeys.actionExpire') || 'Hết hạn',
+      confirmText: t('apiKeys.actionExpire') || 'Hết hạn',
+      variant: 'warning'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/expire', { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('apiKeys.usageExpired') || 'Key đã được đánh dấu hết hạn (100% Quota)', 'success');
       await loadApiKeys();
     } catch (e) {
       toast((e && e.message) || t('common.failed'), 'error');
@@ -2002,7 +2538,13 @@
   }
 
   function showNewApiKey(plaintext) {
-    $('apiKeyShowValue').value = plaintext || '';
+    // Some backends returned the whole entry object here; unwrap it so the
+    // input/copy always holds the plaintext key string.
+    if (plaintext && typeof plaintext === 'object') {
+      plaintext = plaintext.key || plaintext.apiKey || plaintext.value || '';
+      if (plaintext && typeof plaintext === 'object') plaintext = plaintext.key || '';
+    }
+    $('apiKeyShowValue').value = typeof plaintext === 'string' ? plaintext : String(plaintext || '');
     openDialog('apiKeyShowModal');
     setTimeout(() => {
       const el = $('apiKeyShowValue');
@@ -2038,6 +2580,8 @@
         const entry = apiKeysCache.find(x => x.id === id);
         const name = entry ? entry.name : '';
         if (action === 'edit') openApiKeyModal(entry);
+        else if (action === 'expire') expireApiKeyEntry(id, name);
+        else if (action === 'copy') copyApiKeyEntry(id);
         else if (action === 'delete') deleteApiKeyEntry(id, name);
         else if (action === 'reset') resetApiKeyUsageEntry(id, name);
       });
@@ -2049,8 +2593,84 @@
         toggleApiKeyEntry(id, cb.checked);
       });
     }
+    // Dedicated API Keys tab: same delegated handlers on the mirrored list.
+    const tabList = $('apiKeysTabList');
+    if (tabList) {
+      tabList.addEventListener('click', e => {
+        const btn = e.target.closest('[data-apikey-action]');
+        if (!btn) return;
+        const action = btn.dataset.apikeyAction;
+        const id = btn.dataset.id;
+        if (!id) return;
+        const entry = apiKeysCache.find(x => x.id === id);
+        const name = entry ? entry.name : '';
+        if (action === 'edit') openApiKeyModal(entry);
+        else if (action === 'expire') expireApiKeyEntry(id, name);
+        else if (action === 'copy') copyApiKeyEntry(id);
+        else if (action === 'delete') deleteApiKeyEntry(id, name);
+        else if (action === 'reset') resetApiKeyUsageEntry(id, name);
+      });
+      tabList.addEventListener('change', e => {
+        const cb = e.target.closest('input[data-apikey-action="toggle"]');
+        if (!cb) return;
+        const id = cb.dataset.id;
+        if (!id) return;
+        toggleApiKeyEntry(id, cb.checked);
+      });
+    }
     const addBtn = $('addApiKeyBtn');
     if (addBtn) addBtn.addEventListener('click', () => openApiKeyModal(null));
+    const addTabBtn = $('addApiKeyTabBtn');
+    if (addTabBtn) addTabBtn.addEventListener('click', () => openApiKeyModal(null));
+    const refreshTabBtn = $('apiKeysRefreshBtn');
+    if (refreshTabBtn) refreshTabBtn.addEventListener('click', async () => {
+      await loadApiKeys();
+      await refreshApiKeyTrace();
+      toast(t('apiKeys.refreshed'), 'primary');
+    });
+    const apiKeysAuto = $('apiKeysAutoRefresh');
+    if (apiKeysAuto) {
+      apiKeysAuto.checked = localStorage.getItem('kiro_apikeys_auto') === '1';
+      apiKeysAuto.addEventListener('change', toggleApiKeysAutoRefresh);
+      toggleApiKeysAutoRefresh();
+    }
+    const channelsRefreshBtn = $('channelsRefreshBtn');
+    if (channelsRefreshBtn) channelsRefreshBtn.addEventListener('click', async () => {
+      await loadChannelStatus();
+      toast(t('channels.refreshed'), 'primary');
+    });
+    const channelsWindowSel = $('channelsWindowSelect');
+    if (channelsWindowSel) {
+      channelsWindowSel.value = channelsWindow;
+      channelsWindowSel.addEventListener('change', () => {
+        channelsWindow = channelsWindowSel.value || 'h24';
+        localStorage.setItem('kiro_channels_window', channelsWindow);
+        renderChannelStatus();
+      });
+    }
+    const traceBtn = $('apiKeyTraceBtn');
+    if (traceBtn) traceBtn.addEventListener('click', async () => {
+      const sel = $('apiKeyTraceSelect');
+      if (sel) sel.dataset.prevValue = sel.value;
+      await loadLogs();
+      refreshApiKeyTrace();
+    });
+    const traceSel = $('apiKeyTraceSelect');
+    if (traceSel) traceSel.addEventListener('change', () => {
+      traceSel.dataset.prevValue = traceSel.value;
+      refreshApiKeyTrace();
+    });
+    const expirySel = $('apiKeyForm_expiryPreset');
+    if (expirySel) expirySel.addEventListener('change', () => {
+      const expiryDate = $('apiKeyForm_expiryDate');
+      if (!expiryDate) return;
+      const custom = expirySel.value === 'custom';
+      expiryDate.classList.toggle('hidden', !custom);
+      if (custom && !expiryDate.value) {
+        const defaultDate = new Date(Date.now() + 24 * 3600 * 1000);
+        expiryDate.value = new Date(defaultDate.getTime() - defaultDate.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      }
+    });
     const saveBtn = $('apiKeyModalSaveBtn');
     if (saveBtn) saveBtn.addEventListener('click', submitApiKeyModal);
     const cancelBtn = $('apiKeyModalCancelBtn');
@@ -2214,28 +2834,57 @@
       '</div>';
     $('startBuilderIdBtn').addEventListener('click', startBuilderIdLogin);
   }
+  let iamPollTimer = null;
   function modalIam(title, body) {
-    title.textContent = t('modal.iamTitle');
+    if (iamPollTimer) { clearTimeout(iamPollTimer); iamPollTimer = null; }
+    iamSession = "";
+    title.textContent = t("modal.iamTitle");
     body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + '</label><input type="text" id="iamStartUrl" placeholder="https://xxx.awsapps.com/start" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="iamRegion" value="us-east-1" /></div>' +
-      '<div id="iamStep2" class="hidden">' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
-      '<div class="endpoint"><span id="iamAuthUrl" class="font-mono text-xs"></span></div>' +
-      '<div class="flex gap-2 mt-2">' +
-      '<button class="btn btn-sm btn-outline flex-1" id="iamOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
-      '<button class="btn btn-sm btn-outline flex-1" id="iamCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
-      '</div>' +
-      '</div>' +
-      '<p class="text-sm mt-3 success-text">' + escapeHtml(t('iam.completeLogin')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.callbackUrl')) + '</label><input type="text" id="iamCallback" placeholder="http://127.0.0.1:xxx/?code=..." /></div>' +
-      '</div>' +
-      '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="iamBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
-      '</div>';
-    $('iamBtn').addEventListener('click', startIamSso);
+      "<p class=\"help-block\">" + escapeHtml(t("modal.iamDesc")) + "</p>" +
+      "<div id=\"iamStep1\">" +
+      "<div class=\"form-group\"><label>" + escapeHtml(t("iam.startUrl")) + "</label><input type=\"text\" id=\"iamStartUrl\" placeholder=\"https://xxx.awsapps.com/start\" /></div>" +
+      "<div class=\"form-group\"><label>" + escapeHtml(t("detail.region")) + "</label><input type=\"text\" id=\"iamRegion\" value=\"us-east-1\" /></div>" +
+      "</div>" +
+      "<div id=\"iamStep2\" class=\"hidden\">" +
+      "<div class=\"form-group\"><label>" + escapeHtml(t("builderid.userCode") || "User Code") + "</label>" +
+      "<div class=\"endpoint\"><span id=\"iamUserCode\" class=\"font-mono text-xl font-bold text-primary\"></span></div></div>" +
+      "<div class=\"form-group\"><label>" + escapeHtml(t("iam.loginUrl")) + "</label>" +
+      "<div class=\"endpoint\"><span id=\"iamAuthUrl\" class=\"font-mono text-xs\"></span></div>" +
+      "<div class=\"flex gap-2 mt-2\">" +
+      "<button class=\"btn btn-sm btn-outline flex-1\" id=\"iamOpenBtn\" type=\"button\">" + escapeHtml(t("builderid.open")) + "</button>" +
+      "<button class=\"btn btn-sm btn-outline flex-1\" id=\"iamCopyBtn\" type=\"button\">" + escapeHtml(t("common.copy")) + "</button>" +
+      "</div></div>" +
+      "<p class=\"text-sm mt-3 text-muted\" id=\"iamStatus\">" + escapeHtml(t("builderid.waiting") || "Waiting for browser approval...") + "</p>" +
+      "</div>" +
+      "<div class=\"modal-footer\">" +
+      "<button class=\"btn btn-secondary\" data-modal-goto=\"add\" type=\"button\">" + escapeHtml(t("common.back")) + "</button>" +
+      "<button class=\"btn btn-primary\" id=\"iamBtn\" type=\"button\">" + escapeHtml(t("builderid.startLogin")) + "</button>" +
+      "</div>";
+    $("iamBtn").addEventListener("click", startIamSso);
+  }
+
+  function pollIamSsoAuth(interval) {
+    iamPollTimer = setTimeout(async () => {
+      if (!iamSession) return;
+      try {
+        const res = await api("/auth/iam-sso/poll", { method: "POST", body: JSON.stringify({ sessionId: iamSession }) });
+        const raw = await res.json();
+        const d = raw.data || raw;
+        if (d.completed) {
+          if (iamPollTimer) { clearTimeout(iamPollTimer); iamPollTimer = null; }
+          iamSession = "";
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t("builderid.success") + ": " + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else if (d.status === "authorization_pending" || (d.success && !d.completed)) {
+          pollIamSsoAuth(d.interval || interval);
+        } else {
+          toastError(t("common.failed") + ": " + (d.error || ""));
+        }
+      } catch (_) {
+        pollIamSsoAuth(interval);
+      }
+    }, (interval || 3) * 1000);
   }
   function openMicrosoftModal(title, body) {
     resetMicrosoftFlow(true);
@@ -2405,12 +3054,18 @@
       '<p class="help-block">' + escapeHtml(t('modal.credentialsDesc')) + '</p>' +
       '<p class="help-block">' + escapeHtml(t('credentials.batchHint')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('credentials.label')) + '</label>' +
+      '<div class="input-row">' +
       '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
+      '<label class="btn btn-outline btn-sm">' + escapeHtml(t('local.upload')) +
+      '<input type="file" accept=".json,application/json" id="credJsonFile" class="file-input-hidden" />' +
+      '</label>' +
+      '</div>' +
       '</div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importCredBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
+    $('credJsonFile').addEventListener('change', e => loadLocalFile(e.target, 'credJson'));
     $('importCredBtn').addEventListener('click', importCredentials);
   }
   function modalCookie(title, body) {
@@ -2549,7 +3204,7 @@
       const kiroApiKey = String(item.kiroApiKey || '').trim();
       const isApiKey = Boolean(kiroApiKey) || methodKey === 'api_key' || methodKey === 'apikey' ||
         (!item.refreshToken && String(item.accessToken || '').trim().startsWith('ksk_'));
-      if (!isApiKey && !item.refreshToken) { fail++; continue; }
+      if (!isApiKey && !item.refreshToken && !item.accessToken) { fail++; continue; }
       if (isApiKey) {
         const payload = {
           id: item.id || '',
@@ -2599,7 +3254,14 @@
         region: item.region || (isExternalIdp ? '' : 'us-east-1'),
         tokenEndpoint: item.tokenEndpoint || '',
         issuerUrl: item.issuerUrl || '',
-        scopes: item.scopes || ''
+        scopes: item.scopes || '',
+        expiresAt: item.expiresAt || 0,
+        enabled: item.enabled !== false,
+        usageCurrent: item.usageCurrent || 0,
+        usageLimit: item.usageLimit || 0,
+        nextResetUnix: item.nextResetUnix || 0,
+        subscriptionType: item.subscriptionType || '',
+        subscriptionTitle: item.subscriptionTitle || ''
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2620,14 +3282,25 @@
     const credentials = source.credentials && typeof source.credentials === 'object'
       ? source.credentials
       : {};
+    const usage = source.usage && typeof source.usage === 'object' ? source.usage : {};
+    const subscription = source.subscription && typeof source.subscription === 'object' ? source.subscription : {};
     const value = key => Object.prototype.hasOwnProperty.call(credentials, key)
       ? credentials[key]
       : source[key];
+    const timestampSeconds = raw => {
+      if (typeof raw === 'string' && raw.trim() && !/^\d+(\.\d+)?$/.test(raw.trim())) {
+        const parsed = Date.parse(raw);
+        if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed / 1000);
+      }
+      const n = Number(raw || 0);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Math.floor(n > 1e12 ? n / 1000 : n);
+    };
     return {
-      id: value('id'),
-      email: value('email'),
-      userId: value('userId'),
-      nickname: value('nickname'),
+      id: source.id || value('id'),
+      email: source.email || value('email'),
+      userId: source.userId || value('userId'),
+      nickname: source.nickname || value('nickname'),
       profileArn: value('profileArn'),
       accessToken: value('accessToken'),
       refreshToken: value('refreshToken'),
@@ -2639,7 +3312,14 @@
       region: value('region'),
       tokenEndpoint: value('tokenEndpoint'),
       issuerUrl: value('issuerUrl'),
-      scopes: value('scopes')
+      scopes: value('scopes'),
+      expiresAt: timestampSeconds(value('expiresAt')),
+      enabled: source.enabled !== false && source.status !== 'disabled',
+      usageCurrent: Number(source.usageCurrent ?? usage.current ?? 0) || 0,
+      usageLimit: Number(source.usageLimit ?? usage.limit ?? 0) || 0,
+      nextResetUnix: timestampSeconds(source.nextResetUnix || usage.nextResetDate),
+      subscriptionType: source.subscriptionType || subscription.rawType || subscription.type || '',
+      subscriptionTitle: source.subscriptionTitle || subscription.title || ''
     };
   }
   function parseLineCredentials(text) {
@@ -2741,35 +3421,63 @@
   }
   async function startIamSso() {
     if (iamSession) {
-      const res = await api('/auth/iam-sso/complete', {
-        method: 'POST', body: JSON.stringify({
-          sessionId: iamSession, callbackUrl: $('iamCallback').value
-        })
-      });
-      const d = await res.json();
-      if (d.success) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
-        autoRefreshNewAccount(d.account?.id);
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
-    } else {
-      const res = await api('/auth/iam-sso/start', {
-        method: 'POST', body: JSON.stringify({
-          startUrl: $('iamStartUrl').value, region: $('iamRegion').value
-        })
-      });
-      const d = await res.json();
-      if (d.authorizeUrl) {
-        iamSession = d.sessionId;
-        $('iamAuthUrl').textContent = d.authorizeUrl;
-        $('iamStep2').classList.remove('hidden');
-        $('iamBtn').textContent = t('iam.complete');
-        $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
-        $('iamCopyBtn').addEventListener('click', async () => {
-          await copyText($('iamAuthUrl').textContent);
-          toast(t('common.copied'), 'primary');
+      try {
+        const res = await api("/auth/iam-sso/complete", {
+          method: "POST", body: JSON.stringify({ sessionId: iamSession })
         });
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
+        const raw = await res.json();
+        const d = raw.data || raw;
+        if (d.completed) {
+          if (iamPollTimer) { clearTimeout(iamPollTimer); iamPollTimer = null; }
+          iamSession = "";
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t("builderid.success") + ": " + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else {
+          toast(t("builderid.waiting") || "Waiting for browser approval...", "warning");
+        }
+      } catch (err) {
+        toastError(t("common.failed") + ": " + (err.message || ""));
+      }
+      return;
+    }
+
+    const rawUrl = ($("iamStartUrl")?.value || "").trim();
+    const urlMatch = rawUrl.match(/https?:\/\/[^\s"\x27]+/);
+    const startUrl = urlMatch ? urlMatch[0].replace(/\/+$/, "") : rawUrl.replace(/\/+$/, "");
+    const region = ($("iamRegion")?.value || "us-east-1").trim();
+
+    if (!startUrl) {
+      toastError(t("common.failed") + ": Start URL is required");
+      return;
+    }
+
+    try {
+      const res = await api("/auth/iam-sso/start", {
+        method: "POST", body: JSON.stringify({ startUrl, region })
+      });
+      const raw = await res.json();
+      const d = raw.data || raw;
+      const verifyUrl = d.verificationUri || d.authorizeUrl;
+      if (d.sessionId && verifyUrl) {
+        iamSession = d.sessionId;
+        if ($("iamUserCode")) $("iamUserCode").textContent = d.userCode || "";
+        $("iamAuthUrl").textContent = verifyUrl;
+        if ($("iamStep1")) $("iamStep1").classList.add("hidden");
+        $("iamStep2").classList.remove("hidden");
+        $("iamBtn").textContent = t("iam.complete") || "Check Login Status";
+        $("iamOpenBtn").addEventListener("click", () => window.open(verifyUrl, "_blank"));
+        $("iamCopyBtn").addEventListener("click", async () => {
+          await copyText(verifyUrl);
+          toast(t("common.copied"), "primary");
+        });
+        window.open(verifyUrl, "_blank");
+        pollIamSsoAuth(d.interval || 3);
+      } else {
+        toastError(t("common.failed") + ": " + (d.error || raw.error || ""));
+      }
+    } catch (e) {
+      toastError(t("common.failed") + ": " + (e.message || ""));
     }
   }
   function cancelMicrosoftServerSession(sessionId, selectionId) {
@@ -3177,6 +3885,8 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    if (tab === 'apiKeys') loadApiKeys().then(refreshApiKeyTrace);
+    if (tab === 'channels') loadChannelStatus();
   }
 
   // Event wiring
@@ -3216,6 +3926,20 @@
     $('loginThemeToggle').addEventListener('click', toggleTheme);
     $('mainThemeToggle').addEventListener('click', toggleTheme);
     $('logoutBtn').addEventListener('click', logout);
+
+    // Source switcher: 'kirogo' (local) vs 'kiropool' (remote kiro-pool-proxy KV)
+    const sourceSwitcher = $('sourceSwitcher');
+    if (sourceSwitcher) {
+      sourceSwitcher.value = activeSource;
+      sourceSwitcher.addEventListener('change', async () => {
+        activeSource = sourceSwitcher.value || 'kirogo';
+        localStorage.setItem('kiro_admin_source', activeSource);
+        toast('Switched data source: ' + (activeSource === 'kirogo' ? 'Kiro-Go' : 'KiroPool (proxy)'), 'primary');
+        await loadData();
+        if (!$('tabLogs').classList.contains('hidden')) loadLogs();
+        if (typeof loadApiKeys === 'function') loadApiKeys();
+      });
+    }
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
@@ -3306,6 +4030,7 @@
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    $('addProxyListBtn').addEventListener('click', addProxyList);
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
   }
@@ -3635,6 +4360,18 @@
     setInterval(() => {
       if (!$('mainPage').classList.contains('hidden')) loadStats();
     }, 10000);
+    // Real-time quota: keep whichever tab is on screen fresh on its own,
+    // independent of the opt-in "Auto-refresh" checkboxes, so credit/token
+    // numbers move without the user pressing F5. Skips while a modal with
+    // in-progress edits is open so a poll cannot clobber them.
+    setInterval(() => {
+      if ($('mainPage').classList.contains('hidden')) return;
+      const accountModalOpen = $('detailModal') && $('detailModal').classList.contains('active');
+      if (!$('tabAccounts').classList.contains('hidden') && !accountModalOpen) loadAccounts();
+      const apiKeyModalOpen = $('apiKeyModal') && $('apiKeyModal').classList.contains('active');
+      if (!$('tabApiKeys').classList.contains('hidden') && !apiKeyModalOpen) loadApiKeys();
+      if (!$('tabChannels').classList.contains('hidden')) loadChannelStatus();
+    }, 5000);
   }
 
   if (document.readyState === 'loading') {

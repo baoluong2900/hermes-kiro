@@ -1,5 +1,7 @@
 # Build artifacts
 /kiro-go
+/kiro-go-*
+kiro-go.bak*
 /kiro-go.exe
 *.exe
 *.test
@@ -7,7 +9,23 @@
 
 # Runtime data
 /data/
+
+# Cloudflare local state and development secrets
+.wrangler/
+**/.wrangler/
+.dev.vars*
+**/.dev.vars*
+.env*
+**/.env*
 *.log
+
+# Scratch test scripts and patches containing test keys
+test_keys*.py
+add_keys*.py
+test_*.py
+add_*.py
+start_*.sh
+*.patch
 
 # Editor / OS
 .idea/
@@ -22,3 +40,7 @@ Thumbs.db
 # Local backups / scratch
 backup*/
 PR-*.md
+
+# Hermes agent plan notes (not Kiro-Go source)
+.hermes/
+__pycache__/

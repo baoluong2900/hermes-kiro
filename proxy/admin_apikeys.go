@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"kiro-go/config"
 	"net/http"
+	"time"
 )
 
 // apiKeyView is the response payload for listing/inspecting API keys. The Key field
@@ -16,6 +17,9 @@ type apiKeyView struct {
 	Migrated      bool    `json:"migrated,omitempty"`
 	CreatedAt     int64   `json:"createdAt"`
 	LastUsedAt    int64   `json:"lastUsedAt,omitempty"`
+	ExpiresAt     int64   `json:"expiresAt,omitempty"`
+	ExpiryPreset  string  `json:"expiryPreset,omitempty"`
+	Expired       bool    `json:"expired"`
 	TokenLimit    int64   `json:"tokenLimit,omitempty"`
 	CreditLimit   float64 `json:"creditLimit,omitempty"`
 	TokensUsed    int64   `json:"tokensUsed"`
@@ -32,6 +36,9 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		Migrated:      e.Migrated,
 		CreatedAt:     e.CreatedAt,
 		LastUsedAt:    e.LastUsedAt,
+		ExpiresAt:     e.ExpiresAt,
+		ExpiryPreset:  e.ExpiryPreset,
+		Expired:       e.ExpiresAt > 0 && time.Now().Unix() >= e.ExpiresAt,
 		TokenLimit:    e.TokenLimit,
 		CreditLimit:   e.CreditLimit,
 		TokensUsed:    e.TokensUsed,
@@ -60,11 +67,13 @@ func (h *Handler) apiGetApiKey(w http.ResponseWriter, r *http.Request, id string
 }
 
 type apiKeyCreateRequest struct {
-	Name        string  `json:"name,omitempty"`
-	Key         string  `json:"key,omitempty"`
-	Enabled     *bool   `json:"enabled,omitempty"`
-	TokenLimit  int64   `json:"tokenLimit,omitempty"`
-	CreditLimit float64 `json:"creditLimit,omitempty"`
+	Name         string  `json:"name,omitempty"`
+	Key          string  `json:"key,omitempty"`
+	Enabled      *bool   `json:"enabled,omitempty"`
+	TokenLimit   int64   `json:"tokenLimit,omitempty"`
+	CreditLimit  float64 `json:"creditLimit,omitempty"`
+	ExpiresAt    int64   `json:"expiresAt,omitempty"`
+	ExpiryPreset string  `json:"expiryPreset,omitempty"`
 }
 
 func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
@@ -86,11 +95,13 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry, err := config.AddApiKey(config.ApiKeyEntry{
-		Name:        req.Name,
-		Key:         keyValue,
-		Enabled:     enabled,
-		TokenLimit:  req.TokenLimit,
-		CreditLimit: req.CreditLimit,
+		Name:         req.Name,
+		Key:          keyValue,
+		Enabled:      enabled,
+		TokenLimit:   req.TokenLimit,
+		CreditLimit:  req.CreditLimit,
+		ExpiresAt:    req.ExpiresAt,
+		ExpiryPreset: req.ExpiryPreset,
 	})
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -108,11 +119,13 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 }
 
 type apiKeyUpdateRequest struct {
-	Name        *string  `json:"name,omitempty"`
-	Key         *string  `json:"key,omitempty"`
-	Enabled     *bool    `json:"enabled,omitempty"`
-	TokenLimit  *int64   `json:"tokenLimit,omitempty"`
-	CreditLimit *float64 `json:"creditLimit,omitempty"`
+	Name         *string  `json:"name,omitempty"`
+	Key          *string  `json:"key,omitempty"`
+	Enabled      *bool    `json:"enabled,omitempty"`
+	TokenLimit   *int64   `json:"tokenLimit,omitempty"`
+	CreditLimit  *float64 `json:"creditLimit,omitempty"`
+	ExpiresAt    *int64   `json:"expiresAt,omitempty"`
+	ExpiryPreset *string  `json:"expiryPreset,omitempty"`
 }
 
 func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id string) {
@@ -145,6 +158,12 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	if req.CreditLimit != nil {
 		patch.CreditLimit = *req.CreditLimit
+	}
+	if req.ExpiresAt != nil {
+		patch.ExpiresAt = *req.ExpiresAt
+	}
+	if req.ExpiryPreset != nil {
+		patch.ExpiryPreset = *req.ExpiryPreset
 	}
 
 	if err := config.UpdateApiKey(id, patch); err != nil {
@@ -189,4 +208,22 @@ func (h *Handler) apiResetApiKeyUsage(w http.ResponseWriter, r *http.Request, id
 		"success": true,
 		"apiKey":  toApiKeyView(*updated),
 	})
+}
+
+func (h *Handler) apiExpireApiKey(w http.ResponseWriter, r *http.Request, id string) {
+	existing := config.GetApiKeyEntry(id)
+	if existing == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "API key not found"})
+		return
+	}
+	patch := *existing
+	patch.ExpiresAt = time.Now().Unix()
+	patch.ExpiryPreset = "manual"
+	if err := config.UpdateApiKey(id, patch); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }

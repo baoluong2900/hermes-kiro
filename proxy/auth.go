@@ -5,6 +5,7 @@ import (
 	"kiro-go/config"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // apiKeyContextKey is an unexported type used as the context key for the matched ApiKeyEntry
@@ -69,6 +70,9 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		}
 		if !entry.Enabled {
 			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key disabled")
+		}
+		if entry.ExpiresAt > 0 && time.Now().Unix() >= entry.ExpiresAt {
+			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key expired")
 		}
 		if overToken, overCredit := config.ApiKeyOverLimit(*entry); overToken || overCredit {
 			if overToken {

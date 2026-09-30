@@ -8,30 +8,89 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
 
-// modelAliases lists model names that need an explicit redirect — dated snapshots,
-// cross-family legacy IDs (claude-3-*), and non-Anthropic fallbacks.
-// Plain dash → dot version normalization is handled by claudeVersionPattern below,
-// so new versions (e.g. claude-opus-4-8) require no code changes.
+// modelAliases folds every name a client might send onto a model Kiro still
+// serves: retired generations, dated snapshots, cross-family legacy IDs
+// (claude-3-*) and non-Anthropic names. The live ids are listed first as
+// identity entries so a normalized spelling ("claude-sonnet-5.0") canonicalizes
+// instead of falling through as an unknown id.
+//
+// Kiro retired Claude 4.6 / 4.5 / 4 / 3.x. The table previously pointed at those
+// — worst of all mapping the live claude-sonnet-5 *down* to the retired
+// claude-sonnet-4.5 — so those requests earned a genuine INVALID_MODEL_ID.
+//
+// Entries are matched with strings.Contains and the first match wins, so a more
+// specific key must precede any key it contains ("claude-sonnet-4.6" before
+// "claude-sonnet-4", "gpt-4o" before "gpt-4").
 type modelMapping struct {
 	key   string
 	value string
 }
 
 var modelAliases = []modelMapping{
-	{"claude-sonnet-5", "claude-sonnet-4.5"},
+	// Live ids, canonicalized.
+	{"claude-opus-5.5", "claude-opus-5.5"},
+	{"claude-opus-5-5", "claude-opus-5.5"},
+	{"opus-5.5", "claude-opus-5.5"},
+	{"opus 5.5", "claude-opus-5.5"},
+	{"opus5.5", "claude-opus-5.5"},
+	{"opus-5-5", "claude-opus-5.5"},
+	{"claude-opus-5", "claude-opus-5"},
+	{"claude-3-5-opus", "claude-opus-5"},
+	{"claude-3.5-opus", "claude-opus-5"},
+	{"opus-5", "claude-opus-5"},
+	{"opus 5", "claude-opus-5"},
+	{"opus5", "claude-opus-5"},
+	{"claude-opus-4.8", "claude-opus-4.8"},
+	{"claude-opus-4.7", "claude-opus-4.7"},
+	{"claude-sonnet-5", "claude-sonnet-5"},
+
+	// Live generations that an earlier revision folded away by mistake.
+	//
+	// These ids are present in Kiro's own ListAvailableModels for the credentials
+	// on this deployment, so folding them meant a caller who picked (say)
+	// claude-sonnet-4.6 silently got Sonnet 5, and claude-haiku-4.5 — a different
+	// family with a different cost — returned Sonnet 5 as well. A live id must map
+	// to itself: never substitute a model the upstream still serves. What is live
+	// is decided by ListAvailableModels, not by this table.
+	//
+	// Order matters (first match wins, matched with strings.Contains): a longer
+	// id must precede any id it contains, so claude-sonnet-4.6 precedes
+	// claude-sonnet-4, and the dated snapshot precedes its bare generation.
+	{"claude-opus-4.6", "claude-opus-4.6"},
+	{"claude-opus-4.5", "claude-opus-4.5"},
+	{"claude-sonnet-4.6", "claude-sonnet-4.6"},
+	{"claude-sonnet-4.5", "claude-sonnet-4.5"},
 	{"claude-sonnet-4-20250514", "claude-sonnet-4"},
-	{"claude-3-5-sonnet", "claude-sonnet-4.5"},
-	{"claude-3-opus", "claude-opus-4.6"},
-	{"claude-3-sonnet", "claude-sonnet-4"},
-	{"claude-3-haiku", "claude-haiku-4.5"},
-	{"gpt-4-turbo", "claude-sonnet-4.5"},
-	{"gpt-4o", "claude-sonnet-4.5"},
-	{"gpt-4", "claude-sonnet-4.5"},
-	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
+	{"claude-sonnet-4", "claude-sonnet-4"},
+	{"claude-haiku-4.5", "claude-haiku-4.5"},
+
+	// Genuinely absent from the catalog (retired generations and ids Kiro never
+	// served). Nothing advertises these, so a shim here cannot surprise a client
+	// that selected from /v1/models; it only keeps legacy names working.
+	{"claude-3-opus", "claude-opus-4.7"},
+	{"claude-opus", "claude-opus-5"},
+	{"opus", "claude-opus-5"},
+
+	// Every retired Sonnet / Haiku generation resolves to Sonnet 5.
+	{"claude-sonnet-4-20250514", "claude-sonnet-5"},
+	{"claude-haiku", "claude-sonnet-5"},
+	{"claude-3-5-sonnet", "claude-sonnet-5"},
+	{"claude-3-7-sonnet", "claude-sonnet-5"},
+	{"claude-3-sonnet", "claude-sonnet-5"},
+	{"claude-3-5-haiku", "claude-sonnet-5"},
+	{"claude-3-haiku", "claude-sonnet-5"},
+
+	// Non-Anthropic names clients still send. The real gpt-5.6-* tiers are live
+	// Kiro ids and are deliberately absent so they pass through untouched.
+	{"gpt-4-turbo", "claude-sonnet-5"},
+	{"gpt-4o", "claude-sonnet-5"},
+	{"gpt-4", "claude-sonnet-5"},
+	{"gpt-3.5-turbo", "claude-sonnet-5"},
 }
 
 // claudeVersionPattern normalizes "claude-{family}-N-M" to "claude-{family}-N.M".
@@ -47,15 +106,46 @@ const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
-// maxPayloadBytes is the upper bound for the serialized Kiro request body.
+// maxPayloadBytes is the request-body budget for a 200K-token model.
 // Kiro's upstream rejects oversized requests with HTTP 400
 // "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
-// payload exceeds this size we drop the oldest history turns (keeping the
+// payload exceeds its budget we drop the oldest history turns (keeping the
 // system priming, the most recent turns, the active tool turn, and the current
 // message) and insert a placeholder note so the model knows context was elided.
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
+//
+// Larger context windows get a proportionally larger budget — see
+// payloadByteLimitForModel. Applying this 200K-sized budget to a 1M-token model
+// would silently discard roughly 80% of the context the model can accept.
 const maxPayloadBytes = 900 * 1024
+
+// baseContextWindowTokens is the context window that maxPayloadBytes was sized
+// for. The ratio between the two yields the bytes-per-token budget reused for
+// larger windows.
+const baseContextWindowTokens = 200_000
+
+// maxPayloadBytesCeiling caps the derived budget so a bogus upstream limit can
+// never let a single request grow without bound. A 1M-token window lands at
+// 4.5 MiB, comfortably below this ceiling.
+const maxPayloadBytesCeiling = 8 * 1024 * 1024
+
+// payloadByteLimitForModel returns the serialized-body budget for a model,
+// scaled from maxPayloadBytes by the model's context window. Models at or below
+// the 200K baseline keep the original budget; a 1M-token model gets 5x, so the
+// full window is usable instead of being truncated at the 200K-sized cap.
+func payloadByteLimitForModel(model string) int {
+	window := getContextWindowSize(model)
+	if window <= baseContextWindowTokens {
+		return maxPayloadBytes
+	}
+
+	scaled := int(float64(maxPayloadBytes) * (float64(window) / float64(baseContextWindowTokens)))
+	if scaled > maxPayloadBytesCeiling {
+		return maxPayloadBytesCeiling
+	}
+	return scaled
+}
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
@@ -79,22 +169,29 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		lower = strings.ToLower(model)
 	}
 
-	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
+	// 1) Normalize the version format first: claude-{family}-N-M → claude-{family}-N.M.
+	//    Running this ahead of the alias table is what lets one entry cover both the
+	//    dash and the dot spelling of a retired id. It also repairs dated Opus
+	//    snapshots: "claude-opus-4-5-20251101" used to normalize into the nonexistent
+	//    "claude-opus-4.5-20251101" and get forwarded verbatim, because the alias
+	//    lookup had already run against the dash form and missed.
+	//    New versions (claude-opus-4-9, ...) still flow through without code changes.
+	normalized := claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3")
+
+	// 2) Fold retired ids, dated snapshots and cross-family names onto a live model,
+	//    and canonicalize the live ids themselves.
 	for _, m := range modelAliases {
-		if strings.Contains(lower, m.key) {
+		if strings.Contains(normalized, m.key) {
 			return m.value, thinking
 		}
 	}
 
-	// 2) Format normalization: claude-{family}-N-M → claude-{family}-N.M.
-	//    New versions (claude-opus-4-8, etc.) flow through here without code changes.
-	if claudeVersionPattern.MatchString(lower) {
-		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3"), thinking
-	}
-
-	// 3) Already a valid Kiro model (dot form or bare family like claude-sonnet-4): pass through.
-	if strings.HasPrefix(lower, "claude-") {
-		return model, thinking
+	// 3) Unrecognized Claude id: hand back the normalized spelling so a version
+	//    released after this table was written still reaches upstream in the form it
+	//    expects. Everything else (auto, gpt-5.6-*, third-party names) is passed
+	//    through untouched.
+	if strings.HasPrefix(normalized, "claude-") {
+		return normalized, thinking
 	}
 
 	return model, thinking
@@ -867,18 +964,155 @@ func hasKiroWebSearchTool(tools []KiroToolWrapper) bool {
 	return false
 }
 
-// ensureObjectSchema 确保工具 schema 顶层是 object，并清理 Kiro 不接受的字段。
+// ensureObjectSchema 确保工具 schema 顶层是 object，扁平化顶层 oneOf/anyOf/allOf，并清理 Kiro 不接受的字段。
 func ensureObjectSchema(schema interface{}) interface{} {
 	m, ok := schema.(map[string]interface{})
 	if !ok {
 		return map[string]interface{}{"type": "object"}
 	}
 	cleaned := cloneSchemaMap(m)
+	delete(cleaned, "$schema")
+	flattenRootSchemaCombinators(cleaned)
 	cleanSchema(cleaned)
 	if _, hasType := cleaned["type"]; !hasType {
 		cleaned["type"] = "object"
 	}
 	return cleaned
+}
+
+// flattenRootSchemaCombinators flattens top-level oneOf/anyOf/allOf in a tool's input_schema
+// into a single object schema that Claude and upstream APIs accept without 400 invalid_request_error.
+func flattenRootSchemaCombinators(m map[string]interface{}) {
+	if m == nil {
+		return
+	}
+
+	if allOfRaw, ok := m["allOf"].([]interface{}); ok {
+		mergeCombinatorBranches(m, allOfRaw, true)
+		delete(m, "allOf")
+	}
+
+	if oneOfRaw, ok := m["oneOf"].([]interface{}); ok {
+		mergeCombinatorBranches(m, oneOfRaw, false)
+		delete(m, "oneOf")
+	}
+
+	if anyOfRaw, ok := m["anyOf"].([]interface{}); ok {
+		mergeCombinatorBranches(m, anyOfRaw, false)
+		delete(m, "anyOf")
+	}
+}
+
+func mergeCombinatorBranches(root map[string]interface{}, branches []interface{}, isAllOf bool) {
+	props, ok := root["properties"].(map[string]interface{})
+	if !ok || props == nil {
+		props = make(map[string]interface{})
+		root["properties"] = props
+	}
+
+	var rootDefs map[string]interface{}
+	if defs, ok := root["$defs"].(map[string]interface{}); ok {
+		rootDefs = defs
+	}
+
+	branchRequiredLists := make([][]string, 0, len(branches))
+
+	for _, branch := range branches {
+		bMap, ok := branch.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, defKey := range []string{"$defs", "definitions"} {
+			if defs, ok := bMap[defKey].(map[string]interface{}); ok {
+				if rootDefs == nil {
+					rootDefs = make(map[string]interface{})
+					root["$defs"] = rootDefs
+				}
+				for k, v := range defs {
+					if _, exists := rootDefs[k]; !exists {
+						rootDefs[k] = v
+					}
+				}
+			}
+		}
+
+		if bProps, ok := bMap["properties"].(map[string]interface{}); ok {
+			for k, v := range bProps {
+				if _, exists := props[k]; !exists {
+					props[k] = v
+				}
+			}
+		}
+
+		var bReqs []string
+		if reqRaw, ok := bMap["required"]; ok {
+			switch arr := reqRaw.(type) {
+			case []interface{}:
+				for _, item := range arr {
+					if s, ok := item.(string); ok && s != "" {
+						bReqs = append(bReqs, s)
+					}
+				}
+			case []string:
+				bReqs = append(bReqs, arr...)
+			}
+		}
+		branchRequiredLists = append(branchRequiredLists, bReqs)
+	}
+
+	if isAllOf {
+		existingReq := make(map[string]bool)
+		var mergedReq []string
+		if rootReq, ok := root["required"].([]interface{}); ok {
+			for _, item := range rootReq {
+				if s, ok := item.(string); ok && s != "" && !existingReq[s] {
+					existingReq[s] = true
+					mergedReq = append(mergedReq, s)
+				}
+			}
+		} else if rootReq, ok := root["required"].([]string); ok {
+			for _, s := range rootReq {
+				if s != "" && !existingReq[s] {
+					existingReq[s] = true
+					mergedReq = append(mergedReq, s)
+				}
+			}
+		}
+		for _, bReqs := range branchRequiredLists {
+			for _, s := range bReqs {
+				if !existingReq[s] {
+					existingReq[s] = true
+					mergedReq = append(mergedReq, s)
+				}
+			}
+		}
+		if len(mergedReq) > 0 {
+			root["required"] = mergedReq
+		}
+	} else if len(branchRequiredLists) > 0 {
+		counts := make(map[string]int)
+		for _, bReqs := range branchRequiredLists {
+			seen := make(map[string]bool)
+			for _, s := range bReqs {
+				if !seen[s] {
+					seen[s] = true
+					counts[s]++
+				}
+			}
+		}
+		var commonReq []string
+		for s, cnt := range counts {
+			if cnt == len(branchRequiredLists) {
+				commonReq = append(commonReq, s)
+			}
+		}
+		if len(commonReq) > 0 {
+			root["required"] = commonReq
+		} else {
+			delete(root, "required")
+		}
+	}
 }
 
 func cloneSchemaMap(m map[string]interface{}) map[string]interface{} {
@@ -1051,6 +1285,11 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	// ReasoningEffort is the OpenAI-style knob Hermes and other clients use to ask
+	// for extended reasoning. It used to be absent from this struct, so the value
+	// was discarded and a caller requesting "high" got a non-thinking run — which
+	// reads as the model being worse than the one that was selected.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1158,7 +1397,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	var nonSystemMessages []OpenAIMessage
 
 	for _, msg := range req.Messages {
-		if msg.Role == "system" {
+		if msg.Role == "system" || msg.Role == "developer" {
 			if s := extractOpenAIMessageText(msg.Content); s != "" {
 				systemPrompt += s + "\n"
 			}
@@ -1679,7 +1918,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 }
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
-// serialized payload fits within maxPayloadBytes. It preserves, in order:
+// serialized payload fits the budget for the payload's model
+// (payloadByteLimitForModel). It preserves, in order:
 //   - the system priming pair (if present) at the front of history,
 //   - the most recent turns (at least minRecentHistoryTurns, and always the
 //     active tool turn that pairs with the current message),
@@ -1692,7 +1932,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	limit := payloadByteLimitForModel(currentMessageModelID(payload))
+	if payloadByteSize(payload) <= limit {
 		return
 	}
 
@@ -1734,7 +1975,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	for i := len(conversation) - 1; i >= 0; i-- {
 		running += entrySizes[i]
 		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
+		if running > limit && kept > minRecentHistoryTurns {
 			break
 		}
 		keepFrom = i
@@ -1753,8 +1994,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
+	if payloadByteSize(payload) > limit {
+		truncateCurrentMessage(payload, limit)
 	}
 }
 
@@ -1792,21 +2033,81 @@ func currentMessageModelID(payload *KiroPayload) string {
 
 // truncateCurrentMessage hard-truncates the current message content as a last
 // resort when even the minimal retained history plus current message exceeds the
-// limit.
-func truncateCurrentMessage(payload *KiroPayload) {
+// given byte limit.
+func truncateCurrentMessage(payload *KiroPayload, limit int) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
+	// payloadByteSize measures the JSON-encoded payload, in which cur.Content is
+	// ESCAPED, but len(cur.Content) is its RAW length. Subtracting the raw length
+	// from an escaped size over-estimates the remaining budget by exactly the
+	// escaping overhead — a message full of quotes, backslashes or newlines can
+	// be off by 30-40%, so the "truncated" payload still exceeded the limit it
+	// was supposed to honour. Measure the encoded length instead.
+	encodedLen := len(mustMarshalJSONString(cur.Content))
+	overhead := payloadByteSize(payload) - encodedLen
+	budget := limit - overhead
 	if budget < 0 {
 		budget = 0
 	}
-	if len(cur.Content) > budget {
+	if encodedLen > budget {
 		if budget == 0 {
 			cur.Content = minimalFallbackUserContent
 			return
 		}
-		cur.Content = cur.Content[:budget]
+		cur.Content = truncateJSONStringToEncodedLength(cur.Content, budget)
 	}
+}
+
+// mustMarshalJSONString returns the JSON encoding of s, quotes included, or "" if
+// s cannot be encoded (it cannot: encoding/json always succeeds for a string).
+func mustMarshalJSONString(s string) string {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// truncateJSONStringToEncodedLength shortens s so its JSON encoding fits within
+// budget bytes, including the two quote characters.
+//
+// The previous implementation sliced the raw string at a byte offset
+// (`cur.Content[:budget]`). A Go string is UTF-8, and an arbitrary byte offset
+// lands in the middle of a multi-byte rune about three times in four for
+// Vietnamese, Chinese or emoji text. json.Valid reports the result as invalid
+// and encoding/json then silently rewrites the dangling byte to U+FFFD, so the
+// prompt the model actually received ended in a corrupted character — confirmed
+// at five separate offsets on a Vietnamese prompt. Trimming to a rune boundary
+// keeps the content intact.
+func truncateJSONStringToEncodedLength(s string, budget int) string {
+	// Reserve the surrounding quotes.
+	if budget <= 2 {
+		return ""
+	}
+	room := budget - 2
+	if room >= len(mustMarshalJSONString(s))-2 {
+		return s
+	}
+
+	// Walk back from the byte budget to the nearest rune boundary, then re-check
+	// the encoded length because escaping can inflate it well beyond len(s).
+	for end := room; end > 0; {
+		cut := s[:end]
+		if len(mustMarshalJSONString(cut))-2 <= room {
+			return cut
+		}
+		// Step back by whole runes; halving converges quickly on heavily escaped
+		// content while staying correct for plain ASCII.
+		next := end / 2
+		if next >= end {
+			next = end - 1
+		}
+		// Snap to a rune boundary so we never split a multi-byte character.
+		for next > 0 && !utf8.RuneStart(s[next]) {
+			next--
+		}
+		end = next
+	}
+	return ""
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

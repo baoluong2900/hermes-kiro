@@ -517,18 +517,21 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 		wantModel    string
 		wantThinking bool
 	}{
+		// Models are named from the live Kiro catalog. Retired ids would work too,
+		// but modelAliases folds them onto a live id, and that would make this
+		// table read as if thinking resolution rewrote the model.
 		{
 			name:         "adaptive request enables thinking",
-			model:        "claude-sonnet-4.6",
+			model:        "claude-sonnet-5",
 			thinking:     &ClaudeThinkingConfig{Type: "adaptive"},
-			wantModel:    "claude-sonnet-4.6",
+			wantModel:    "claude-sonnet-5",
 			wantThinking: true,
 		},
 		{
 			name:         "enabled request enables thinking",
-			model:        "claude-opus-4.5",
+			model:        "claude-opus-5",
 			thinking:     &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
-			wantModel:    "claude-opus-4.5",
+			wantModel:    "claude-opus-5",
 			wantThinking: true,
 		},
 		{
@@ -540,9 +543,9 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 		},
 		{
 			name:         "suffix remains supported when thinking is disabled",
-			model:        "claude-sonnet-4.5-thinking",
+			model:        "claude-opus-4.8-thinking",
 			thinking:     &ClaudeThinkingConfig{Type: "disabled"},
-			wantModel:    "claude-sonnet-4.5",
+			wantModel:    "claude-opus-4.8",
 			wantThinking: true,
 		},
 	}
@@ -781,5 +784,50 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+func TestFallbackAnthropicModelsParity(t *testing.T) {
+	thinkingSuffix := "-thinking"
+	models := fallbackAnthropicModels(thinkingSuffix)
+
+	// Mirrors the live Kiro catalog. Retired ids (Claude 4.6 / 4.5 / 4 /
+	// haiku-4.5) must not reappear here: advertising a model upstream rejects is
+	// what sent clients after a genuine INVALID_MODEL_ID.
+	expectedModelIDs := []string{
+		"auto",
+		"claude-opus-5.5",
+		"claude-opus-5.5-thinking",
+		"claude-opus",
+		"claude-opus-thinking",
+		"opus",
+		"opus-thinking",
+		"claude-opus-5",
+		"claude-opus-5-thinking",
+		"claude-opus-4.8",
+		"claude-opus-4.8-thinking",
+		"claude-opus-4.7",
+		"claude-opus-4.7-thinking",
+		"claude-sonnet-5",
+		"claude-sonnet-5-thinking",
+		"gpt-5.6-sol",
+		"gpt-5.6-terra",
+		"gpt-5.6-luna",
+	}
+
+	if len(models) != len(expectedModelIDs) {
+		t.Fatalf("expected %d models, got %d", len(expectedModelIDs), len(models))
+	}
+
+	gotIDs := make([]string, len(models))
+	for i, m := range models {
+		id, ok := m["id"].(string)
+		if !ok {
+			t.Fatalf("model %d missing string id: %#v", i, m)
+		}
+		gotIDs[i] = id
+		if id != expectedModelIDs[i] {
+			t.Errorf("model at index %d: got %q, want %q", i, id, expectedModelIDs[i])
+		}
 	}
 }

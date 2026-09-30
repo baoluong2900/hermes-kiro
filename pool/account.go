@@ -129,7 +129,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		return acc
+		return detachedAccount(acc)
 	}
 
 	// All otherwise-eligible accounts are cooling down. Returning the account
@@ -224,7 +224,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		return acc
+		return detachedAccount(acc)
 	}
 
 	// Every account that supports this model is currently cooling down. Respect
@@ -239,10 +239,58 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			return detachedAccount(&p.accounts[i])
 		}
 	}
 	return nil
+}
+
+// detachedAccount returns a pointer to a private copy of a pooled account.
+//
+// Every getter used to hand out &p.accounts[idx] — a pointer INTO the pool's own
+// slice — and release the RLock on return. Callers then read acc.AccessToken,
+// acc.ExpiresAt and acc.ProfileArn with no lock held for the whole request, while
+// UpdateCredentialState and UpdateProfileArn wrote those same fields under
+// p.mu.Lock(). Two different lock disciplines over one address: `go test -race`
+// reports it as a data race (write at pool/account.go UpdateCredentialState vs a
+// bare field read in the request path). Torn reads of an AccessToken are not
+// theoretical — a string header is two words.
+//
+// Returning a copy makes the snapshot immutable for the caller. Account holds
+// only scalars and strings (no slices, maps or pointers), so a shallow copy is a
+// complete one; config.GetAccounts and GetAllAccounts already rely on that.
+// The cost is one ~700-byte struct copy per request, against saving a lock held
+// across a multi-second upstream call.
+//
+// Callers that need to publish a resolved field back into the pool must go
+// through UpdateProfileArn / UpdateCredentialState, which take p.mu.Lock().
+func detachedAccount(acc *config.Account) *config.Account {
+	if acc == nil {
+		return nil
+	}
+	snapshot := *acc
+	return &snapshot
+}
+
+// UpdateProfileArn publishes a resolved Kiro profile ARN into every pooled entry
+// for the account.
+//
+// ResolveProfileArn used to write straight through the aliased pointer it was
+// handed (proxy/kiro_api.go), which both raced and served as the cross-request
+// cache that keeps the fast path at ResolveProfileArn from re-resolving over the
+// network. Detaching the getters removes that accidental cache, so the publish
+// has to be explicit and locked.
+func (p *AccountPool) UpdateProfileArn(id string, profileArn string) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(profileArn) == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ProfileArn = profileArn
+		}
+	}
 }
 
 // RecordSuccess 记录请求成功，清除冷却

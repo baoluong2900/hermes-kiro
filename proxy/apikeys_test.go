@@ -346,3 +346,62 @@ func TestAuthenticateRequiredWithoutKeysFailsClosed(t *testing.T) {
 		t.Fatalf("expected provided-key path to also fail closed when nothing is configured")
 	}
 }
+
+func TestAuthenticateRejectsExpiredKey(t *testing.T) {
+	mustInitConfig(t)
+	created, err := config.AddApiKey(config.ApiKeyEntry{
+		Name:      "expired",
+		Key:       "sk-expired",
+		Enabled:   true,
+		ExpiresAt: 1000, // expired in the past (1970)
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_ = created
+	requireAuth(t)
+
+	h := &Handler{}
+	r := newAuthTestRequest(t, "Authorization", "Bearer sk-expired")
+	entry, err := h.authenticate(r)
+	if err == nil {
+		t.Fatalf("expected expired key to be rejected, got entry=%v", entry)
+	}
+	ae, ok := err.(*authError)
+	if !ok || ae.status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 authError, got %v", err)
+	}
+	if !strings.Contains(ae.message, "expired") {
+		t.Fatalf("expected expired message, got %q", ae.message)
+	}
+}
+
+func TestApiExpireApiKey(t *testing.T) {
+	mustInitConfig(t)
+	created, err := config.AddApiKey(config.ApiKeyEntry{
+		Name:    "to-expire",
+		Key:     "sk-to-expire",
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/api-keys/"+created.ID+"/expire", nil)
+	req.Header.Set("X-Admin-Password", config.GetPassword())
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from expire endpoint, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	updated := config.GetApiKeyEntry(created.ID)
+	if updated == nil {
+		t.Fatalf("entry not found after expire")
+	}
+	if updated.ExpiresAt == 0 || updated.ExpiryPreset != "manual" {
+		t.Fatalf("expected ExpiresAt > 0 and ExpiryPreset=manual, got %+v", updated)
+	}
+}

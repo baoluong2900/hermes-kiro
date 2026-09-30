@@ -244,10 +244,10 @@ func TestResetApiKeyUsage(t *testing.T) {
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},
@@ -291,5 +291,38 @@ func TestGenerateApiKeyValueIsUnique(t *testing.T) {
 	}
 	if len(a) < 10 {
 		t.Fatalf("expected non-trivial key length, got %q", a)
+	}
+}
+
+func TestApiKeyExpiryFields(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	created, err := AddApiKey(ApiKeyEntry{
+		Name:         "expiring",
+		Key:          "sk-expiring",
+		Enabled:      true,
+		ExpiresAt:    1700000000,
+		ExpiryPreset: "8h",
+	})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if created.ExpiresAt != 1700000000 || created.ExpiryPreset != "8h" {
+		t.Fatalf("expected expiry fields preserved on create, got %+v", created)
+	}
+
+	if err := UpdateApiKey(created.ID, ApiKeyEntry{
+		ExpiresAt:    1800000000,
+		ExpiryPreset: "1d",
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got := GetApiKeyEntry(created.ID)
+	if got == nil || got.ExpiresAt != 1800000000 || got.ExpiryPreset != "1d" {
+		t.Fatalf("expected expiry fields updated, got %+v", got)
 	}
 }
