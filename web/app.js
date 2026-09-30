@@ -1808,7 +1808,9 @@
       rows.replaceChildren();
       const proxies = data.proxies || [];
       const active = proxies.filter(p => p.enabled).length;
-      status.textContent = t('settings.proxyCount', proxies.length, active);
+      status.textContent = t('settings.proxyCount', proxies.length, active)
+        + (active === 0 ? ' · ' + t('settings.proxyNoneActive') : '');
+      status.classList.toggle('proxy-status--warn', active === 0);
       if (!proxies.length) {
         rows.textContent = t('settings.proxyNone');
         return;

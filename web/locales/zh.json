@@ -137,6 +137,7 @@
   "settings.proxyAddHint": "国家：ID（印度尼西亚）、VN（越南）。ID 条目优先于 VN。",
   "settings.proxyAddBtn": "添加到代理池",
   "settings.proxyCount": "已保存 {0} · 启用 {1}",
+  "settings.proxyNoneActive": "无启用代理 — 账号直连",
   "settings.proxyUserTag": "用户 {0}",
   "settings.proxyDisabledTag": "已停用",
   "settings.proxyEnable": "启用",

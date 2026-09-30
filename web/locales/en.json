@@ -137,6 +137,7 @@
   "settings.proxyAddHint": "Countries: ID (Indonesia), VN (Vietnam). ID entries take precedence over VN.",
   "settings.proxyAddBtn": "Add to inventory",
   "settings.proxyCount": "{0} saved · {1} active",
+  "settings.proxyNoneActive": "no active proxy — accounts connect directly",
   "settings.proxyUserTag": "user {0}",
   "settings.proxyDisabledTag": "disabled",
   "settings.proxyEnable": "Enable",

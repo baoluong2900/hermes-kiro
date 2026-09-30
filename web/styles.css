@@ -791,9 +791,10 @@ label:has(> .switch) > span {
   gap: 0.4rem;
   min-width: 0;
   height: 2.25rem;
-  padding: 0 1.125rem;
+  padding: 0 0.6875rem;
   font-size: 0.875rem;
   font-weight: 500;
+  white-space: nowrap;
   color: var(--muted-foreground);
   background: transparent;
   border: 0;
@@ -808,12 +809,13 @@ label:has(> .switch) > span {
 }
 .tab:hover {
   color: var(--foreground);
-  background: transparent;
+  background: var(--muted);
 }
 .tab.active {
   color: var(--foreground);
-  background: transparent;
+  background: var(--secondary);
   border-color: transparent;
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 .tab:focus-visible {
   outline: 2px solid var(--foreground);
@@ -1051,13 +1053,15 @@ label:has(> .switch) > span {
   padding: 0 2rem;
   height: 4rem;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 1.5rem;
+  gap: 2rem;
 }
 .app-header-inner .topbar-actions {
   justify-self: end;
   margin-left: 0;
+  flex-wrap: nowrap;
+  white-space: nowrap;
 }
 .brand {
   display: inline-flex;
@@ -1070,6 +1074,8 @@ label:has(> .switch) > span {
   text-decoration: none;
   font-feature-settings: "cv11", "ss01";
   cursor: default;
+  white-space: nowrap;
+  flex: none;
 }
 .brand:hover {
   color: var(--foreground);
@@ -1120,6 +1126,9 @@ img.brand-icon {
   font: inherit;
   font-size: 0.6875rem;
   font-weight: 600;
+  min-width: 6.5rem;
+  max-width: 12rem;
+  flex: 0 1 auto;
   padding: 0.25rem 1.4rem 0.25rem 0.5rem;
   cursor: pointer;
   background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath fill='%23737373' d='M0 0l4 5 4-5z'/%3E%3C/svg%3E");
@@ -3763,4 +3772,97 @@ img.brand-icon {
   .stats-view-grid {
     grid-template-columns: repeat(2, 1fr);
   }
+}
+
+/* ===========================================================
+   Polish pass — hierarchy, rhythm, and control grouping.
+   Appended last so these rules win without reordering the
+   earlier, stable selectors.
+   =========================================================== */
+
+/* Active tab gets a real surface; hover is a soft step. */
+.tab.active {
+  font-weight: 600;
+}
+
+/* Three clear type steps: section heading > field label > hint. */
+.card-title {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.form-group label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--foreground);
+  letter-spacing: 0.005em;
+}
+.form-group small,
+.field-hint-offset {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--muted-foreground);
+}
+
+/* Helper text is a note, not a greyed-out input. */
+.help-block {
+  background: transparent;
+  border: 0;
+  border-left: 2px solid var(--border);
+  border-radius: 0;
+  padding: 0.125rem 0 0.125rem 0.75rem;
+  margin-bottom: 1rem;
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  color: var(--muted-foreground);
+}
+.help-block:last-of-type {
+  margin-bottom: 1.25rem;
+}
+
+/* One consistent internal rhythm per card. */
+.card-header {
+  padding-bottom: 0.875rem;
+  margin-bottom: 1rem;
+}
+
+/* Red means destructive/error only — the header logout is neutral. */
+#logoutBtn,
+#logoutBtn:hover {
+  background: var(--background);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+#logoutBtn:hover {
+  background: var(--muted);
+}
+
+/* Group the right-hand header controls and soften the divider. */
+.app-header .topbar-actions {
+  gap: 0.5rem;
+}
+.app-header .topbar-actions::before {
+  content: "";
+  width: 1px;
+  height: 1.25rem;
+  background: var(--border);
+  margin-right: 0.5rem;
+}
+.app-header .topbar-actions .divider {
+  margin: 0 0.5rem;
+  opacity: 0.7;
+}
+
+/* Proxy inventory status: make "nothing is routing" impossible to miss. */
+.proxy-status--warn {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* Numeric columns line up. */
+.stat-value,
+.stat-value-sm,
+table td,
+table th {
+  font-variant-numeric: tabular-nums;
 }

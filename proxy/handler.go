@@ -5656,7 +5656,9 @@ func (h *Handler) apiDeleteProxyEntry(w http.ResponseWriter, r *http.Request, id
 	json.NewEncoder(w).Encode(map[string]any{"success": true})
 }
 
-// proxyEntryView masks the credential before an entry leaves the process.
+// proxyEntryView masks the credential before an entry leaves the process. The
+// username is returned as a masked hint (first 2 chars) so an operator can tell
+// entries apart without a working credential ever being exposed in the API.
 func proxyEntryView(e config.ProxyEntry) map[string]any {
 	scheme := strings.ToLower(strings.TrimSpace(e.Scheme))
 	if scheme == "" {
@@ -5672,9 +5674,17 @@ func proxyEntryView(e config.ProxyEntry) map[string]any {
 		"hasAuth": e.Username != "",
 	}
 	if e.Username != "" {
-		view["username"] = e.Username
+		view["username"] = maskSecret(e.Username)
 	}
 	return view
+}
+
+// maskSecret keeps a short leading hint and hides the rest.
+func maskSecret(s string) string {
+	if len(s) <= 2 {
+		return "***"
+	}
+	return s[:2] + strings.Repeat("•", 6)
 }
 
 // normalizeProxyEntry validates and canonicalizes one inbound entry.
