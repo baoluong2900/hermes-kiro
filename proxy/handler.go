@@ -1846,7 +1846,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
-			h.handleAccountFailure(account, err)
+			h.handleAccountModelFailure(account, model, err)
 			if !messageStarted {
 				// The next attempt gets a fresh accounting scope, so anything this
 				// attempt already had metered upstream has to be booked now or it is
@@ -1855,7 +1855,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 				h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 				continue
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, err)
+			h.recordFailureWithDuration("claude", model, account.ID, err, time.Since(reqStart).Milliseconds())
 			// Upstream already metered whatever it streamed before dying, so the
 			// key owes for it. Without this the request left no usage trace at all.
 			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -1936,7 +1936,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
+	h.recordFailureWithDuration("claude", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 		return
 	}
@@ -2290,7 +2290,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
-			h.handleAccountFailure(account, err)
+			h.handleAccountModelFailure(account, model, err)
 			continue
 		}
 
@@ -2363,7 +2363,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
+	h.recordFailureWithDuration("claude", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 		return
 	}
@@ -2887,14 +2887,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
-			h.handleAccountFailure(account, err)
+			h.handleAccountModelFailure(account, model, err)
 			if !responseStarted {
 				// Same reason as the Claude stream: book what upstream already
 				// metered before the retry resets the accounting scope.
 				h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 				continue
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, err)
+			h.recordFailureWithDuration("openai", model, account.ID, err, time.Since(reqStart).Milliseconds())
 			// Partial output was already generated and metered upstream; attribute
 			// it instead of dropping the request from the key's usage entirely.
 			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -2989,7 +2989,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
+	h.recordFailureWithDuration("openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
@@ -3049,7 +3049,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
-			h.handleAccountFailure(account, err)
+			h.handleAccountModelFailure(account, model, err)
 			continue
 		}
 
@@ -3084,7 +3084,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
+	h.recordFailureWithDuration("openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
@@ -3285,6 +3285,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiSelectMicrosoftSSOProfile(w, r)
 	case path == "/auth/microsoft-sso/cancel" && r.Method == "POST":
 		h.apiCancelMicrosoftSSO(w, r)
+	case (path == "/auth/github/start" || path == "/auth/social/start") && r.Method == "POST":
+		h.apiStartGitHubLogin(w, r)
+	case (path == "/auth/github/poll" || path == "/auth/social/poll") && r.Method == "POST":
+		h.apiPollGitHubLogin(w, r)
+	case (path == "/auth/github/complete" || path == "/auth/social/complete") && r.Method == "POST":
+		h.apiCompleteGitHubLogin(w, r)
+	case (path == "/auth/github/cancel" || path == "/auth/social/cancel") && r.Method == "POST":
+		h.apiCancelGitHubLogin(w, r)
 	case path == "/auth/builderid/start" && r.Method == "POST":
 		h.apiStartBuilderIdLogin(w, r)
 	case path == "/auth/builderid/poll" && r.Method == "POST":
@@ -4389,6 +4397,172 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 			"email": account.Email,
 		},
 	})
+}
+
+func (h *Handler) apiStartGitHubLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "device"
+	}
+
+	session, authURL, err := auth.StartGitHubLogin(mode, config.GetProxyURL())
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":                 true,
+		"sessionId":               session.ID,
+		"mode":                    session.Mode,
+		"userCode":                session.UserCode,
+		"verificationUri":         session.VerificationURI,
+		"verificationUriComplete": session.VerificationURIComplete,
+		"authorizeUrl":            authURL,
+		"interval":                session.Interval,
+	})
+}
+
+func (h *Handler) apiPollGitHubLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Invalid JSON"})
+		return
+	}
+
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "sessionId is required"})
+		return
+	}
+
+	result, status, err := auth.PollGitHubLogin(sessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"completed": false,
+			"error":     err.Error(),
+		})
+		return
+	}
+
+	if status == "authorization_pending" || status == "pending" || status == "slow_down" {
+		interval := 5
+		if session := auth.GetGitHubSocialSession(sessionID); session != nil && session.Interval > 0 {
+			interval = session.Interval
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    status,
+			"interval":  interval,
+		})
+		return
+	}
+
+	if status == "success" && result != nil {
+		account := result.CreateAccount()
+		if err := config.AddAccount(*account); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": true,
+			"account": map[string]interface{}{
+				"id":         account.ID,
+				"email":      account.Email,
+				"authMethod": account.AuthMethod,
+				"provider":   account.Provider,
+			},
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": false,
+		"status":    status,
+	})
+}
+
+func (h *Handler) apiCompleteGitHubLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		CallbackURL string `json:"callbackUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Invalid JSON"})
+		return
+	}
+
+	sessionID := strings.TrimSpace(req.SessionID)
+	callbackURL := strings.TrimSpace(req.CallbackURL)
+	if sessionID == "" || callbackURL == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "sessionId and callbackUrl are required"})
+		return
+	}
+
+	result, err := auth.CompleteGitHubLogin(sessionID, callbackURL)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"completed": false,
+			"error":     err.Error(),
+		})
+		return
+	}
+
+	account := result.CreateAccount()
+	if err := config.AddAccount(*account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+			"provider":   account.Provider,
+		},
+	})
+}
+
+func (h *Handler) apiCancelGitHubLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID != "" {
+		auth.CancelGitHubLogin(sessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {

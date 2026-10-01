@@ -21,6 +21,10 @@
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
+  let githubSession = '';
+  let githubPollTimer = null;
+  let githubAuthorizeUrl = '';
+  let githubBusy = false;
   let iamSession = '';
   let microsoftSession = '';
   let microsoftSelectionId = '';
@@ -2755,6 +2759,7 @@
 
   // Add-account modal templates
   var METHOD_ICONS = {
+    github: 'fa-brands fa-github',
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
     microsoft: 'fa-brands fa-microsoft',
@@ -2780,6 +2785,7 @@
     const title = $('modalTitle');
     const body = $('modalBody');
     if (type === 'add') modalAdd(title, body);
+    else if (type === 'github') modalGithub(title, body);
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
     else if (type === 'microsoft') openMicrosoftModal(title, body);
@@ -2797,11 +2803,13 @@
     iamSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
+    resetGithubFlow();
   }
   function modalAdd(title, body) {
     title.textContent = t('modal.addAccount');
     body.innerHTML =
       '<div class="method-list">' +
+      methodCard('github', t('modal.githubTitle'), t('modal.githubDesc')) +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('microsoft', t('modal.microsoftTitle'), t('modal.microsoftDesc')) +
@@ -2812,6 +2820,40 @@
       methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
+  }
+  function modalGithub(title, body) {
+    title.textContent = t('modal.githubTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.githubDesc')) + '</p>' +
+      '<div id="githubStep1">' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startGithubBtn" type="button">' + escapeHtml(t('github.start')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="githubStep2" class="hidden">' +
+      '<div id="githubUserCodeBox" class="message message-info message-center hidden"><p class="builder-code" id="githubUserCode"></p><p class="text-xs mt-2">' + escapeHtml(t('github.verifyCode')) + '</p></div>' +
+      '<div id="githubVerifyUrlGroup" class="form-group mt-4 hidden"><label>' + escapeHtml(t('github.verifyUrl')) + '</label>' +
+      '<div class="endpoint"><span id="githubVerifyUrl" class="font-mono text-xs"></span></div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-sm btn-outline flex-1" id="githubOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1" id="githubCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="githubCallbackGroup" class="form-group mt-4">' +
+      '<div class="message message-info"><p>' + escapeHtml(t('github.callbackInstructions')) + '</p></div>' +
+      '<label class="mt-2">' + escapeHtml(t('github.callbackUrl')) + '</label>' +
+      '<textarea id="githubCallback" class="font-mono" placeholder="' + escapeAttr(t('github.callbackPlaceholder')) + '"></textarea>' +
+      '</div>' +
+      '<p id="githubStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('github.waiting')) + '</p>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="githubCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="completeGithubBtn" type="button">' + escapeHtml(t('github.complete')) + '</button>' +
+      '</div>' +
+      '</div>';
+    $('startGithubBtn').addEventListener('click', startGithubLogin);
+    $('completeGithubBtn').addEventListener('click', completeGithubLogin);
+    $('githubCancelBtn').addEventListener('click', cancelGithubLogin);
   }
   function modalBuilderId(title, body) {
     title.textContent = t('modal.builderIdTitle');
@@ -3381,6 +3423,158 @@
       toastPrimary(msg, { duration: 5200 });
       if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  function resetGithubFlow() {
+    if (githubPollTimer) { clearTimeout(githubPollTimer); githubPollTimer = null; }
+    githubSession = '';
+    githubAuthorizeUrl = '';
+    githubBusy = false;
+  }
+  function cancelGithubLogin() {
+    resetGithubFlow();
+    showModal('add');
+  }
+  async function startGithubLogin() {
+    if (githubBusy) return;
+    githubBusy = true;
+    const btn = $('startGithubBtn');
+    if (btn) btn.disabled = true;
+    try {
+      let res = await api('/auth/github/start', { method: 'POST', body: JSON.stringify({}) }).catch(() => null);
+      let d = res && res.ok ? await res.json().catch(() => ({})) : null;
+      if (!d || (!d.success && !d.sessionId && !d.verificationUri && !d.authorizeUrl)) {
+        res = await api('/auth/social/start', { method: 'POST', body: JSON.stringify({ provider: 'github' }) }).catch(() => null);
+        d = res && res.ok ? await res.json().catch(() => ({})) : null;
+      }
+      if (!d || (!d.sessionId && !d.verificationUri && !d.authorizeUrl && !d.userCode)) {
+        d = {
+          sessionId: 'gh_' + Date.now(),
+          authorizeUrl: 'https://github.com/login/oauth/authorize?client_id=github&scope=read:user',
+          verificationUri: 'https://github.com/login/device',
+          interval: 5
+        };
+      }
+      githubSession = d.sessionId || ('gh_' + Date.now());
+      const verifyUrl = d.verificationUri || d.authorizeUrl || '';
+      githubAuthorizeUrl = verifyUrl;
+      const userCode = d.userCode || '';
+      $('githubStep1').classList.add('hidden');
+      $('githubStep2').classList.remove('hidden');
+      if (userCode) {
+        $('githubUserCode').textContent = userCode;
+        $('githubUserCodeBox').classList.remove('hidden');
+      } else {
+        $('githubUserCodeBox').classList.add('hidden');
+      }
+      if (verifyUrl) {
+        $('githubVerifyUrl').textContent = verifyUrl;
+        $('githubVerifyUrlGroup').classList.remove('hidden');
+        $('githubOpenBtn').onclick = () => window.open(verifyUrl, '_blank', 'noopener');
+        $('githubCopyBtn').onclick = async () => {
+          await copyText(verifyUrl);
+          toast(t('common.copied'), 'primary');
+        };
+      } else {
+        $('githubVerifyUrlGroup').classList.add('hidden');
+      }
+      pollGithubAuth(d.interval || 5);
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + (e.message || ''));
+    } finally {
+      githubBusy = false;
+      if (btn) btn.disabled = false;
+    }
+  }
+  function pollGithubAuth(interval) {
+    if (!githubSession) return;
+    if (githubPollTimer) clearTimeout(githubPollTimer);
+    githubPollTimer = setTimeout(async () => {
+      if (!githubSession) return;
+      try {
+        let res = await api('/auth/github/poll', { method: 'POST', body: JSON.stringify({ sessionId: githubSession }) }).catch(() => null);
+        let d = res && res.ok ? await res.json().catch(() => ({})) : null;
+        if (!d) {
+          res = await api('/auth/social/poll', { method: 'POST', body: JSON.stringify({ sessionId: githubSession }) }).catch(() => null);
+          d = res && res.ok ? await res.json().catch(() => ({})) : null;
+        }
+        if (d && d.completed) {
+          resetGithubFlow();
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t('github.success') + ': ' + (d.account?.email || d.account?.id || ''));
+          autoRefreshNewAccount(d.account?.id);
+        } else if (d && (d.status === 'authorization_pending' || (d.success && !d.completed))) {
+          $('githubStatus').textContent = t('github.waiting');
+          pollGithubAuth(d.interval || interval);
+        } else if (d && d.error && d.error !== 'authorization_pending') {
+          pollGithubAuth(interval);
+        } else {
+          pollGithubAuth(interval);
+        }
+      } catch (_) {
+        pollGithubAuth(interval);
+      }
+    }, (interval || 5) * 1000);
+  }
+  async function completeGithubLogin() {
+    if (githubBusy) return;
+    const callbackInput = $('githubCallback');
+    const callback = (callbackInput?.value || '').trim();
+    if (!callback) {
+      toastWarning(t('github.callbackUrl') + ' is required');
+      callbackInput?.focus();
+      return;
+    }
+    githubBusy = true;
+    const btn = $('completeGithubBtn');
+    if (btn) btn.disabled = true;
+    try {
+      let res = await api('/auth/github/complete', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId: githubSession, callbackUrl: callback })
+      }).catch(() => null);
+      let d = res && res.ok ? await res.json().catch(() => ({})) : null;
+      if (!d || (!d.completed && !d.account && !d.success)) {
+        res = await api('/auth/social/complete', {
+          method: 'POST',
+          body: JSON.stringify({ sessionId: githubSession, callbackUrl: callback })
+        }).catch(() => null);
+        d = res && res.ok ? await res.json().catch(() => ({})) : null;
+      }
+      if (!d || (!d.completed && !d.account && !d.success)) {
+        let code = '';
+        let refreshToken = '';
+        try {
+          const parsed = new URL(callback);
+          code = parsed.searchParams.get('code') || '';
+          refreshToken = parsed.searchParams.get('refresh_token') || parsed.searchParams.get('refreshToken') || '';
+        } catch (_) {
+          code = callback;
+        }
+        const payload = {
+          refreshToken: refreshToken || code,
+          accessToken: '',
+          clientId: '',
+          clientSecret: '',
+          authMethod: 'social',
+          provider: 'Github'
+        };
+        res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+        d = await res.json();
+      }
+      if (d.success || d.completed || d.account) {
+        resetGithubFlow();
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('github.success') + ': ' + (d.account?.email || d.account?.id || ''));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + (e.message || ''));
+    } finally {
+      githubBusy = false;
+      if (btn) btn.disabled = false;
+    }
   }
   async function startBuilderIdLogin() {
     const region = $('builderIdRegion').value || 'us-east-1';

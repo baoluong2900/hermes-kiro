@@ -20,7 +20,8 @@ type AccountPool struct {
 	currentIndex  uint64
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	modelLists     map[string]map[string]bool      // accountID → set of modelIDs (from ListAvailableModels)
+	modelCooldowns map[string]map[string]time.Time // accountID → modelID → model-level cooldown
 }
 
 // NewTestPool constructs an isolated account pool for cross-package tests.
@@ -33,7 +34,8 @@ func NewTestPool(accounts ...config.Account) *AccountPool {
 		totalAccounts: len(isolated),
 		cooldowns:     make(map[string]time.Time),
 		errorCounts:   make(map[string]int),
-		modelLists:    make(map[string]map[string]bool),
+		modelLists:     make(map[string]map[string]bool),
+		modelCooldowns: make(map[string]map[string]time.Time),
 	}
 }
 
@@ -46,9 +48,10 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:      make(map[string]time.Time),
+			errorCounts:    make(map[string]int),
+			modelLists:     make(map[string]map[string]bool),
+			modelCooldowns: make(map[string]map[string]time.Time),
 		}
 		pool.Reload()
 	})
@@ -169,11 +172,56 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 // accountHasModel 检查账号是否支持指定模型。
 // 若该账号尚无模型列表（冷启动），视为支持所有模型。
 func (p *AccountPool) accountHasModel(accountID, model string) bool {
+	norm := strings.ToLower(strings.TrimSpace(model))
+	normBase := strings.TrimSuffix(strings.TrimSuffix(norm, "-thinking"), ":thinking")
+
+	if p.modelCooldowns != nil {
+		if cds, ok := p.modelCooldowns[accountID]; ok {
+			now := time.Now()
+			if cd, ok := cds[norm]; ok && now.Before(cd) {
+				return false
+			}
+			if cd, ok := cds[normBase]; ok && now.Before(cd) {
+				return false
+			}
+		}
+	}
+
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
 		return true // 冷启动：列表未就绪，乐观放行
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+	return list[norm] || list[normBase]
+}
+
+// RecordModelCooldown 针对单个账号的某个具体模型设置冷却。
+// 当上游账号对某个声明支持的模型返回 EmptyUpstreamResponse（空响应）时，
+// 临时冷却该账号的该模型，避免不断将该模型请求分发给失效账号，同时保留该账号处理其他正常模型的能力。
+func (p *AccountPool) RecordModelCooldown(accountID, model string, cooldown time.Duration) {
+	if accountID == "" || model == "" || cooldown <= 0 {
+		return
+	}
+	norm := strings.ToLower(strings.TrimSpace(model))
+	normBase := strings.TrimSuffix(strings.TrimSuffix(norm, "-thinking"), ":thinking")
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.modelCooldowns == nil {
+		p.modelCooldowns = make(map[string]map[string]time.Time)
+	}
+	cds, ok := p.modelCooldowns[accountID]
+	if !ok {
+		cds = make(map[string]time.Time)
+		p.modelCooldowns[accountID] = cds
+	}
+	until := time.Now().Add(cooldown)
+	if existing, ok := cds[norm]; !ok || until.After(existing) {
+		cds[norm] = until
+	}
+	if existing, ok := cds[normBase]; !ok || until.After(existing) {
+		cds[normBase] = until
+	}
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号。

@@ -519,7 +519,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		if account != nil {
 			accountID = account.ID
 		}
-		h.recordFailureWithDetails("claude", req.Model, accountID, err)
+		h.recordFailureWithDuration("claude", req.Model, accountID, err, time.Since(reqStart).Milliseconds())
 		// Prefer a real error over a silent empty body (issue #120 symptom).
 		status := 502
 		errType := "api_error"

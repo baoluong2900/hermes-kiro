@@ -178,7 +178,7 @@ pre,
   align-items: center;
   gap: 8px;
   padding: 10px 0;
-  border-bottom: 1px solid var(--border-color, #333);
+  border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
 }
 .proxy-inventory-row > span { flex: 1; min-width: 200px; overflow-wrap: anywhere; }
@@ -1368,21 +1368,28 @@ img.brand-icon {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
-  /* A long unbroken error string (JSON, URLs) otherwise sets the cell's
-     min-content width and forces the table — and the page — to grow. */
-  overflow-wrap: anywhere;
+  /* Keep structured values (status, model, duration, account) on a single
+     line. The .logs-list wrapper scrolls horizontally (overflow:auto on both
+     axes) if the table is wider than the panel, so cells no longer need to
+     break mid-token to avoid page-wide scroll. The error column opts back
+     into wrapping via .log-msg below. */
+  white-space: nowrap;
 }
 .logs-table tr:last-child td {
   border-bottom: none;
 }
 .logs-table .log-msg {
-  /* Wrap instead of nowrap+ellipsis, and do NOT change layout on hover: the old
-     nowrap→normal hover rule made the row jump as the pointer moved. */
-  display: inline;
-  max-width: 100%;
+  /* The one column that SHOULD wrap: long error strings (JSON, URLs). Bounded
+     by max-width so a single long error can't blow the column out, and
+     inline-block so wrapping happens inside its own box despite the nowrap td.
+     Do NOT change layout on hover: the old nowrap→normal hover rule made the
+     row jump as the pointer moved. */
+  display: inline-block;
+  max-width: 32rem;
   white-space: normal;
   overflow-wrap: anywhere;
   word-break: break-word;
+  vertical-align: top;
   color: var(--destructive);
 }
 .log-status {
@@ -1395,8 +1402,8 @@ img.brand-icon {
 }
 .log-status--success { background: #dcfce7; color: #166534; }
 .log-status--error { background: #fee2e2; color: #991b1b; }
-[data-theme="dark"] .log-status--success { background: #052e16; color: #86efac; }
-[data-theme="dark"] .log-status--error { background: #450a0a; color: #fca5a5; }
+.dark .log-status--success { background: #052e16; color: #86efac; }
+.dark .log-status--error { background: #450a0a; color: #fca5a5; }
 .err-badge {
   display: inline-block;
   padding: 0.125rem 0.375rem;
@@ -1411,11 +1418,11 @@ img.brand-icon {
 .err-badge--overage { background: #ffedd5; color: #9a3412; }
 .err-badge--profile { background: #e0e7ff; color: #3730a3; }
 .err-badge--unknown { background: var(--muted); color: var(--muted-foreground); }
-[data-theme="dark"] .err-badge--quota { background: #451a03; color: #fde68a; }
-[data-theme="dark"] .err-badge--auth { background: #450a0a; color: #fca5a5; }
-[data-theme="dark"] .err-badge--suspended { background: #450a0a; color: #fca5a5; }
-[data-theme="dark"] .err-badge--overage { background: #431407; color: #fdba74; }
-[data-theme="dark"] .err-badge--profile { background: #1e1b4b; color: #a5b4fc; }
+.dark .err-badge--quota { background: #451a03; color: #fde68a; }
+.dark .err-badge--auth { background: #450a0a; color: #fca5a5; }
+.dark .err-badge--suspended { background: #450a0a; color: #fca5a5; }
+.dark .err-badge--overage { background: #431407; color: #fdba74; }
+.dark .err-badge--profile { background: #1e1b4b; color: #a5b4fc; }
 
 /* Login screen */
 .login-wrapper {
@@ -3365,6 +3372,28 @@ img.brand-icon {
   .container {
     padding-left: 1rem;
     padding-right: 1rem;
+  }
+  /* Long button labels (e.g. the Vietnamese preset button) otherwise keep
+     their single-line min-content width via .btn's white-space:nowrap and
+     overflow the viewport, forcing page-wide horizontal scroll. On narrow
+     screens let them wrap and never exceed their container. */
+  .btn {
+    white-space: normal;
+    max-width: 100%;
+    height: auto;
+    min-height: 2.25rem;
+    padding-top: 0.4rem;
+    padding-bottom: 0.4rem;
+    text-align: center;
+  }
+  /* Two <select>s carry inline min-width (16rem / 9rem via w-64!/w-40!) that the
+     .btn mobile rule above doesn't reach, so they keep their desktop width inside
+     flex-wrap / grid cells and force page-wide horizontal scroll on phones. Let
+     them shrink to their container on narrow screens. */
+  #apiKeyTraceSelect,
+  #channelsWindowSelect {
+    width: 100%;
+    min-width: 0;
   }
   .app-header {
     background: var(--background);

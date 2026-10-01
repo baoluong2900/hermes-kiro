@@ -180,7 +180,7 @@ func (h *Handler) handleResponsesNonStream(
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
-			h.handleAccountFailure(account, err)
+			h.handleAccountModelFailure(account, model, err)
 			continue
 		}
 
@@ -220,7 +220,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, lastAccountID, lastErr)
+	h.recordFailureWithDuration("responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
@@ -517,11 +517,11 @@ func (h *Handler) handleResponsesStream(
 				lastErr = err
 				excluded[account.ID] = true
 				lastAccountID = account.ID
-				h.handleAccountFailure(account, err)
+				h.handleAccountModelFailure(account, model, err)
 				continue
 			}
 			sendFailure(err.Error())
-			h.recordFailureWithDetails("responses", model, account.ID, err)
+			h.recordFailureWithDuration("responses", model, account.ID, err, time.Since(reqStart).Milliseconds())
 			// Partial output was already generated and metered upstream; attribute
 			// it instead of dropping the request from the key's usage entirely.
 			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -597,6 +597,6 @@ func (h *Handler) handleResponsesStream(
 		sendFailure("No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, lastAccountID, lastErr)
+	h.recordFailureWithDuration("responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	sendFailure(lastErr.Error())
 }

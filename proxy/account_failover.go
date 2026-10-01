@@ -177,6 +177,10 @@ func (h *Handler) disableAccountOverage(account *config.Account) {
 }
 
 func (h *Handler) handleAccountFailure(account *config.Account, err error) {
+	h.handleAccountModelFailure(account, "", err)
+}
+
+func (h *Handler) handleAccountModelFailure(account *config.Account, model string, err error) {
 	if account == nil || err == nil {
 		return
 	}
@@ -200,6 +204,10 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 			// cooldown to prevent account pool starvation.
 			if ue.ExceptionType == "EmptyUpstreamResponse" {
 				logger.Warnf("[AccountFailover] Soft failure (%s) on %s, not incrementing account error count", ue.ExceptionType, account.Email)
+				if model != "" {
+					h.pool.RecordModelCooldown(account.ID, model, defaultQuotaCooldown)
+					logger.Warnf("[AccountFailover] Model %s cooled down on %s for %v due to empty upstream response", model, account.Email, defaultQuotaCooldown)
+				}
 				return
 			}
 			h.pool.RecordError(account.ID, false)
