@@ -32,6 +32,7 @@ const VALID_KIRO_MODELS = new Set([
   "claude-opus-5",
   "claude-opus-4.8",
   "claude-opus-4.7",
+  "claude-sonnet-5.5",
   "claude-sonnet-5",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
@@ -50,6 +51,8 @@ const FALLBACK_MODELS = [
   "claude-opus-4.8-thinking",
   "claude-opus-4.7",
   "claude-opus-4.7-thinking",
+  "claude-sonnet-5.5",
+  "claude-sonnet-5.5-thinking",
   "claude-sonnet-5",
   "claude-sonnet-5-thinking",
   "gpt-5.6-sol",
@@ -98,6 +101,8 @@ const MODEL_ALIASES = new Map([
   ["opus 5.5", "claude-opus-5.5"],
   ["opus5.5", "claude-opus-5.5"],
   ["opus-5-5", "claude-opus-5.5"],
+  ["claude-sonnet-5.5", "claude-sonnet-5.5"],
+  ["claude-sonnet-5-5", "claude-sonnet-5.5"],
   ["claude-opus-5", "claude-opus-5"],
   ["claude-3-5-opus", "claude-opus-5"],
   ["claude-3.5-opus", "claude-opus-5"],
@@ -3422,6 +3427,7 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
       apiKey: "",
       requireApiKey: settings.requireApiKey !== false,
       allowOverUsage: Boolean(settings.allowOverUsage),
+      accountRoutingMode: settings.accountRoutingMode || settings.strategy || "sequential",
       port: 5000,
       host: "0.0.0.0",
       strategy: settings.strategy || "smart",
@@ -3440,6 +3446,11 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
       if (body.strategy) settings.strategy = body.strategy;
       if (typeof body.requireApiKey === "boolean") settings.requireApiKey = body.requireApiKey;
       if (typeof body.allowOverUsage === "boolean") settings.allowOverUsage = body.allowOverUsage;
+      if (body.accountRoutingMode) {
+        const mode = (body.accountRoutingMode === "round_robin") ? "round_robin" : "sequential";
+        settings.accountRoutingMode = mode;
+        settings.strategy = mode;
+      }
       if (body.endpointMode) settings.endpointMode = body.endpointMode;
       if (typeof body.sendTelemetry === "boolean") settings.sendTelemetry = body.sendTelemetry;
       settings.updatedAt = Math.floor(Date.now() / 1000);
@@ -3492,6 +3503,31 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
       if (body.mode) settings.endpointMode = body.mode;
       await setKV(env, "config:settings", settings);
       return jsonResponse({ success: true, ok: true }, 200, cors);
+    } catch (e) {
+      return jsonResponse({ ok: false, success: false, error: e.message }, 400, cors);
+    }
+  }
+
+  if (path === "/routing/mode" && method === "GET") {
+    const settings = await getSettings(env);
+    return jsonResponse({
+      mode: settings.accountRoutingMode || settings.strategy || "sequential",
+    }, 200, cors);
+  }
+  if (path === "/routing/mode" && method === "POST") {
+    try {
+      const body = await request.json();
+      const settings = await getSettings(env);
+      const mode = (body.mode === "round_robin") ? "round_robin" : "sequential";
+      settings.accountRoutingMode = mode;
+      settings.strategy = mode;
+      settings.updatedAt = Math.floor(Date.now() / 1000);
+      await setKV(env, "config:settings", settings);
+      return jsonResponse({
+        success: true,
+        ok: true,
+        mode,
+      }, 200, cors);
     } catch (e) {
       return jsonResponse({ ok: false, success: false, error: e.message }, 400, cors);
     }
@@ -4933,6 +4969,7 @@ function mapKiroModel(rawModel) {
   if (MODEL_ALIASES.has(lm)) return MODEL_ALIASES.get(lm);
 
   if (lm.includes("opus-5.5") || lm.includes("opus 5.5") || lm.includes("opus5.5") || lm.includes("opus-5-5")) return "claude-opus-5.5";
+  if (lm.includes("sonnet-5.5") || lm.includes("sonnet-5-5")) return "claude-sonnet-5.5";
   if (lm.includes("opus-5") || lm.includes("opus 5") || lm.includes("opus5")) return "claude-opus-5";
   if (lm.includes("opus-4.8") || lm.includes("opus-4-8")) return "claude-opus-4.8";
   if (lm.includes("opus-4.7") || lm.includes("opus-4-7")) return "claude-opus-4.7";
@@ -4989,8 +5026,8 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
   // here so every retry/fallback attempt and the single final settle share it.
   const requestId = crypto.randomUUID();
 
-  const accounts = await getAccounts(env);
-  const candidates = pickCandidates(accounts, env);
+  const [accounts, settings] = await Promise.all([getAccounts(env), getSettings(env)]);
+  const candidates = pickCandidates(accounts, env, settings);
   if (candidates.length === 0) {
     // See handleClaudeMessages: free, but it still has to be visible.
     await finishFailedRequest(env, ctx, {
@@ -5592,8 +5629,8 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
   // here so every retry/fallback attempt and the single final settle share it.
   const requestId = crypto.randomUUID();
 
-  const accounts = await getAccounts(env);
-  const candidates = pickCandidates(accounts, env);
+  const [accounts, settings] = await Promise.all([getAccounts(env), getSettings(env)]);
+  const candidates = pickCandidates(accounts, env, settings);
   if (candidates.length === 0) {
     // Nothing was metered, so this costs nothing — but it is still a request the
     // client saw fail, and a failure that leaves no row is a failure nobody can
@@ -6005,8 +6042,8 @@ async function handleDirectKiroProxy(request, env, ctx, cors, apiKeyId) {
     return jsonResponse({ error: "Failed to read request body" }, 400, cors);
   }
 
-  const accounts = await getAccounts(env);
-  const candidates = pickCandidates(accounts, env);
+  const [accounts, settings] = await Promise.all([getAccounts(env), getSettings(env)]);
+  const candidates = pickCandidates(accounts, env, settings);
   if (candidates.length === 0) {
     return jsonResponse({ error: "No available accounts in pool" }, 503, cors);
   }
@@ -6560,9 +6597,22 @@ function sanitizeToolName(name) {
   return out === "" ? "tool" : out;
 }
 
-function pickCandidates(accounts, env) {
+let _edgeRoundRobinIndex = 0;
+
+function pickCandidates(accounts, env, settings = null) {
   const enabled = accounts.filter((a) => a.enabled !== false && (a.accessToken || a.kiroApiKey));
   if (enabled.length === 0) return [];
+
+  const mode = (settings && (settings.accountRoutingMode || settings.strategy)) || "sequential";
+  if (mode === "round_robin") {
+    const n = enabled.length;
+    const start = (_edgeRoundRobinIndex++) % n;
+    const sorted = [];
+    for (let i = 0; i < n; i++) {
+      sorted.push(enabled[(start + i) % n]);
+    }
+    return sorted;
+  }
 
   // Sort by smart quota strategy (highest remaining quota first)
   return enabled.sort((a, b) => {
@@ -8583,7 +8633,7 @@ claude</pre>
           </div>
           <pre id="snippet-cursor" class="bg-[var(--code-bg)] border border-[var(--border)] rounded-lg p-3 text-xs text-[var(--text-primary)] mono overflow-x-auto select-all">Base URL: ${origin}/v1
 API Key:  ${rawKey || 'kpp_...'}
-Models:   claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-sonnet-5</pre>
+Models:   claude-opus-5.5, claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-sonnet-5.5, claude-sonnet-5</pre>
         </div>
 
         <div id="tab-hermes" class="tab-pane space-y-2">
@@ -9279,7 +9329,7 @@ print(response.choices[0].message.content)</pre>
         cursor.textContent = [
           'Base URL: ' + serverOrigin + '/v1',
           'API Key:  ' + k,
-          'Models:   ' + (isThinkingModeActive ? 'claude-opus-5-thinking, claude-opus-4.8-thinking, claude-opus-4.7-thinking, claude-sonnet-5-thinking' : 'claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-sonnet-5')
+          'Models:   ' + (isThinkingModeActive ? 'claude-opus-5.5-thinking, claude-opus-5-thinking, claude-opus-4.8-thinking, claude-opus-4.7-thinking, claude-sonnet-5.5-thinking, claude-sonnet-5-thinking' : 'claude-opus-5.5, claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-sonnet-5.5, claude-sonnet-5')
         ].join(nl);
       }
 

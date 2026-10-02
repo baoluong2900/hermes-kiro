@@ -575,6 +575,8 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("claude-opus-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.8", "anthropic", true),
 		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-5.5", "anthropic", true),
+		buildModelInfo("claude-sonnet-5.5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-5", "anthropic", true),
 		buildModelInfo("claude-sonnet-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("auto", "anthropic", true),
@@ -2137,11 +2139,6 @@ func (h *Handler) recordPartialUsageForApiKey(apiKeyID string, inputTokens, outp
 	}
 }
 
-// recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
-	h.recordFailureWithDuration(endpoint, model, accountID, err, 0)
-}
-
 func (h *Handler) recordFailureWithDuration(endpoint, model, accountID string, err error, durationMs int64) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
@@ -3307,6 +3304,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetSettings(w, r)
 	case path == "/settings" && r.Method == "POST":
 		h.apiUpdateSettings(w, r)
+	case path == "/routing/mode" && r.Method == "GET":
+		h.apiGetRoutingMode(w, r)
+	case path == "/routing/mode" && r.Method == "POST":
+		h.apiUpdateRoutingMode(w, r)
 	case path == "/stats" && r.Method == "GET":
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
@@ -4984,27 +4985,68 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
+	var totalQuotaLimit, totalQuotaUsed float64
+	allAccs := config.GetAccounts()
+	for _, a := range allAccs {
+		totalQuotaLimit += a.UsageLimit
+		totalQuotaUsed += a.UsageCurrent
+	}
+	remainingQuota := totalQuotaLimit - totalQuotaUsed
+	if remainingQuota < 0 {
+		remainingQuota = 0
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":         config.Version,
-		"accounts":        h.pool.Count(),
+		"accounts":        len(allAccs),
 		"available":       h.pool.AvailableCount(),
 		"totalRequests":   h.totalRequests,
 		"successRequests": h.successRequests,
 		"failedRequests":  h.failedRequests,
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
+		"totalQuotaLimit": totalQuotaLimit,
+		"totalQuotaUsed":  totalQuotaUsed,
+		"remainingQuota":  remainingQuota,
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
-		"externalApi":    config.GetExternalAPIConfig(),
+		"apiKey":             config.GetApiKey(),
+		"requireApiKey":      config.IsApiKeyRequired(),
+		"port":               config.GetPort(),
+		"host":               config.GetHost(),
+		"allowOverUsage":     config.GetAllowOverUsage(),
+		"accountRoutingMode": config.GetAccountRoutingMode(),
+		"externalApi":        config.GetExternalAPIConfig(),
+	})
+}
+
+func (h *Handler) apiGetRoutingMode(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"mode": config.GetAccountRoutingMode(),
+	})
+}
+
+func (h *Handler) apiUpdateRoutingMode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if err := config.UpdateAccountRoutingMode(req.Mode); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"mode":    config.GetAccountRoutingMode(),
 	})
 }
 
@@ -5072,10 +5114,11 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey             *string `json:"apiKey,omitempty"`
+		RequireApiKey      *bool   `json:"requireApiKey,omitempty"`
+		Password           string  `json:"password,omitempty"`
+		AllowOverUsage     *bool   `json:"allowOverUsage,omitempty"`
+		AccountRoutingMode *string `json:"accountRoutingMode,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5097,6 +5140,16 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
+		h.pool.Reload()
+	}
+
+	// 更新账号路由模式
+	if req.AccountRoutingMode != nil {
+		if err := config.UpdateAccountRoutingMode(*req.AccountRoutingMode); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 		h.pool.Reload()
 	}
 
@@ -5331,8 +5384,14 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	if err := h.ensureValidToken(account); err != nil {
+		_ = config.SetAccountEnabled(id, false)
+		h.pool.RecordError(account.ID, false)
+		h.pool.Reload()
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":    "Token refresh failed: " + err.Error(),
+			"disabled": true,
+		})
 		return
 	}
 
@@ -5342,7 +5401,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.Model == "" {
-		req.Model = "claude-sonnet-4"
+		req.Model = "claude-sonnet-5.5"
 	}
 
 	// Build a minimal chat payload
@@ -5369,10 +5428,23 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	err := CallKiroAPI(account, kiroPayload, callback)
 	if err != nil {
+		// Ping/test error -> automatically disable account
+		_ = config.SetAccountEnabled(id, false)
+		h.pool.RecordError(account.ID, false)
+		h.pool.Reload()
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":    err.Error(),
+			"disabled": true,
+		})
 		return
 	}
+
+	// Ping/test succeeded -> ensure account is active and clear prior error/ban
+	_ = config.ClearAccountBanStatus(id)
+	_ = config.SetAccountEnabled(id, true)
+	h.pool.RecordSuccess(account.ID)
+	h.pool.Reload()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,

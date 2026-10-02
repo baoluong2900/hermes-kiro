@@ -47,7 +47,16 @@ var modelAliases = []modelMapping{
 	{"opus5", "claude-opus-5"},
 	{"claude-opus-4.8", "claude-opus-4.8"},
 	{"claude-opus-4.7", "claude-opus-4.7"},
+	{"claude-sonnet-5.5", "claude-sonnet-5.5"},
+	{"claude-sonnet-5-5", "claude-sonnet-5.5"},
+	{"sonnet-5.5", "claude-sonnet-5.5"},
+	{"sonnet 5.5", "claude-sonnet-5.5"},
+	{"sonnet5.5", "claude-sonnet-5.5"},
+	{"sonnet-5-5", "claude-sonnet-5.5"},
 	{"claude-sonnet-5", "claude-sonnet-5"},
+	{"sonnet-5", "claude-sonnet-5"},
+	{"sonnet 5", "claude-sonnet-5"},
+	{"sonnet5", "claude-sonnet-5"},
 
 	// Live generations that an earlier revision folded away by mistake.
 	//
@@ -101,6 +110,27 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
+
+// thinkingModePromptForEffort maps an OpenAI-style reasoning_effort level to the
+// declared max_thinking_length. Kiro's only upstream lever is this integer inside
+// the thinking prompt (there is no structured budget field on the OpenAI path), so
+// effort is expressed by scaling it. Empty/unknown/"high" keep the default 200000,
+// so the model-name "-thinking" suffix path and existing tests are unchanged.
+func thinkingModePromptForEffort(effort string) string {
+	budget := 200000
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		budget = 16000
+	case "medium":
+		budget = 48000
+	case "high", "xhigh", "":
+		budget = 200000
+	}
+	if budget == 200000 {
+		return ThinkingModePrompt
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
+}
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
@@ -161,12 +191,16 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	lower := strings.ToLower(model)
 	thinking := false
 
-	// Strip the configured thinking suffix (e.g. "-thinking") if present.
+	// Strip the configured thinking suffix (e.g. "-thinking") or common variants if present.
 	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
-		thinking = true
-		model = model[:len(model)-len(thinkingSuffix)]
-		lower = strings.ToLower(model)
+	suffixes := []string{suffixLower, "-thinking", " thinking", ":thinking", "_thinking"}
+	for _, s := range suffixes {
+		if s != "" && strings.HasSuffix(lower, s) {
+			thinking = true
+			model = strings.TrimSpace(model[:len(model)-len(s)])
+			lower = strings.ToLower(model)
+			break
+		}
 	}
 
 	// 1) Normalize the version format first: claude-{family}-N-M → claude-{family}-N.M.
@@ -1406,9 +1440,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// 如果启用 thinking 模式，注入 thinking 提示
+	// 如果启用 thinking 模式，注入 thinking 提示。
+	// reasoning_effort (OpenAI-style) scales the declared thinking budget;
+	// empty/high keep the default so the "-thinking" suffix path is unchanged.
 	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		systemPrompt = thinkingModePromptForEffort(req.ReasoningEffort) + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息

@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kiro-Go</title>
+  <title>Hermes-Kiro</title>
   <link rel="icon" type="image/png" href="/admin/icon.png?v=20260724" />
   <script src="/admin/vendor/tailwindcss-browser/index.global.js"></script>
   <link rel="stylesheet" href="/admin/vendor/fontawesome/css/all.min.css" />
@@ -41,14 +41,15 @@
     </div>
     <header class="login-topbar">
       <div class="login-topbar-inner">
-        <div class="brand" aria-label="Kiro-Go" data-i18n-aria-label="app.title">
+        <div class="brand" aria-label="Hermes-Kiro" data-i18n-aria-label="app.title">
           <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
-          <span class="brand-text">Kiro-Go</span>
+          <span class="brand-text" data-i18n="app.title">Hermes-Kiro</span>
         </div>
         <div class="topbar-actions">
           <div class="lang-switch" id="loginLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
             <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
             <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
+            <button class="lang-btn" data-lang="vi" type="button" data-i18n="lang.vi"></button>
           </div>
           <span class="divider" aria-hidden="true"></span>
           <button id="loginThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
@@ -94,14 +95,11 @@
     <header class="app-header">
       <div class="app-header-inner">
         <div class="brand-wrap">
-          <div class="brand">
+          <div class="brand" aria-label="Hermes-Kiro" data-i18n-aria-label="app.title">
             <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
-            <span class="brand-text">Kiro-Go</span>
+            <span class="brand-text" data-i18n="app.title">Hermes-Kiro</span>
           </div>
-          <select id="sourceSwitcher" class="source-switcher" title="Quản lý nguồn dữ liệu (Data source)">
-            <option value="kirogo">Kiro-Go</option>
-            <option value="kiropool">KiroPool (proxy)</option>
-          </select>
+
         </div>
         <nav class="header-nav" aria-label="" data-i18n-aria-label="aria.sections">
           <div class="tabs" id="tabBar">
@@ -125,6 +123,7 @@
           <div class="lang-switch" id="mainLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
             <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
             <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
+            <button class="lang-btn" data-lang="vi" type="button" data-i18n="lang.vi"></button>
           </div>
           <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
             data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
@@ -144,52 +143,87 @@
     <div class="container">
       <!-- Stats summary -->
       <div class="stats-grid">
-        <div class="stat-card">
+        <div class="stat-card stat-card-accounts">
           <div class="stat-card-title" data-i18n="stats.accounts"></div>
           <div class="stat-body">
             <div class="stat-main">
               <div class="stat-value" id="statAccounts">0</div>
               <div class="stat-sub">
-                <span class="stat-sub-sec"><span class="stat-value-sm" id="statCredits">0</span> <span
-                    class="stat-label" data-i18n="stats.credits"></span></span>
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-sm--active" id="statActiveAccounts">0</span> <span
+                    class="stat-label" data-i18n="stats.activeAccounts"></span></span>
+                <span class="stat-sep">·</span>
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-sm--muted" id="statDisabledAccounts">0</span> <span
+                    class="stat-label" data-i18n="stats.disabledAccounts"></span></span>
               </div>
             </div>
-            <i class="fa-solid fa-users stat-icon" aria-hidden="true"></i>
+            <div class="stat-icon-badge stat-icon-badge--blue">
+              <i class="fa-solid fa-users stat-icon" aria-hidden="true"></i>
+            </div>
           </div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card stat-card-quota" id="statCardQuota">
+          <div class="stat-card-title" data-i18n="stats.quota"></div>
+          <div class="stat-body">
+            <div class="stat-main">
+              <div class="stat-value stat-value--quota">
+                <span id="statRemainingQuota">0</span><span class="stat-value-sub" id="statTotalQuota">/ 0</span>
+              </div>
+              <div class="stat-sub stat-sub--quota">
+                <div class="stat-quota-progress">
+                  <div class="stat-quota-bar">
+                    <div class="stat-quota-fill" id="statQuotaFill" style="width: 0%"></div>
+                  </div>
+                  <span class="stat-quota-text" id="statQuotaText">0 / 0</span>
+                </div>
+              </div>
+            </div>
+            <div class="stat-icon-badge stat-icon-badge--amber">
+              <i class="fa-solid fa-gauge-high stat-icon" aria-hidden="true"></i>
+            </div>
+          </div>
+        </div>
+        <div class="stat-card stat-card-requests">
           <div class="stat-card-title" data-i18n="stats.requests"></div>
           <div class="stat-body">
             <div class="stat-main">
-              <div class="stat-value" id="statRequests">0</div>
+              <div class="stat-value stat-value--requests" id="statRequests">0</div>
               <div class="stat-sub">
-                <span class="stat-sub-sec"><span class="stat-value-sm" id="statTokens">0</span> <span class="stat-label"
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-sm--tokens" id="statTokens">0</span> <span class="stat-label"
                     data-i18n="stats.tokens"></span></span>
+                <span class="stat-sep">·</span>
+                <span class="stat-sub-sec" title="" data-i18n-title="stats.consumedCreditsHint"><span class="stat-value-sm stat-value-sm--credits" id="statCredits">0</span> <span class="stat-label"
+                    data-i18n="stats.consumed"></span></span>
               </div>
             </div>
-            <i class="fa-solid fa-route stat-icon" aria-hidden="true"></i>
+            <div class="stat-icon-badge stat-icon-badge--purple">
+              <i class="fa-solid fa-route stat-icon" aria-hidden="true"></i>
+            </div>
           </div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card stat-card-success">
           <div class="stat-card-title" data-i18n="stats.success"></div>
           <div class="stat-body">
             <div class="stat-main">
-              <div class="stat-value" id="statSuccess">0</div>
-              <div class="stat-sub"><span class="stat-label" data-i18n="stats.completed"></span></div>
+              <div class="stat-value stat-value--success" id="statSuccess">0</div>
+              <div class="stat-sub"><span class="stat-label" data-i18n="stats.completed"></span> <span class="stat-value-sm stat-rate-badge" id="statSuccessRate"></span></div>
             </div>
-            <i class="fa-solid fa-circle-check stat-icon" aria-hidden="true"></i>
+            <div class="stat-icon-badge stat-icon-badge--emerald">
+              <i class="fa-solid fa-circle-check stat-icon" aria-hidden="true"></i>
+            </div>
           </div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card stat-card-danger">
           <div class="stat-card-title" data-i18n="stats.failed"></div>
           <div class="stat-body">
             <div class="stat-main">
               <div class="stat-value stat-value--danger" id="statFailed">0</div>
               <div class="stat-sub">
-                <span class="stat-label" data-i18n="stats.errors"></span>
+                <span class="stat-label" data-i18n="stats.errors"></span> <span class="stat-value-sm stat-rate-badge" id="statFailedRate"></span>
               </div>
             </div>
-            <i class="fa-solid fa-circle-xmark stat-icon stat-icon--danger" aria-hidden="true"></i>
+            <div class="stat-icon-badge stat-icon-badge--rose">
+              <i class="fa-solid fa-circle-xmark stat-icon stat-icon--danger" aria-hidden="true"></i>
+            </div>
           </div>
         </div>
       </div>
@@ -197,9 +231,20 @@
       <!-- Accounts tab -->
       <div id="tabAccounts" class="tab-content">
         <div class="card">
-          <div class="card-header">
-            <span class="card-title" data-i18n="accounts.title"></span>
+          <div class="card-header account-list-header">
+            <div class="card-title-group">
+              <span class="card-title" data-i18n="accounts.title"></span>
+              <span class="account-counter-badge" id="accountCountBadge">0</span>
+            </div>
             <div class="card-actions">
+              <label class="flex items-center gap-2 cursor-pointer select-none routing-mode-toggle-wrap" id="routingModeToggleWrap" title=""
+                data-i18n-title="routing.modeTooltip">
+                <i class="fa-solid fa-arrows-split-up-and-left routing-mode-icon" aria-hidden="true"></i>
+                <span class="text-xs font-medium" id="routingModeSwitchLabel" data-i18n="routing.switchLabel"></span>
+                <span class="switch"><input type="checkbox" id="routingModeToggle" /><span
+                    class="slider"></span></span>
+                <span class="badge badge-muted" id="routingModeBadge">Sequential</span>
+              </label>
               <label class="flex items-center gap-2 cursor-pointer select-none" title=""
                 data-i18n-title="privacy.tooltip">
                 <span class="text-xs font-medium" data-i18n="privacy.label"></span>
@@ -230,13 +275,29 @@
               <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>
             </div>
             <div class="toolbar-spacer"></div>
-            <input type="text" id="filterSearch" class="w-56!" data-i18n-placeholder="filter.search" />
-            <select id="filterStatusSelect" class="w-32!" data-i18n-aria-label="filter.status">
-              <option value="all" data-i18n="filter.all"></option>
-              <option value="enabled" data-i18n="filter.enabled"></option>
-              <option value="disabled" data-i18n="filter.disabled"></option>
-              <option value="banned" data-i18n="filter.banned"></option>
-            </select>
+            <div class="search-input-wrap">
+              <i class="fa-solid fa-magnifying-glass search-icon" aria-hidden="true"></i>
+              <input type="text" id="filterSearch" data-i18n-placeholder="filter.search" />
+            </div>
+            <div class="select-wrap">
+              <select id="filterStatusSelect" data-i18n-aria-label="filter.status">
+                <option value="all" data-i18n="filter.all"></option>
+                <option value="enabled" data-i18n="filter.enabled"></option>
+                <option value="disabled" data-i18n="filter.disabled"></option>
+                <option value="banned" data-i18n="filter.banned"></option>
+              </select>
+              <i class="fa-solid fa-chevron-down select-chevron" aria-hidden="true"></i>
+            </div>
+            <div class="view-toggle-group" id="accountViewToggle" role="group" aria-label="View mode">
+              <button type="button" class="view-toggle-btn active" id="viewModeCardsBtn" data-view="cards" title="Cards View" data-i18n-title="view.cards">
+                <i class="fa-solid fa-table-cells-large"></i>
+                <span class="view-toggle-text" data-i18n="view.cards"></span>
+              </button>
+              <button type="button" class="view-toggle-btn" id="viewModeListBtn" data-view="list" title="List View" data-i18n-title="view.list">
+                <i class="fa-solid fa-list-ul"></i>
+                <span class="view-toggle-text" data-i18n="view.list"></span>
+              </button>
+            </div>
           </div>
 
           <div id="accountsList"></div>
@@ -343,6 +404,31 @@
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
 
+        <!-- Routing mode settings -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="routing.settingsTitle"></span></div>
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="routing.settingsLabel"></label>
+            <div class="flex flex-col gap-3">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="accountRoutingModeRadio" value="sequential" id="routingModeRadioSequential" />
+                <div>
+                  <div class="font-medium text-sm" data-i18n="routing.modeSequentialTitle"></div>
+                  <small class="field-hint-offset" data-i18n="routing.modeSequentialDesc"></small>
+                </div>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="accountRoutingModeRadio" value="round_robin" id="routingModeRadioRoundRobin" />
+                <div>
+                  <div class="font-medium text-sm" data-i18n="routing.modeRoundRobinTitle"></div>
+                  <small class="field-hint-offset" data-i18n="routing.modeRoundRobinDesc"></small>
+                </div>
+              </label>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="saveRoutingModeBtn" data-i18n="routing.saveSettings"></button>
+        </div>
+
         <!-- Custom Model & External API settings -->
         <div class="card">
           <div class="card-header"><span class="card-title"><i class="fa-solid fa-cloud-bolt"></i> Cấu hình Model & Priority Call URL</span></div>
@@ -372,7 +458,7 @@
           </div>
           <div class="form-group">
             <label class="text-xs font-semibold">Sonnet Model</label>
-            <input type="text" id="externalSonnetModel" placeholder="claude-sonnet-4.5" />
+            <input type="text" id="externalSonnetModel" placeholder="claude-sonnet-5.5" />
           </div>
           <div class="form-group">
             <label class="text-xs font-semibold">Haiku Model</label>
@@ -656,7 +742,7 @@
             <img class="footer-icon" src="/admin/icon.png?v=20260724" alt="" />
             <div class="footer-copy">
               <div class="footer-title-row">
-                <span class="footer-title">Kiro-Go</span>
+                <span class="footer-title" data-i18n="app.title">Hermes-Kiro</span>
                 <span class="footer-version" id="versionBadge" aria-label=""
                   data-i18n-aria-label="aria.currentVersion"></span>
                 <span class="footer-version-status" id="statusBadge" data-i18n-title="status.running" title="">
@@ -672,7 +758,7 @@
                 <i class="fa-solid fa-rotate" aria-hidden="true"></i>
                 <span data-i18n="update.check" data-update-label></span>
               </button>
-              <a class="footer-link" href="https://github.com/Quorinex/Kiro-Go" target="_blank" rel="noopener">
+              <a class="footer-link" href="https://github.com/baoluong2900/hermes-kiro" target="_blank" rel="noopener">
                 <i class="fa-brands fa-github" aria-hidden="true"></i>
                 <span data-i18n="footer.github"></span>
               </a>
@@ -680,7 +766,7 @@
           </div>
         </div>
         <div class="footer-meta">
-          <span>© <span id="footerYear"></span> Kiro-Go</span>
+          <span>© <span id="footerYear"></span> <span data-i18n="app.title">Hermes-Kiro</span></span>
         </div>
       </div>
     </footer>

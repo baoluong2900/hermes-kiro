@@ -25,6 +25,11 @@ import (
 	"time"
 )
 
+const (
+	RoutingModeSequential = "sequential"
+	RoutingModeRoundRobin = "round_robin"
+)
+
 var (
 	ErrAccountNotFound       = errors.New("account not found")
 	ErrDuplicateAccountID    = errors.New("account ID already exists")
@@ -234,6 +239,10 @@ type Config struct {
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
+
+	// AccountRoutingMode determines how requests are dispatched across accounts:
+	// "sequential" (default: exhaust 1 account before next) or "round_robin" (evenly distributed).
+	AccountRoutingMode string `json:"accountRoutingMode,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
@@ -1317,6 +1326,33 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetAccountRoutingMode returns the active account routing strategy.
+// Defaults to "sequential" (exhaust 1 account before moving to next).
+func GetAccountRoutingMode() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || strings.TrimSpace(cfg.AccountRoutingMode) == "" {
+		return RoutingModeSequential
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.AccountRoutingMode))
+	if mode == RoutingModeRoundRobin {
+		return RoutingModeRoundRobin
+	}
+	return RoutingModeSequential
+}
+
+// UpdateAccountRoutingMode updates the account routing mode and persists the change.
+func UpdateAccountRoutingMode(mode string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	norm := strings.ToLower(strings.TrimSpace(mode))
+	if norm != RoutingModeRoundRobin && norm != RoutingModeSequential {
+		norm = RoutingModeSequential
+	}
+	cfg.AccountRoutingMode = norm
 	return Save()
 }
 

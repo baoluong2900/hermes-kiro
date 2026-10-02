@@ -18,6 +18,7 @@
   let filterKeyword = '';
   let filterStatus = 'all';
   let privacyModeEnabled = true;
+  let currentRoutingMode = 'sequential';
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
@@ -117,7 +118,7 @@
   }
   function t(key, ...args) {
     const active = dict[currentLang] || {};
-    const fallback = dict.zh || {};
+    const fallback = dict.en || dict.zh || {};
     let text = active[key] || fallback[key] || key;
     args.forEach((arg, idx) => { text = text.replace('{' + idx + '}', arg); });
     return text;
@@ -132,6 +133,7 @@
     updateLangButtons();
     applyTheme(getThemePref());
     refreshCustomSelects();
+    updateRoutingModeUI(currentRoutingMode);
   }
   async function setLang(lang) {
     currentLang = lang;
@@ -139,6 +141,7 @@
     await loadLocale(lang);
     applyTranslations();
     renderVersionBadge();
+    updateAccountStatsSummary();
     renderAccounts();
     renderPromptRules();
     renderLogs(logsCache);
@@ -147,11 +150,12 @@
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
     qsa('.lang-toggle').forEach(btn => {
       const label = btn.querySelector('.lang-toggle-label');
-      if (label) label.textContent = currentLang === 'zh' ? t('lang.zh') : t('lang.en');
+      if (label) label.textContent = currentLang === 'zh' ? t('lang.zh') : (currentLang === 'vi' ? t('lang.vi') : t('lang.en'));
     });
   }
   function toggleLang() {
-    setLang(currentLang === 'zh' ? 'en' : 'zh');
+    const nextLang = currentLang === 'zh' ? 'en' : (currentLang === 'en' ? 'vi' : 'zh');
+    setLang(nextLang);
   }
 
   // Custom select
@@ -446,7 +450,7 @@
     return maskedLocal + '@' + domain;
   }
   function getDisplayEmail(email, id) {
-    const raw = email || (id ? id.substring(0, 12) + '...' : '-');
+    const raw = email || id || '-';
     return maskEmail(raw);
   }
 
@@ -714,12 +718,95 @@
   async function loadStats() {
     const res = await api('/status');
     const d = await res.json();
-    $('statAccounts').textContent = d.accounts || 0;
+    const accCount = (d.accounts != null && d.accounts > 0)
+      ? d.accounts
+      : ((accountsData && accountsData.length) ? accountsData.length : (d.accounts || 0));
+    $('statAccounts').textContent = accCount;
     $('statRequests').textContent = d.totalRequests || 0;
     $('statSuccess').textContent = d.successRequests || 0;
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+
+    const totalReq = Number(d.totalRequests || 0);
+    const succReq = Number(d.successRequests || 0);
+    const failReq = Number(d.failedRequests || 0);
+    const elSuccRate = $('statSuccessRate');
+    if (elSuccRate) {
+      elSuccRate.textContent = totalReq > 0 ? ((succReq / totalReq) * 100).toFixed(1) + '%' : '';
+    }
+    const elFailRate = $('statFailedRate');
+    if (elFailRate) {
+      elFailRate.textContent = totalReq > 0 ? ((failReq / totalReq) * 100).toFixed(1) + '%' : '';
+    }
+
+    if (Array.isArray(accountsData) && accountsData.length) {
+      updateAccountStatsSummary();
+    } else if (d.totalQuotaLimit != null && d.totalQuotaLimit > 0) {
+      applyQuotaStats(d.remainingQuota ?? (d.totalQuotaLimit - d.totalQuotaUsed), d.totalQuotaLimit, d.totalQuotaUsed, d.accounts || 0, d.available || 0);
+    }
+  }
+
+  function applyQuotaStats(remaining, limit, used, totalAcc, activeAcc) {
+    const rem = Math.max(0, Number(remaining) || 0);
+    const lim = Math.max(0, Number(limit) || 0);
+    const u = Math.max(0, Number(used) || 0);
+
+    const remPct = lim > 0 ? Math.max(0, Math.min(100, (rem / lim) * 100)) : 0;
+
+    const elRemaining = $('statRemainingQuota');
+    if (elRemaining) {
+      elRemaining.textContent = Number(rem.toFixed(rem % 1 === 0 ? 0 : 1)).toLocaleString('en-US');
+    }
+    const elTotalQuota = $('statTotalQuota');
+    if (elTotalQuota) {
+      elTotalQuota.textContent = '/ ' + Number(lim.toFixed(lim % 1 === 0 ? 0 : 1)).toLocaleString('en-US');
+    }
+    const elFill = $('statQuotaFill');
+    if (elFill) {
+      elFill.style.width = remPct.toFixed(1) + '%';
+      elFill.className = 'stat-quota-fill ' + (remPct < 15 ? 'critical' : (remPct < 40 ? 'warning' : 'healthy'));
+    }
+    const elText = $('statQuotaText');
+    if (elText) {
+      const usedFormatted = Number(u.toFixed(u % 1 === 0 ? 0 : 1)).toLocaleString('en-US');
+      elText.textContent = `${remPct.toFixed(1)}% ${t('stats.remaining')} (${usedFormatted} ${t('stats.used')})`;
+    }
+    const cardQuota = $('statCardQuota');
+    if (cardQuota) {
+      cardQuota.title = t('stats.quotaTooltip', Number(lim.toFixed(0)).toLocaleString('en-US'), u.toFixed(1), rem.toFixed(1));
+    }
+
+    if (totalAcc != null) {
+      const elTotalAcc = $('statAccounts');
+      if (elTotalAcc) elTotalAcc.textContent = totalAcc;
+    }
+    if (activeAcc != null) {
+      const elActive = $('statActiveAccounts');
+      if (elActive) elActive.textContent = activeAcc;
+      const elDisabled = $('statDisabledAccounts');
+      if (elDisabled && totalAcc != null) elDisabled.textContent = Math.max(0, totalAcc - activeAcc);
+    }
+  }
+
+  function updateAccountStatsSummary() {
+    if (!Array.isArray(accountsData)) return;
+    const totalAccounts = accountsData.length;
+    let activeAccounts = 0;
+    let totalLimit = 0;
+    let totalUsed = 0;
+
+    accountsData.forEach(a => {
+      const isBanned = a.banStatus && a.banStatus !== 'ACTIVE';
+      if (a.enabled && !isBanned) {
+        activeAccounts++;
+      }
+      totalLimit += Number(a.usageLimit) || 0;
+      totalUsed += Number(a.usageCurrent) || 0;
+    });
+
+    const remaining = Math.max(0, totalLimit - totalUsed);
+    applyQuotaStats(remaining, totalLimit, totalUsed, totalAccounts, activeAccounts);
   }
 
   // ===== Logs =====
@@ -830,11 +917,14 @@
       const keyCell = '<span class="text-xs font-mono" title="' + escapeAttr(l.apiKey || '') + '">' + escapeHtml(l.apiKey || l.apiKeyName || (l.apiKeyId ? l.apiKeyId.slice(0, 12) : '—')) + '</span>';
       let detailCell;
       if (!isSuccess) {
-        detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
-          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
-          '<span class="log-msg" title="' + escapeAttr(l.error || '') + '">' + escapeHtml(l.error || 'Failed') + '</span>';
+        const rawErr = String(l.error || 'Failed');
+        detailCell = '<div class="log-detail-cell">' +
+          '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
+          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span>' +
+          '<span class="log-msg" title="' + escapeAttr(rawErr) + '">' + escapeHtml(rawErr) + '</span>' +
+          '</div>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (Number(l.credits).toFixed(4) + ' cr') : '-') + '</span>';
+        detailCell = '<span class="text-muted font-mono">' + (l.credits ? (Number(l.credits).toFixed(4) + ' cr') : '-') + '</span>';
       }
       const timeVal = l.time || l.timeUnix || 0;
       const tokensVal = (l.inputTokens != null && l.outputTokens != null && (l.inputTokens > 0 || l.outputTokens > 0))
@@ -877,6 +967,11 @@
   async function loadAccounts() {
     const res = await api('/accounts');
     accountsData = await res.json();
+    if (accountsData && accountsData.length) {
+      const statAcc = $('statAccounts');
+      if (statAcc) statAcc.textContent = accountsData.length;
+    }
+    updateAccountStatsSummary();
     renderAccounts();
   }
 
@@ -928,20 +1023,24 @@
     }
   }
 
-  function formatSubscriptionLabel(type) {
-    const s = (type || '').toUpperCase();
-    if (s.includes('POWER')) return t('subscription.power');
-    if (s.includes('PRO_PLUS') || s.includes('PROPLUS')) return t('subscription.proPlus');
-    if (s.includes('PRO')) return t('subscription.pro');
-    if (s.includes('FREE')) return t('subscription.free');
-    return type || t('subscription.free');
+  function formatSubscriptionLabel(type, title) {
+    const raw = `${title || ''} ${type || ''}`.toUpperCase();
+    if (raw.includes('STUDENT')) return 'STUDENT';
+    if (raw.includes('POWER')) return t('subscription.power');
+    if (raw.includes('PRO_PLUS') || raw.includes('PROPLUS')) return t('subscription.proPlus');
+    if (raw.includes('PRO MAX') || raw.includes('PROMAX')) return 'PRO MAX';
+    if (raw.includes('PRO')) return t('subscription.pro');
+    if (raw.includes('FREE')) return t('subscription.free');
+    return title || type || t('subscription.free');
   }
-  function getSubBadge(type) {
-    const s = (type || '').toUpperCase();
-    if (s.includes('POWER')) return '<span class="badge badge-power">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
-    if (s.includes('PRO_PLUS') || s.includes('PROPLUS')) return '<span class="badge badge-proplus">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
-    if (s.includes('PRO')) return '<span class="badge badge-pro">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
-    return '<span class="badge badge-free">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
+  function getSubBadge(type, a) {
+    const raw = `${(a && a.subscriptionTitle) || ''} ${(type || '')}`.toUpperCase();
+    if (raw.includes('STUDENT')) return '<span class="badge badge-student">' + escapeHtml(formatSubscriptionLabel(type, a && a.subscriptionTitle)) + '</span>';
+    if (raw.includes('POWER')) return '<span class="badge badge-power">' + escapeHtml(formatSubscriptionLabel(type, a && a.subscriptionTitle)) + '</span>';
+    if (raw.includes('PRO_PLUS') || raw.includes('PROPLUS')) return '<span class="badge badge-proplus">' + escapeHtml(formatSubscriptionLabel(type, a && a.subscriptionTitle)) + '</span>';
+    if (raw.includes('PRO MAX') || raw.includes('PROMAX')) return '<span class="badge badge-promax">' + escapeHtml(formatSubscriptionLabel(type, a && a.subscriptionTitle)) + '</span>';
+    if (raw.includes('PRO')) return '<span class="badge badge-pro">' + escapeHtml(formatSubscriptionLabel(type, a && a.subscriptionTitle)) + '</span>';
+    return '<span class="badge badge-free">' + escapeHtml(formatSubscriptionLabel(type, a && a.subscriptionTitle)) + '</span>';
   }
   function getTrialBadge(a) {
     if (a.trialStatus === 'ACTIVE' && a.trialUsageLimit > 0) {
@@ -974,19 +1073,20 @@
     const out = [];
     const isBanned = a.banStatus && a.banStatus !== 'ACTIVE';
     if (isBanned) {
-      if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned">' + escapeHtml(t('accounts.banned')) + '</span>');
-      else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
-      out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+      if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned"><i class="fa-solid fa-ban"></i> ' + escapeHtml(t('accounts.banned')) + '</span>');
+      else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended"><i class="fa-solid fa-triangle-exclamation"></i> ' + escapeHtml(t('accounts.suspended')) + '</span>');
+      out.push('<span class="badge badge-muted"><i class="fa-solid fa-power-off"></i> ' + escapeHtml(t('accounts.disabled')) + '</span>');
+      return out.join('');
+    }
+
+    if (!a.hasToken) {
+      out.push('<span class="badge badge-error"><i class="fa-solid fa-circle-xmark"></i> ' + escapeHtml(t('accounts.noToken')) + '</span>');
+    }
+
+    if (!a.enabled) {
+      out.push('<span class="badge badge-muted"><i class="fa-solid fa-power-off"></i> ' + escapeHtml(t('accounts.disabled')) + '</span>');
     } else {
-      if (!a.hasToken)
-        out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
-      else if (a.expiresAt && a.expiresAt < Date.now() / 1000)
-        out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.expired')) + '</span>');
-      else
-        out.push('<span class="badge badge-success">' + escapeHtml(t('accounts.normal')) + '</span>');
-      out.push(a.enabled
-        ? '<span class="badge badge-info">' + escapeHtml(t('accounts.enabled')) + '</span>'
-        : '<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+      out.push('<span class="badge badge-success"><span class="status-dot"></span> ' + escapeHtml(t('accounts.normal')) + '</span>');
     }
     return out.join('');
   }
@@ -994,9 +1094,9 @@
     if (!ts) return '-';
     const diff = ts - Date.now() / 1000;
     if (diff <= 0) return t('time.expired');
-    if (diff < 3600) return Math.floor(diff / 60) + t('time.minutes');
-    if (diff < 86400) return Math.floor(diff / 3600) + t('time.hours');
-    return Math.floor(diff / 86400) + t('time.days');
+    if (diff < 3600) return Math.max(0, Math.floor(diff / 60)) + ' ' + t('time.minutes');
+    if (diff < 86400) return Math.floor(diff / 3600) + ' ' + t('time.hours');
+    return Math.floor(diff / 86400) + ' ' + t('time.days');
   }
   function formatNum(n) {
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
@@ -1007,6 +1107,9 @@
     qsa('.usage-fill[data-usage-pct]', root).forEach(el => {
       const pct = Math.max(0, Math.min(100, parseFloat(el.dataset.usagePct) || 0));
       el.style.width = pct + '%';
+      if (pct > 0 && pct < 2) {
+        el.style.minWidth = '6px';
+      }
     });
   }
   // Worker admin payloads often omit usagePercent and only send
@@ -1042,27 +1145,71 @@
       : 'Gateway-recorded credits for this credential. This is not Kiro Main Quota.';
   }
 
+  function getProviderIcon(method) {
+    const m = String(method || '').toLowerCase();
+    if (m === 'github') return '<i class="fa-brands fa-github" aria-hidden="true"></i>';
+    if (m === 'google') return '<i class="fa-brands fa-google" aria-hidden="true"></i>';
+    if (m === 'builderid' || m === 'aws' || m === 'idc') return '<i class="fa-brands fa-aws" aria-hidden="true"></i>';
+    if (m === 'external_idp' || m === 'azuread' || m === 'microsoft') return '<i class="fa-brands fa-microsoft" aria-hidden="true"></i>';
+    return '<i class="fa-solid fa-cloud" aria-hidden="true"></i>';
+  }
+  function getProviderAvatarClass(method) {
+    const m = String(method || '').toLowerCase();
+    if (m === 'github') return 'avatar-github';
+    if (m === 'google') return 'avatar-google';
+    if (m === 'builderid' || m === 'aws' || m === 'idc') return 'avatar-aws';
+    if (m === 'external_idp' || m === 'azuread' || m === 'microsoft') return 'avatar-microsoft';
+    return 'avatar-default';
+  }
+
+  let accountViewMode = localStorage.getItem('kiro_accounts_view_mode') || 'cards';
+  function setAccountViewMode(mode) {
+    accountViewMode = mode === 'list' ? 'list' : 'cards';
+    localStorage.setItem('kiro_accounts_view_mode', accountViewMode);
+    const container = $('accountsList');
+    if (container) {
+      container.classList.toggle('view-grid', accountViewMode === 'cards');
+      container.classList.toggle('view-list', accountViewMode === 'list');
+    }
+    const cardsBtn = $('viewModeCardsBtn');
+    const listBtn = $('viewModeListBtn');
+    if (cardsBtn) cardsBtn.classList.toggle('active', accountViewMode === 'cards');
+    if (listBtn) listBtn.classList.toggle('active', accountViewMode === 'list');
+  }
+
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
+    container.classList.toggle('view-grid', accountViewMode === 'cards');
+    container.classList.toggle('view-list', accountViewMode === 'list');
     const filtered = getFilteredAccounts();
+    const countBadge = $('accountCountBadge');
+    if (countBadge) countBadge.textContent = filtered.length;
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
       return;
     }
-    container.innerHTML = filtered.map(a => {
+    container.innerHTML = filtered.map((a, idx) => {
       const usagePct = quotaBarPercent(a.usageCurrent, a.usageLimit, a.usagePercent);
       const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
       const trialPct = quotaBarPercent(a.trialUsageCurrent, a.trialUsageLimit, a.trialUsagePercent);
       const trialClass = trialPct > 90 ? 'critical' : trialPct > 70 ? 'high' : '';
       const isSelected = selectedAccounts.has(a.id);
       const weight = a.weight || 0;
-      const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
-      const overageBadge = renderOverageBadge(a);
+      const weightBadge = weight >= 1 ? '<span class="badge badge-warning" title="' + escapeAttr(t('detail.weight')) + ': ' + weight + '">P' + weight + '</span>' : '';
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
       const idAttr = escapeAttr(a.id);
+      const orderBadge = '<span class="account-index-badge">#' + (idx + 1) + '</span>';
+      const overageBadge = renderOverageBadge(a);
       const displayEmail = getDisplayEmail(a.email, a.id);
       const selectLabel = t('accounts.selectAccount', displayEmail);
+      const authMethod = a.provider || a.authMethod;
+      const providerLabel = formatAuthMethod(authMethod);
+      const providerIcon = getProviderIcon(authMethod);
+      const avatarClass = getProviderAvatarClass(authMethod);
+      const emailTooltip = a.email && a.id && a.email !== a.id
+        ? displayEmail + ' · ID: ' + a.id
+        : (a.email ? displayEmail : (a.id || displayEmail));
 
       const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
       const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
@@ -1070,51 +1217,58 @@
 
       return '' +
         '<div class="account-card' + (isSelected ? ' selected' : '') + '" data-id="' + idAttr + '">' +
-        '<div class="account-header">' +
+        '<div class="account-card-header">' +
         '<div class="account-info">' +
-        '<input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" />' +
+        '<div class="account-avatar ' + avatarClass + '" title="' + escapeAttr(providerLabel) + '">' + providerIcon + '</div>' +
         '<div class="account-info-text">' +
-        '<div class="account-email">' + escapeHtml(displayEmail) + '</div>' +
-        '<div class="account-meta">' +
-        getSubBadge(a.subscriptionType) +
-        getTrialBadge(a) +
-        weightBadge +
-        overageBadge +
-        '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
-        (a.linkedCredentialCount > 1 ? '<span class="badge badge-info" title="Gateway usage is shared across credentials for this Kiro account">Shared account · ' + a.linkedCredentialCount + ' credentials</span>' : '') +
-        getStatusBadge(a) +
+        '<div class="account-email" title="' + escapeAttr(emailTooltip) + '">' + escapeHtml(displayEmail) + '</div>' +
         '</div>' +
         '</div>' +
-        '</div>' +
-        '<div class="account-actions">' +
+        '<div class="account-quick-tools">' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
-        (banned ? '' :
-          '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
-          escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
-          '</button>') +
-        '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
-        '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
         '</div>' +
+        '<div class="account-meta">' +
+        getSubBadge(a.subscriptionType, a) +
+        (weight >= 1 ? '<span class="badge badge-warning" title="' + escapeAttr(t('detail.weight')) + ': ' + weight + '">P' + weight + '</span>' : '') +
+        getTrialBadge(a) +
+        overageBadge +
+        (a.linkedCredentialCount > 1 ? '<span class="badge badge-info" title="Gateway usage is shared across credentials for this Kiro account">Shared · ' + a.linkedCredentialCount + '</span>' : '') +
+        getStatusBadge(a) +
+        '</div>' +
+        '<div class="account-card-body">' +
         (a.usageLimit > 0 ?
           '<div class="account-usage">' +
-          '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +
+          '<div class="usage-header">' +
+          '<span class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</span>' +
+          '<span class="usage-numbers"><strong>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + '</strong> / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + ' <span class="usage-badge ' + usageClass + '">' + usagePct.toFixed(1) + '%</span></span>' +
+          '</div>' +
           '<div class="usage-bar"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '" style="width:' + usagePct + '%"></div></div>' +
-          '<div class="usage-text"><span>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + '</span><span>' + usagePct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
         (a.trialUsageLimit > 0 ?
           '<div class="account-usage">' +
-          '<div class="usage-label">' + escapeHtml(t('accounts.trialQuota')) + ' ' + escapeHtml(formatTrialExpiry(a.trialExpiresAt)) + '</div>' +
+          '<div class="usage-header">' +
+          '<span class="usage-label">' + escapeHtml(t('accounts.trialQuota')) + ' ' + escapeHtml(formatTrialExpiry(a.trialExpiresAt)) + '</span>' +
+          '<span class="usage-numbers"><strong>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + '</strong> / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + ' <span class="usage-badge ' + trialClass + '">' + trialPct.toFixed(1) + '%</span></span>' +
+          '</div>' +
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '" style="width:' + trialPct + '%"></div></div>' +
-          '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
         '<div class="account-stats">' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value" title="' + escapeAttr(accountTokensHint(a)) + '">' + formatAccountTokens(a) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value" title="' + escapeAttr(accountCreditsHint(a)) + '">' + formatAccountCredits(a) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div><div class="account-stat-value">' + (a.requestCount || 0) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div><div class="account-stat-value" title="' + escapeAttr(accountTokensHint(a)) + '">' + formatAccountTokens(a) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div><div class="account-stat-value" title="' + escapeAttr(accountCreditsHint(a)) + '">' + formatAccountCredits(a) + '</div></div>' +
+        '</div>' +
+        '</div>' +
+        '<div class="account-actions">' +
+        (banned ? '' :
+          '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
+          '<i class="fa-solid ' + (a.enabled ? 'fa-pause' : 'fa-play') + '"></i>' +
+          '<span>' + escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</span>' +
+          '</button>') +
+        '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '"><i class="fa-solid fa-bolt"></i><span>' + escapeHtml(t('accounts.test')) + '</span></button>' +
+        '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '"><i class="fa-solid fa-trash-can"></i><span>' + escapeHtml(t('accounts.delete')) + '</span></button>' +
         '</div>' +
         '</div>';
     }).join('');
@@ -1347,10 +1501,10 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div></div>' +
 
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
+      '<div class="detail-section"><h4><i class="fa-solid fa-arrow-up-wide-short"></i> ' + escapeHtml(t('detail.weight')) + ' (Priority)</h4>' +
       '<div class="form-group">' +
       '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" />' +
-      '<small>' + escapeHtml(t('detail.weightHint')) + '</small>' +
+      '<small>' + escapeHtml(t('detail.weightHint')) + ' (0 = P0 mặc định, 1-10 = ưu tiên cao)</small>' +
       '</div>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
@@ -1550,7 +1704,7 @@
   }
   function getTestModelValue() {
     const choice = $('testModelChoice');
-    return (choice && choice.value.trim()) || 'claude-sonnet-4';
+    return (choice && choice.value.trim()) || 'claude-sonnet-5.5';
   }
   function renderTestLog() {
     const c = $('testModalLog');
@@ -1595,7 +1749,7 @@
         ? '<select id="testModelChoice">' +
         testModalModels.map(m => '<option value="' + escapeAttr(m) + '">' + escapeHtml(m) + '</option>').join('') +
         '</select>'
-        : '<input type="text" id="testModelChoice" placeholder="claude-sonnet-4" value="claude-sonnet-4" />';
+        : '<input type="text" id="testModelChoice" placeholder="claude-sonnet-5.5" value="claude-sonnet-5.5" />';
 
     body.innerHTML =
       '<div class="test-modal-account">' +
@@ -1676,8 +1830,13 @@
       const d = await parseApiResponse(res);
       if (d.success || d.ok) {
         addTestLog(t('accounts.testLog.success', email, elapsed, d.reply), 'ok');
+        loadAccounts();
       } else {
         addTestLog(t('accounts.testLog.failed', email, elapsed, d.error || t('common.unknownError')), 'err');
+        if (d.disabled) {
+          addTestLog('[Auto-Disabled] Tài khoản đã tự động chuyển sang Đã tắt', 'warn');
+          loadAccounts();
+        }
       }
     } catch (e) {
       addTestLog(t('accounts.testLog.error', email, e.message), 'err');
@@ -1692,6 +1851,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    updateRoutingModeUI(d.accountRoutingMode || 'sequential');
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadPromptFilter(), loadApiKeys(), loadExternalApiConfig()]);
     refreshCustomSelects();
   }
@@ -1820,26 +1980,64 @@
         return;
       }
       for (const item of proxies) {
-        const row = document.createElement('div');
-        row.className = 'proxy-inventory-row';
-        const label = document.createElement('span');
-        label.textContent = item.country + ' · ' + item.scheme + '://' + item.host + ':' + item.port +
-          (item.username ? ' · ' + t('settings.proxyUserTag', item.username) : '') +
-          (item.enabled ? '' : ' · ' + t('settings.proxyDisabledTag'));
+        const card = document.createElement('div');
+        card.className = 'proxy-card' + (item.enabled ? ' is-active' : ' is-disabled');
+
+        const header = document.createElement('div');
+        header.className = 'proxy-card-header';
+
+        const flagTag = document.createElement('div');
+        flagTag.className = 'proxy-flag-tag';
+        flagTag.innerHTML = '<i class="fa-solid fa-globe" aria-hidden="true"></i> <span>' + escapeHtml(item.country || 'GLOBAL') + '</span>';
+
+        const schemeBadge = document.createElement('span');
+        schemeBadge.className = 'badge ' + (item.scheme === 'socks5' ? 'badge-info' : 'badge-default');
+        schemeBadge.textContent = (item.scheme || 'http').toUpperCase();
+
+        const statusBadge = document.createElement('span');
+        statusBadge.className = 'badge ' + (item.enabled ? 'badge-success' : 'badge-warning');
+        statusBadge.textContent = item.enabled ? t('accounts.enabled') : t('accounts.disabled');
+
+        header.append(flagTag, schemeBadge, statusBadge);
+
+        const body = document.createElement('div');
+        body.className = 'proxy-card-body';
+
+        const endpoint = document.createElement('div');
+        endpoint.className = 'proxy-endpoint';
+        endpoint.innerHTML = '<span class="proxy-host">' + escapeHtml(item.host) + '</span><span class="proxy-port">:' + escapeHtml(item.port) + '</span>';
+
+        body.append(endpoint);
+
+        if (item.username) {
+          const userMeta = document.createElement('div');
+          userMeta.className = 'proxy-user-meta';
+          userMeta.innerHTML = '<i class="fa-solid fa-user-lock" aria-hidden="true"></i> <span>' + escapeHtml(item.username) + '</span>';
+          body.append(userMeta);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'proxy-card-actions';
+
         const toggle = document.createElement('button');
-        toggle.type = 'button'; toggle.className = 'btn btn-outline btn-sm';
-        toggle.textContent = item.enabled ? t('settings.proxyDisable') : t('settings.proxyEnable');
+        toggle.type = 'button';
+        toggle.className = 'btn ' + (item.enabled ? 'btn-outline' : 'btn-primary') + ' btn-sm';
+        toggle.innerHTML = (item.enabled ? '<i class="fa-solid fa-pause"></i> ' : '<i class="fa-solid fa-play"></i> ') + escapeHtml(item.enabled ? t('settings.proxyDisable') : t('settings.proxyEnable'));
         toggle.addEventListener('click', () => updateProxyList(item.id, 'PATCH', { enabled: !item.enabled }));
+
         const remove = document.createElement('button');
-        remove.type = 'button'; remove.className = 'btn btn-danger btn-sm';
-        remove.textContent = t('common.remove');
+        remove.type = 'button';
+        remove.className = 'btn btn-danger btn-sm';
+        remove.innerHTML = '<i class="fa-solid fa-trash"></i> ' + escapeHtml(t('common.remove'));
         remove.addEventListener('click', async () => {
           if (await confirmAction(t('settings.proxyRemoveConfirm'), { variant: 'danger' })) {
             await updateProxyList(item.id, 'DELETE');
           }
         });
-        row.append(label, toggle, remove);
-        rows.append(row);
+
+        actions.append(toggle, remove);
+        card.append(header, body, actions);
+        rows.append(card);
       }
     } catch (err) {
       status.textContent = err.message;
@@ -1953,6 +2151,40 @@
     const allowOverUsage = $('allowOverUsage').checked;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  function updateRoutingModeUI(mode) {
+    currentRoutingMode = mode === 'round_robin' ? 'round_robin' : 'sequential';
+    const isRoundRobin = currentRoutingMode === 'round_robin';
+
+    const toggle = $('routingModeToggle');
+    if (toggle) toggle.checked = isRoundRobin;
+
+    const badge = $('routingModeBadge');
+    if (badge) {
+      badge.textContent = isRoundRobin ? t('routing.modeRoundRobinShort') : t('routing.modeSequentialShort');
+      badge.className = 'badge ' + (isRoundRobin ? 'badge-info' : 'badge-muted');
+    }
+
+    const radioSeq = $('routingModeRadioSequential');
+    if (radioSeq) radioSeq.checked = !isRoundRobin;
+    const radioRR = $('routingModeRadioRoundRobin');
+    if (radioRR) radioRR.checked = isRoundRobin;
+  }
+  async function saveRoutingMode(mode, fromSettings = false) {
+    const targetMode = mode === 'round_robin' ? 'round_robin' : 'sequential';
+    try {
+      const res = await api('/routing/mode', {
+        method: 'POST',
+        body: JSON.stringify({ mode: targetMode })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      updateRoutingModeUI(targetMode);
+      toast(targetMode === 'round_robin' ? t('routing.toastRoundRobin') : t('routing.toastSequential'), 'success');
+    } catch (e) {
+      updateRoutingModeUI(currentRoutingMode);
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -2200,11 +2432,14 @@
         : (l.tokens ? formatNum(l.tokens) : (l.totalTokens ? formatNum(l.totalTokens) : '-'));
       let detailCell;
       if (!isSuccess) {
-        detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
-          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
-          '<span class="log-msg" title="' + escapeAttr(l.error || '') + '">' + escapeHtml(l.error || 'Failed') + '</span>';
+        const rawErr = String(l.error || 'Failed');
+        detailCell = '<div class="log-detail-cell">' +
+          '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
+          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span>' +
+          '<span class="log-msg" title="' + escapeAttr(rawErr) + '">' + escapeHtml(rawErr) + '</span>' +
+          '</div>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (Number(l.credits).toFixed(4) + ' cr') : '-') + '</span>';
+        detailCell = '<span class="text-muted font-mono">' + (l.credits ? (Number(l.credits).toFixed(4) + ' cr') : '-') + '</span>';
       }
       html += '<tr>' +
         '<td>' + escapeHtml(formatLogTime(l.time || l.timeUnix || 0)) + '</td>' +
@@ -3998,7 +4233,7 @@
       if (!currentVersion) await loadVersion();
       const current = currentVersion.replace(/^v/i, '');
       if (!current) throw new Error('Current version missing');
-      const res = await fetch('https://raw.githubusercontent.com/Quorinex/Kiro-Go/main/version.json?t=' + Date.now());
+      const res = await fetch('https://raw.githubusercontent.com/baoluong2900/hermes-kiro/main/version.json?t=' + Date.now());
       if (!res.ok) throw new Error('Fetch failed');
       const d = await res.json();
       const latest = (d.version || '').replace(/^v/i, '');
@@ -4175,6 +4410,13 @@
   }
 
   function bindAccountEvents() {
+    const routingToggle = $('routingModeToggle');
+    if (routingToggle) {
+      routingToggle.addEventListener('change', e => {
+        saveRoutingMode(e.target.checked ? 'round_robin' : 'sequential');
+      });
+    }
+
     $('privacyModeToggle').addEventListener('change', e => {
       privacyModeEnabled = e.target.checked;
       localStorage.setItem('privacyMode', privacyModeEnabled);
@@ -4196,6 +4438,13 @@
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
 
+    const cardsBtn = $('viewModeCardsBtn');
+    const listBtn = $('viewModeListBtn');
+    if (cardsBtn) cardsBtn.addEventListener('click', () => setAccountViewMode('cards'));
+    if (listBtn) listBtn.addEventListener('click', () => setAccountViewMode('list'));
+
+
+
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
       if (cb) {
@@ -4203,6 +4452,15 @@
         const card = cb.closest('.account-card');
         if (card) card.classList.toggle('selected', cb.checked);
         return;
+      }
+      const avatar = e.target.closest('.account-avatar');
+      if (avatar) {
+        const card = avatar.closest('.account-card');
+        if (card && card.dataset.id) {
+          toggleSelectAccount(card.dataset.id);
+          card.classList.toggle('selected', selectedAccounts.has(card.dataset.id));
+          return;
+        }
       }
       const btn = e.target.closest('button[data-action]');
       if (!btn) return;
@@ -4220,10 +4478,17 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    if ($('saveRoutingModeBtn')) {
+      $('saveRoutingModeBtn').addEventListener('click', () => {
+        const rr = $('routingModeRadioRoundRobin') && $('routingModeRadioRoundRobin').checked;
+        saveRoutingMode(rr ? 'round_robin' : 'sequential', true);
+      });
+    }
     if ($('saveExternalApiBtn')) $('saveExternalApiBtn').addEventListener('click', saveExternalApiConfig);
     if ($('applyTuongTacFreePresetBtn')) $('applyTuongTacFreePresetBtn').addEventListener('click', applyTuongTacFreePreset);
     if ($('externalApiPriority')) $('externalApiPriority').addEventListener('change', updateExternalRoutingStatus);
     if ($('externalBaseUrl')) $('externalBaseUrl').addEventListener('input', updateExternalRoutingStatus);
+
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
@@ -4419,7 +4684,7 @@
       gemini: 'Gemini (Google)',
       meta: 'LLaMA (Meta)',
       proxy: 'Proxy Aliases',
-      other: currentLang === 'zh' ? '其他模型' : 'Other'
+      other: currentLang === 'zh' ? '其他模型' : (currentLang === 'vi' ? 'Khác' : 'Other')
     };
     return labels[family] || family;
   }
@@ -4547,6 +4812,7 @@
   async function init() {
     initTheme();
     await loadLocale(currentLang);
+    if (currentLang !== 'en') await loadLocale('en');
     if (currentLang !== 'zh') await loadLocale('zh');
     applyTranslations();
     initCustomSelectObserver();

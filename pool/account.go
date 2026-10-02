@@ -87,7 +87,10 @@ func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
-// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// GetNextExcluding 获取下一个可用账号，并跳过指定账号。
+// 根据配置支持两种路由模式：
+// - sequential (默认): 始终优先使用首个可用账号，用尽额度/故障后才切换下一个
+// - round_robin (均衡): 轮询均衡分配请求至各可用账号
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -97,13 +100,24 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	}
 
 	allowOverUsage := config.GetAllowOverUsage()
+	routingMode := config.GetAccountRoutingMode()
 	now := time.Now()
 	n := len(p.accounts)
 	seen := make(map[string]bool)
 
-	// 加权轮询查找可用账号
+	var startIdx uint64
+	if routingMode == config.RoutingModeRoundRobin {
+		startIdx = atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+	}
+
+	// 查找可用账号
 	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+		var idx uint64
+		if routingMode == config.RoutingModeRoundRobin {
+			idx = (startIdx + uint64(i)) % uint64(n)
+		} else {
+			idx = uint64(i)
+		}
 		acc := &p.accounts[idx]
 
 		if excluded != nil && excluded[acc.ID] {
@@ -232,6 +246,7 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 }
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
+// 根据配置支持 sequential (默认单账号用尽模式) 与 round_robin (均衡模式)。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -241,12 +256,23 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	}
 
 	allowOverUsage := config.GetAllowOverUsage()
+	routingMode := config.GetAccountRoutingMode()
 	now := time.Now()
 	n := len(p.accounts)
 	seen := make(map[string]bool)
 
+	var startIdx uint64
+	if routingMode == config.RoutingModeRoundRobin {
+		startIdx = atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+	}
+
 	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+		var idx uint64
+		if routingMode == config.RoutingModeRoundRobin {
+			idx = (startIdx + uint64(i)) % uint64(n)
+		} else {
+			idx = uint64(i)
+		}
 		acc := &p.accounts[idx]
 
 		if excluded != nil && excluded[acc.ID] {
