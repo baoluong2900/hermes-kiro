@@ -4452,6 +4452,7 @@ func (h *Handler) apiPollGitHubLogin(w http.ResponseWriter, r *http.Request) {
 
 	result, status, err := auth.PollGitHubLogin(sessionID)
 	if err != nil {
+		logger.Warnf("[GitHubAuth] Poll error for session %s: %v", sessionID, err)
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":   false,
@@ -4475,13 +4476,16 @@ func (h *Handler) apiPollGitHubLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if status == "success" && result != nil {
+	if (status == "success" || status == "completed") && result != nil {
 		account := result.CreateAccount()
 		if err := config.AddAccount(*account); err != nil {
+			logger.Errorf("[GitHubAuth] Failed to save account: %v", err)
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
 			return
 		}
+
+		logger.Infof("[GitHubAuth] Login completed successfully for account: %s (%s)", account.Email, account.ID)
 
 		h.pool.Reload()
 		json.NewEncoder(w).Encode(map[string]interface{}{

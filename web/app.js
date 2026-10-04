@@ -3075,7 +3075,7 @@
       '<button class="btn btn-sm btn-outline flex-1" id="githubCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
       '</div>' +
       '</div>' +
-      '<div id="githubCallbackGroup" class="form-group mt-4">' +
+      '<div id="githubCallbackGroup" class="form-group mt-4 hidden">' +
       '<div class="message message-info"><p>' + escapeHtml(t('github.callbackInstructions')) + '</p></div>' +
       '<label class="mt-2">' + escapeHtml(t('github.callbackUrl')) + '</label>' +
       '<textarea id="githubCallback" class="font-mono" placeholder="' + escapeAttr(t('github.callbackPlaceholder')) + '"></textarea>' +
@@ -3083,7 +3083,7 @@
       '<p id="githubStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('github.waiting')) + '</p>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" id="githubCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
-      '<button class="btn btn-primary" id="completeGithubBtn" type="button">' + escapeHtml(t('github.complete')) + '</button>' +
+      '<button class="btn btn-primary hidden" id="completeGithubBtn" type="button">' + escapeHtml(t('github.complete')) + '</button>' +
       '</div>' +
       '</div>';
     $('startGithubBtn').addEventListener('click', startGithubLogin);
@@ -3690,7 +3690,8 @@
         };
       }
       githubSession = d.sessionId || ('gh_' + Date.now());
-      const verifyUrl = d.verificationUri || d.authorizeUrl || '';
+      const isPortal = d.mode === 'portal';
+      const verifyUrl = d.verificationUriComplete || d.authorizeUrl || d.verificationUri || '';
       githubAuthorizeUrl = verifyUrl;
       const userCode = d.userCode || '';
       $('githubStep1').classList.add('hidden');
@@ -3712,6 +3713,13 @@
       } else {
         $('githubVerifyUrlGroup').classList.add('hidden');
       }
+      if (isPortal) {
+        $('githubCallbackGroup')?.classList.remove('hidden');
+        $('completeGithubBtn')?.classList.remove('hidden');
+      } else {
+        $('githubCallbackGroup')?.classList.add('hidden');
+        $('completeGithubBtn')?.classList.add('hidden');
+      }
       pollGithubAuth(d.interval || 5);
     } catch (e) {
       toastError(t('common.failed') + ': ' + (e.message || ''));
@@ -3727,20 +3735,26 @@
       if (!githubSession) return;
       try {
         let res = await api('/auth/github/poll', { method: 'POST', body: JSON.stringify({ sessionId: githubSession }) }).catch(() => null);
-        let d = res && res.ok ? await res.json().catch(() => ({})) : null;
+        let d = res ? await res.json().catch(() => null) : null;
         if (!d) {
           res = await api('/auth/social/poll', { method: 'POST', body: JSON.stringify({ sessionId: githubSession }) }).catch(() => null);
-          d = res && res.ok ? await res.json().catch(() => ({})) : null;
+          d = res ? await res.json().catch(() => null) : null;
         }
         if (d && d.completed) {
           resetGithubFlow();
           closeModal(); loadAccounts(); loadStats();
           toastPrimary(t('github.success') + ': ' + (d.account?.email || d.account?.id || ''));
           autoRefreshNewAccount(d.account?.id);
-        } else if (d && (d.status === 'authorization_pending' || (d.success && !d.completed))) {
+        } else if (d && (d.status === 'authorization_pending' || d.status === 'pending' || d.status === 'slow_down' || (d.success && !d.completed))) {
           $('githubStatus').textContent = t('github.waiting');
           pollGithubAuth(d.interval || interval);
-        } else if (d && d.error && d.error !== 'authorization_pending') {
+        } else if (d && d.error) {
+          if (d.error.includes('expired') || d.error.includes('denied') || d.error.includes('not found')) {
+            $('githubStatus').textContent = d.error;
+            toastError(d.error);
+            resetGithubFlow();
+            return;
+          }
           pollGithubAuth(interval);
         } else {
           pollGithubAuth(interval);
