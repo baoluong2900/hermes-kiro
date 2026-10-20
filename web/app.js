@@ -3749,7 +3749,7 @@
           $('githubStatus').textContent = t('github.waiting');
           pollGithubAuth(d.interval || interval);
         } else if (d && d.error) {
-          if (d.error.includes('expired') || d.error.includes('denied') || d.error.includes('not found')) {
+          if (d.error.includes('expired') || d.error.includes('denied') || d.error.includes('not found') || d.error.includes('invalid_token') || d.error.includes('already used')) {
             $('githubStatus').textContent = d.error;
             toastError(d.error);
             resetGithubFlow();

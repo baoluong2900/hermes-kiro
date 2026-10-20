@@ -4476,13 +4476,25 @@ func (h *Handler) apiPollGitHubLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if (status == "success" || status == "completed") && result != nil {
+	if (status == "success" || status == "completed" || status == "authorized") && result != nil {
 		account := result.CreateAccount()
 		if err := config.AddAccount(*account); err != nil {
-			logger.Errorf("[GitHubAuth] Failed to save account: %v", err)
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
-			return
+			if errors.Is(err, config.ErrDuplicateRefreshToken) {
+				for _, existing := range config.GetAccounts() {
+					if existing.RefreshToken == account.RefreshToken ||
+						(account.RefreshTokenFingerprint != "" && config.RefreshTokenFingerprint(existing.RefreshToken) == account.RefreshTokenFingerprint) {
+						_ = config.UpdateAccountCredentialState(existing.ID, account.AccessToken, account.RefreshToken, account.ExpiresAt, account.ProfileArn)
+						account.ID = existing.ID
+						account.Email = existing.Email
+						break
+					}
+				}
+			} else {
+				logger.Errorf("[GitHubAuth] Failed to save account: %v", err)
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+				return
+			}
 		}
 
 		logger.Infof("[GitHubAuth] Login completed successfully for account: %s (%s)", account.Email, account.ID)
@@ -4540,9 +4552,21 @@ func (h *Handler) apiCompleteGitHubLogin(w http.ResponseWriter, r *http.Request)
 
 	account := result.CreateAccount()
 	if err := config.AddAccount(*account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
-		return
+		if errors.Is(err, config.ErrDuplicateRefreshToken) {
+			for _, existing := range config.GetAccounts() {
+				if existing.RefreshToken == account.RefreshToken ||
+					(account.RefreshTokenFingerprint != "" && config.RefreshTokenFingerprint(existing.RefreshToken) == account.RefreshTokenFingerprint) {
+					_ = config.UpdateAccountCredentialState(existing.ID, account.AccessToken, account.RefreshToken, account.ExpiresAt, account.ProfileArn)
+					account.ID = existing.ID
+					account.Email = existing.Email
+					break
+				}
+			}
+		} else {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
 	}
 
 	h.pool.Reload()

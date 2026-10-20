@@ -105,6 +105,7 @@ func refreshSocialToken(refreshToken string, client *http.Client) (string, strin
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", GitHubSocialUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {

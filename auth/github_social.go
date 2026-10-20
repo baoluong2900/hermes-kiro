@@ -20,11 +20,12 @@ import (
 
 const (
 	// GitHub Social constants
-	GitHubSocialAuthMethod = "social"
-	GitHubSocialProvider   = "Github"
-	DefaultGitHubRegion    = "us-east-1"
-	GitHubSocialClientID   = "Kiro-CLI"
-	GitHubSocialUserAgent  = "kiro-cli/1.0.0"
+	GitHubSocialAuthMethod  = "social"
+	GitHubSocialProvider    = "Github"
+	DefaultGitHubRegion     = "us-east-1"
+	DefaultGitHubProfileArn = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+	GitHubSocialClientID    = "Kiro-CLI"
+	GitHubSocialUserAgent   = "kiro-cli/1.0.0"
 
 	// Kiro Auth Gateway & Portal endpoints
 	defaultKiroAuthGatewayBase = "https://prod.us-east-1.auth.desktop.kiro.dev"
@@ -97,6 +98,10 @@ func (r *GitHubSocialResult) CreateAccount() *config.Account {
 	if authMethod == "" {
 		authMethod = GitHubSocialAuthMethod
 	}
+	profileArn := strings.TrimSpace(r.ProfileArn)
+	if profileArn == "" {
+		profileArn = DefaultGitHubProfileArn
+	}
 	expiresAt := r.ExpiresAt
 	if expiresAt == 0 && r.ExpiresIn > 0 {
 		expiresAt = time.Now().Unix() + int64(r.ExpiresIn)
@@ -108,7 +113,7 @@ func (r *GitHubSocialResult) CreateAccount() *config.Account {
 		UserId:       r.UserID,
 		AccessToken:  r.AccessToken,
 		RefreshToken: r.RefreshToken,
-		ProfileArn:   r.ProfileArn,
+		ProfileArn:   profileArn,
 		AuthMethod:   authMethod,
 		Provider:     provider,
 		Region:       region,
@@ -315,24 +320,24 @@ func PollGitHubLogin(sessionID string) (*GitHubSocialResult, string, error) {
 		}
 		_ = json.Unmarshal(body, &errResp)
 
-		errCode := errResp.Error
+		errCode := strings.ToLower(strings.TrimSpace(errResp.Error))
 		if errCode == "" {
-			errCode = errResp.Message
+			errCode = strings.ToLower(strings.TrimSpace(errResp.Message))
 		}
 
 		switch errCode {
-		case "authorization_pending":
+		case "authorization_pending", "pending":
 			return nil, "pending", nil
 		case "slow_down":
 			gitHubSocialSessionsMu.Lock()
 			session.Interval += 5
 			gitHubSocialSessionsMu.Unlock()
 			return nil, "slow_down", nil
-		case "expired_token":
+		case "expired_token", "invalid_token":
 			gitHubSocialSessionsMu.Lock()
 			delete(gitHubSocialSessions, sessionID)
 			gitHubSocialSessionsMu.Unlock()
-			return nil, "", fmt.Errorf("device code expired")
+			return nil, "", fmt.Errorf("device code expired or already used (%s)", errCode)
 		case "access_denied":
 			gitHubSocialSessionsMu.Lock()
 			delete(gitHubSocialSessions, sessionID)
@@ -344,19 +349,55 @@ func PollGitHubLogin(sessionID string) (*GitHubSocialResult, string, error) {
 	}
 
 	var pollResp struct {
-		Status           string `json:"status"`
-		AccessToken      string `json:"accessToken"`
-		RefreshToken     string `json:"refreshToken"`
-		ProfileArn       string `json:"profileArn"`
-		IdentityProvider string `json:"identityProvider"`
-		ExpiresIn        int    `json:"expiresIn"`
+		Status            string `json:"status"`
+		AccessToken       string `json:"accessToken"`
+		AccessTokenSnake  string `json:"access_token"`
+		RefreshToken      string `json:"refreshToken"`
+		RefreshTokenSnake string `json:"refresh_token"`
+		ProfileArn        string `json:"profileArn"`
+		ProfileArnSnake   string `json:"profile_arn"`
+		IdentityProvider  string `json:"identityProvider"`
+		ExpiresIn         int    `json:"expiresIn"`
+		ExpiresInSnake    int    `json:"expires_in"`
+		Error             string `json:"error"`
+		ErrorDescription  string `json:"error_description"`
+		Message           string `json:"message"`
 	}
 
 	if err := json.Unmarshal(body, &pollResp); err != nil {
 		return nil, "", fmt.Errorf("parse device poll response: %w", err)
 	}
 
-	switch pollResp.Status {
+	accessToken := strings.TrimSpace(pollResp.AccessToken)
+	if accessToken == "" {
+		accessToken = strings.TrimSpace(pollResp.AccessTokenSnake)
+	}
+	refreshToken := strings.TrimSpace(pollResp.RefreshToken)
+	if refreshToken == "" {
+		refreshToken = strings.TrimSpace(pollResp.RefreshTokenSnake)
+	}
+	profileArn := strings.TrimSpace(pollResp.ProfileArn)
+	if profileArn == "" {
+		profileArn = strings.TrimSpace(pollResp.ProfileArnSnake)
+	}
+	expiresIn := pollResp.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = pollResp.ExpiresInSnake
+	}
+	if expiresIn <= 0 {
+		expiresIn = 3600
+	}
+
+	status := strings.ToLower(strings.TrimSpace(pollResp.Status))
+	if status == "" {
+		if pollResp.Error != "" {
+			status = strings.ToLower(strings.TrimSpace(pollResp.Error))
+		} else if accessToken != "" {
+			status = "authorized"
+		}
+	}
+
+	switch status {
 	case "authorization_pending", "pending":
 		return nil, "pending", nil
 	case "slow_down":
@@ -364,8 +405,8 @@ func PollGitHubLogin(sessionID string) (*GitHubSocialResult, string, error) {
 		session.Interval += 5
 		gitHubSocialSessionsMu.Unlock()
 		return nil, "slow_down", nil
-	case "success", "completed":
-		if pollResp.AccessToken == "" {
+	case "authorized", "success", "completed", "approved":
+		if accessToken == "" {
 			return nil, "", fmt.Errorf("token response missing accessToken")
 		}
 
@@ -374,22 +415,40 @@ func PollGitHubLogin(sessionID string) (*GitHubSocialResult, string, error) {
 		delete(gitHubSocialSessions, sessionID)
 		gitHubSocialSessionsMu.Unlock()
 
-		expiresIn := pollResp.ExpiresIn
-		if expiresIn <= 0 {
-			expiresIn = 3600
-		}
-
 		provider := pollResp.IdentityProvider
 		if provider == "" {
 			provider = GitHubSocialProvider
 		}
 
-		email, userID, _ := GetUserInfo(pollResp.AccessToken)
+		claims := parseSocialTokenClaims(accessToken)
+		if profileArn == "" {
+			profileArn = claims.ProfileArn
+		}
+		if profileArn == "" {
+			profileArn = DefaultGitHubProfileArn
+		}
+
+		email, userID, _ := GetUserInfo(accessToken)
+		if email == "" {
+			email = claims.Email
+		}
+		if userID == "" {
+			userID = claims.UserID
+		}
+		if email == "" {
+			if userID != "" {
+				email = "github_" + userID + "@kiro.dev"
+			} else if session.UserCode != "" {
+				email = "github_user_" + session.UserCode + "@kiro.dev"
+			} else {
+				email = "github_account@kiro.dev"
+			}
+		}
 
 		result := &GitHubSocialResult{
-			AccessToken:      pollResp.AccessToken,
-			RefreshToken:     pollResp.RefreshToken,
-			ProfileArn:       pollResp.ProfileArn,
+			AccessToken:      accessToken,
+			RefreshToken:     refreshToken,
+			ProfileArn:       profileArn,
 			IdentityProvider: provider,
 			ExpiresIn:        expiresIn,
 			ExpiresAt:        time.Now().Unix() + int64(expiresIn),
@@ -400,7 +459,58 @@ func PollGitHubLogin(sessionID string) (*GitHubSocialResult, string, error) {
 			UserID:           userID,
 		}
 		return result, "completed", nil
+	case "invalid_token", "expired_token":
+		gitHubSocialSessionsMu.Lock()
+		delete(gitHubSocialSessions, sessionID)
+		gitHubSocialSessionsMu.Unlock()
+		return nil, "", fmt.Errorf("device code expired or already used (%s)", status)
+	case "access_denied":
+		gitHubSocialSessionsMu.Lock()
+		delete(gitHubSocialSessions, sessionID)
+		gitHubSocialSessionsMu.Unlock()
+		return nil, "", fmt.Errorf("user denied authorization")
 	default:
+		if accessToken != "" {
+			gitHubSocialSessionsMu.Lock()
+			delete(gitHubSocialSessions, sessionID)
+			gitHubSocialSessionsMu.Unlock()
+
+			provider := pollResp.IdentityProvider
+			if provider == "" {
+				provider = GitHubSocialProvider
+			}
+			claims := parseSocialTokenClaims(accessToken)
+			if profileArn == "" {
+				profileArn = claims.ProfileArn
+			}
+			if profileArn == "" {
+				profileArn = DefaultGitHubProfileArn
+			}
+			email, userID, _ := GetUserInfo(accessToken)
+			if email == "" {
+				email = claims.Email
+			}
+			if userID == "" {
+				userID = claims.UserID
+			}
+			if email == "" {
+				email = "github_account@kiro.dev"
+			}
+			result := &GitHubSocialResult{
+				AccessToken:      accessToken,
+				RefreshToken:     refreshToken,
+				ProfileArn:       profileArn,
+				IdentityProvider: provider,
+				ExpiresIn:        expiresIn,
+				ExpiresAt:        time.Now().Unix() + int64(expiresIn),
+				Region:           DefaultGitHubRegion,
+				AuthMethod:       GitHubSocialAuthMethod,
+				Provider:         provider,
+				Email:            email,
+				UserID:           userID,
+			}
+			return result, "completed", nil
+		}
 		return nil, "", fmt.Errorf("unexpected status from auth gateway: %s", pollResp.Status)
 	}
 }
@@ -496,19 +606,36 @@ func CompleteGitHubLogin(sessionID, callbackURL string) (*GitHubSocialResult, er
 	}
 
 	var tokenResp struct {
-		AccessToken      string `json:"accessToken"`
-		RefreshToken     string `json:"refreshToken"`
-		ProfileArn       string `json:"profileArn"`
-		IdentityProvider string `json:"identityProvider"`
-		ExpiresIn        int    `json:"expiresIn"`
+		AccessToken       string `json:"accessToken"`
+		AccessTokenSnake  string `json:"access_token"`
+		RefreshToken      string `json:"refreshToken"`
+		RefreshTokenSnake string `json:"refresh_token"`
+		ProfileArn        string `json:"profileArn"`
+		ProfileArnSnake   string `json:"profile_arn"`
+		IdentityProvider  string `json:"identityProvider"`
+		ExpiresIn         int    `json:"expiresIn"`
+		ExpiresInSnake    int    `json:"expires_in"`
 	}
 
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("parse token exchange response: %w", err)
 	}
 
-	if tokenResp.AccessToken == "" {
+	accessToken := strings.TrimSpace(tokenResp.AccessToken)
+	if accessToken == "" {
+		accessToken = strings.TrimSpace(tokenResp.AccessTokenSnake)
+	}
+	if accessToken == "" {
 		return nil, fmt.Errorf("token exchange response missing accessToken")
+	}
+
+	refreshToken := strings.TrimSpace(tokenResp.RefreshToken)
+	if refreshToken == "" {
+		refreshToken = strings.TrimSpace(tokenResp.RefreshTokenSnake)
+	}
+	profileArn := strings.TrimSpace(tokenResp.ProfileArn)
+	if profileArn == "" {
+		profileArn = strings.TrimSpace(tokenResp.ProfileArnSnake)
 	}
 
 	// Clean up session
@@ -518,6 +645,9 @@ func CompleteGitHubLogin(sessionID, callbackURL string) (*GitHubSocialResult, er
 
 	expiresIn := tokenResp.ExpiresIn
 	if expiresIn <= 0 {
+		expiresIn = tokenResp.ExpiresInSnake
+	}
+	if expiresIn <= 0 {
 		expiresIn = 3600
 	}
 
@@ -526,12 +656,33 @@ func CompleteGitHubLogin(sessionID, callbackURL string) (*GitHubSocialResult, er
 		provider = GitHubSocialProvider
 	}
 
-	email, userID, _ := GetUserInfo(tokenResp.AccessToken)
+	claims := parseSocialTokenClaims(accessToken)
+	if profileArn == "" {
+		profileArn = claims.ProfileArn
+	}
+	if profileArn == "" {
+		profileArn = DefaultGitHubProfileArn
+	}
+
+	email, userID, _ := GetUserInfo(accessToken)
+	if email == "" {
+		email = claims.Email
+	}
+	if userID == "" {
+		userID = claims.UserID
+	}
+	if email == "" {
+		if userID != "" {
+			email = "github_" + userID + "@kiro.dev"
+		} else {
+			email = "github_portal@kiro.dev"
+		}
+	}
 
 	result := &GitHubSocialResult{
-		AccessToken:      tokenResp.AccessToken,
-		RefreshToken:     tokenResp.RefreshToken,
-		ProfileArn:       tokenResp.ProfileArn,
+		AccessToken:      accessToken,
+		RefreshToken:     refreshToken,
+		ProfileArn:       profileArn,
 		IdentityProvider: provider,
 		ExpiresIn:        expiresIn,
 		ExpiresAt:        time.Now().Unix() + int64(expiresIn),
@@ -543,6 +694,69 @@ func CompleteGitHubLogin(sessionID, callbackURL string) (*GitHubSocialResult, er
 	}
 
 	return result, nil
+}
+
+type socialTokenClaims struct {
+	Email      string
+	UserID     string
+	ProfileArn string
+}
+
+func parseSocialTokenClaims(accessToken string) socialTokenClaims {
+	if len(accessToken) == 0 || len(accessToken) > 256<<10 {
+		return socialTokenClaims{}
+	}
+	parts := strings.Split(accessToken, ".")
+	if len(parts) < 2 {
+		return socialTokenClaims{}
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return socialTokenClaims{}
+		}
+	}
+	var claims struct {
+		Email             string `json:"email"`
+		PreferredUsername string `json:"preferred_username"`
+		Username          string `json:"username"`
+		CognitoUsername   string `json:"cognito:username"`
+		Sub               string `json:"sub"`
+		UserID            string `json:"userId"`
+		ProfileArn        string `json:"profileArn"`
+		ProfileArnSnake   string `json:"profile_arn"`
+		CustomProfileArn  string `json:"custom:profile_arn"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return socialTokenClaims{}
+	}
+	email := ""
+	for _, candidate := range []string{claims.Email, claims.PreferredUsername, claims.Username, claims.CognitoUsername} {
+		if c := strings.TrimSpace(candidate); c != "" {
+			email = c
+			break
+		}
+	}
+	userID := ""
+	for _, candidate := range []string{claims.Sub, claims.UserID, claims.Username, claims.CognitoUsername} {
+		if c := strings.TrimSpace(candidate); c != "" {
+			userID = c
+			break
+		}
+	}
+	profileArn := ""
+	for _, candidate := range []string{claims.ProfileArn, claims.ProfileArnSnake, claims.CustomProfileArn} {
+		if c := strings.TrimSpace(candidate); c != "" {
+			profileArn = c
+			break
+		}
+	}
+	return socialTokenClaims{
+		Email:      email,
+		UserID:     userID,
+		ProfileArn: profileArn,
+	}
 }
 
 // CancelGitHubLogin removes an active login session.
