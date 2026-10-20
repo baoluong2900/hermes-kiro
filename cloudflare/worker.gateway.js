@@ -4138,6 +4138,58 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
     }
   }
 
+  // GitHub social login (Kiro Auth Gateway device flow / Kiro Portal PKCE flow).
+  // Mirrors auth/github_social.go + proxy/handler.go in the Go server.
+  if ((path === "/auth/github/start" || path === "/auth/social/start") && method === "POST") {
+    try {
+      const body = await request.json().catch(() => ({}));
+      const res = await startGitHubLogin(String(body.mode || "device"), env);
+      return jsonResponse({ success: true, ok: true, ...res }, 200, cors);
+    } catch (e) {
+      return jsonResponse({ success: false, ok: false, error: e.message }, 500, cors);
+    }
+  }
+
+  if ((path === "/auth/github/poll" || path === "/auth/social/poll") && method === "POST") {
+    try {
+      const body = await request.json().catch(() => ({}));
+      const sessionId = String(body.sessionId || "").trim();
+      if (!sessionId) return jsonResponse({ success: false, error: "sessionId is required" }, 400, cors);
+      const res = await pollGitHubLogin(sessionId, env, request);
+      return jsonResponse({ ok: true, ...res }, 200, cors);
+    } catch (e) {
+      return jsonResponse({ success: false, ok: false, completed: false, error: e.message }, 400, cors);
+    }
+  }
+
+  if ((path === "/auth/github/complete" || path === "/auth/social/complete") && method === "POST") {
+    try {
+      const body = await request.json().catch(() => ({}));
+      const sessionId = String(body.sessionId || "").trim();
+      const callbackUrl = String(body.callbackUrl || "").trim();
+      if (!sessionId || !callbackUrl) {
+        return jsonResponse({ success: false, error: "sessionId and callbackUrl are required" }, 400, cors);
+      }
+      const res = await completeGitHubLogin(sessionId, callbackUrl, env, request);
+      return jsonResponse({ ok: true, ...res }, 200, cors);
+    } catch (e) {
+      return jsonResponse({ success: false, ok: false, completed: false, error: e.message }, 400, cors);
+    }
+  }
+
+  if ((path === "/auth/github/cancel" || path === "/auth/social/cancel") && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const sessionId = String(body.sessionId || "").trim();
+    if (sessionId) {
+      const sessions = await getKV(env, GITHUB_SESSIONS_KEY, {});
+      if (sessions[sessionId]) {
+        delete sessions[sessionId];
+        await setKV(env, GITHUB_SESSIONS_KEY, sessions);
+      }
+    }
+    return jsonResponse({ success: true, ok: true }, 200, cors);
+  }
+
   return jsonResponse({ ok: false, error: "Not Found" }, 404, cors);
 }
 
@@ -4779,6 +4831,303 @@ async function pollBuilderIdLogin(sessionId, env, request = null) {
     completed: true,
     account: { id: newAcc.id, email: newAcc.email },
   };
+}
+
+// ==================== GitHub Social Login (Kiro Auth Gateway) ====================
+// Port of auth/github_social.go. Sessions live in KV because a Worker isolate
+// does not survive between the start and poll requests.
+
+const GITHUB_SESSIONS_KEY = "auth:github_sessions";
+const KIRO_AUTH_GATEWAY_BASE = "https://prod.us-east-1.auth.desktop.kiro.dev";
+const KIRO_PORTAL_SIGNIN_URL = "https://app.kiro.dev/signin";
+const GITHUB_SOCIAL_CLIENT_ID = "Kiro-CLI";
+const GITHUB_SOCIAL_PROVIDER = "Github";
+const GITHUB_SOCIAL_USER_AGENT = "kiro-cli/1.0.0";
+const GITHUB_DEFAULT_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+const GITHUB_PORTAL_REDIRECT_URI = "http://localhost:3128/oauth/callback";
+const GITHUB_SESSION_TTL_MS = 10 * 60 * 1000;
+const GITHUB_MAX_CALLBACK_LEN = 16 << 10;
+
+function base64UrlEncode(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function randomUrlSafe(size = 32) {
+  return base64UrlEncode(crypto.getRandomValues(new Uint8Array(size)));
+}
+
+async function pkceChallenge(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return base64UrlEncode(new Uint8Array(digest));
+}
+
+async function loadGitHubSessions(env) {
+  const sessions = await getKV(env, GITHUB_SESSIONS_KEY, {});
+  const now = Date.now();
+  let pruned = false;
+  for (const [id, s] of Object.entries(sessions)) {
+    if (!s || Number(s.expiresAt || 0) < now) { delete sessions[id]; pruned = true; }
+  }
+  return { sessions, pruned };
+}
+
+async function dropGitHubSession(env, sessions, sessionId) {
+  delete sessions[sessionId];
+  await setKV(env, GITHUB_SESSIONS_KEY, sessions);
+}
+
+async function startGitHubLogin(mode, env) {
+  mode = String(mode || "device").trim().toLowerCase() || "device";
+  if (mode !== "device" && mode !== "portal") {
+    throw new Error(`unsupported login mode: "${mode}", must be 'device' or 'portal'`);
+  }
+  const { sessions } = await loadGitHubSessions(env);
+  const sessionId = crypto.randomUUID();
+
+  if (mode === "portal") {
+    const verifier = randomUrlSafe(32);
+    const state = randomUrlSafe(32);
+    const q = new URLSearchParams({
+      state,
+      code_challenge: await pkceChallenge(verifier),
+      code_challenge_method: "S256",
+      redirect_uri: GITHUB_PORTAL_REDIRECT_URI,
+      redirect_from: "KiroIDE",
+    });
+    const authorizeUrl = `${KIRO_PORTAL_SIGNIN_URL}?${q.toString()}`;
+    sessions[sessionId] = {
+      mode: "portal",
+      codeVerifier: verifier,
+      state,
+      redirectUri: GITHUB_PORTAL_REDIRECT_URI,
+      expiresAt: Date.now() + GITHUB_SESSION_TTL_MS,
+    };
+    await setKV(env, GITHUB_SESSIONS_KEY, sessions);
+    return { sessionId, mode: "portal", userCode: "", verificationUri: "", verificationUriComplete: "", authorizeUrl, interval: 5 };
+  }
+
+  const resp = await fetch(`${KIRO_AUTH_GATEWAY_BASE}/oauth/device/authorization`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": GITHUB_SOCIAL_USER_AGENT },
+    body: JSON.stringify({ clientId: GITHUB_SOCIAL_CLIENT_ID, loginProvider: GITHUB_SOCIAL_PROVIDER }),
+  });
+  if (!resp.ok) {
+    throw new Error(`device authorization failed: HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+  }
+  const data = await resp.json();
+  const interval = Math.floor(Number(data.intervalInMilliseconds || 0) / 1000) || 5;
+  const expiresIn = Math.floor(Number(data.expiresInMilliseconds || 0) / 1000) || 300;
+  const verificationUriComplete = data.verificationUriComplete || data.verificationUri || "";
+
+  sessions[sessionId] = {
+    mode: "device",
+    deviceCode: data.deviceCode,
+    userCode: data.userCode || "",
+    interval,
+    expiresAt: Date.now() + expiresIn * 1000,
+  };
+  await setKV(env, GITHUB_SESSIONS_KEY, sessions);
+
+  return {
+    sessionId,
+    mode: "device",
+    userCode: data.userCode || "",
+    verificationUri: data.verificationUri || "",
+    verificationUriComplete,
+    authorizeUrl: verificationUriComplete,
+    interval,
+  };
+}
+
+function parseSocialTokenClaims(accessToken) {
+  try {
+    const parts = String(accessToken || "").split(".");
+    if (parts.length < 2 || accessToken.length > 256 * 1024) return {};
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const c = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+    const pick = (...vals) => vals.map((v) => String(v || "").trim()).find(Boolean) || "";
+    return {
+      email: pick(c.email, c.preferred_username, c.username, c["cognito:username"]),
+      userId: pick(c.sub, c.userId, c.username, c["cognito:username"]),
+      profileArn: pick(c.profileArn, c.profile_arn, c["custom:profile_arn"]),
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function fetchKiroUserInfo(accessToken) {
+  try {
+    const resp = await fetch("https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        "User-Agent": "aws-sdk-js/1.0.18 KiroAPIProxy",
+        "x-amz-user-agent": "aws-sdk-js/1.0.18 KiroAPIProxy",
+      },
+    });
+    if (!resp.ok) return {};
+    const data = await resp.json();
+    return { email: String(data?.userInfo?.email || ""), userId: String(data?.userInfo?.userId || "") };
+  } catch {
+    return {};
+  }
+}
+
+// saveGitHubAccount normalises a token response into an account and upserts it
+// by refreshToken, matching the Go server's duplicate-refresh-token handling.
+async function saveGitHubAccount(tokenData, env, request, fallbackEmail) {
+  const accessToken = String(tokenData.accessToken || tokenData.access_token || "").trim();
+  if (!accessToken) throw new Error("token response missing accessToken");
+  const refreshToken = String(tokenData.refreshToken || tokenData.refresh_token || "").trim();
+  const expiresIn = Number(tokenData.expiresIn || tokenData.expires_in || 0) || 3600;
+  const provider = String(tokenData.identityProvider || "").trim() || GITHUB_SOCIAL_PROVIDER;
+
+  const claims = parseSocialTokenClaims(accessToken);
+  const profileArn = String(tokenData.profileArn || tokenData.profile_arn || "").trim()
+    || claims.profileArn || GITHUB_DEFAULT_PROFILE_ARN;
+  const info = await fetchKiroUserInfo(accessToken);
+  const userId = info.userId || claims.userId || "";
+  const email = info.email || claims.email || (userId ? `github_${userId}@kiro.dev` : fallbackEmail);
+  const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+
+  const accounts = await getAccounts(env, request);
+  const existingIdx = refreshToken ? accounts.findIndex((a) => a.refreshToken === refreshToken) : -1;
+  let saved;
+  if (existingIdx >= 0) {
+    saved = {
+      ...accounts[existingIdx],
+      accessToken,
+      refreshToken,
+      profileArn,
+      hasProfileArn: true,
+      expiresAt,
+      tokenExpires: expiresAt,
+    };
+    accounts[existingIdx] = saved;
+  } else {
+    saved = {
+      id: `acc-${accounts.length + 1}-${crypto.randomUUID().slice(0, 8)}`,
+      email,
+      userId,
+      nickname: "",
+      authMethod: "social",
+      provider,
+      region: DEFAULT_REGION,
+      accessToken,
+      refreshToken,
+      clientId: "",
+      clientSecret: "",
+      profileArn,
+      expiresAt,
+      tokenExpires: expiresAt,
+      enabled: true,
+      credits: 0,
+      requests: 0,
+      lastUsedUnix: 0,
+      usageLimit: 0,
+      usageCurrent: 0,
+      nextResetUnix: 0,
+      hasProfileArn: true,
+      plan: "",
+    };
+    accounts.push(saved);
+  }
+  await setKV(env, "config:accounts", accounts, request);
+  return {
+    success: true,
+    completed: true,
+    account: { id: saved.id, email: saved.email, authMethod: saved.authMethod, provider: saved.provider },
+  };
+}
+
+async function pollGitHubLogin(sessionId, env, request = null) {
+  const { sessions } = await loadGitHubSessions(env);
+  const session = sessions[sessionId];
+  if (!session) throw new Error("session not found or expired");
+  if (session.mode !== "device") {
+    throw new Error(`session ${sessionId} is in portal mode, use complete instead`);
+  }
+
+  const resp = await fetch(`${KIRO_AUTH_GATEWAY_BASE}/oauth/device/poll`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": GITHUB_SOCIAL_USER_AGENT },
+    body: JSON.stringify({ clientId: GITHUB_SOCIAL_CLIENT_ID, deviceCode: session.deviceCode }),
+  });
+  const text = await resp.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch { data = {}; }
+
+  const accessToken = String(data.accessToken || data.access_token || "").trim();
+  let status = String((resp.ok ? data.status : "") || "").trim().toLowerCase();
+  if (!resp.ok || !status) {
+    status = String(data.error || data.message || "").trim().toLowerCase() || (accessToken ? "authorized" : "");
+  }
+
+  if (status === "authorization_pending" || status === "pending") {
+    return { success: true, completed: false, status: "pending", interval: session.interval || 5 };
+  }
+  if (status === "slow_down") {
+    session.interval = (session.interval || 5) + 5;
+    await setKV(env, GITHUB_SESSIONS_KEY, sessions);
+    return { success: true, completed: false, status: "slow_down", interval: session.interval };
+  }
+  if (status === "expired_token" || status === "invalid_token") {
+    await dropGitHubSession(env, sessions, sessionId);
+    throw new Error(`device code expired or already used (${status})`);
+  }
+  if (status === "access_denied") {
+    await dropGitHubSession(env, sessions, sessionId);
+    throw new Error("user denied authorization");
+  }
+  if (resp.ok && accessToken) {
+    await dropGitHubSession(env, sessions, sessionId);
+    const fallback = session.userCode ? `github_user_${session.userCode}@kiro.dev` : "github_account@kiro.dev";
+    return saveGitHubAccount(data, env, request, fallback);
+  }
+  if (!resp.ok) {
+    throw new Error(`device authorization error (HTTP ${resp.status}): ${text.slice(0, 300)}`);
+  }
+  throw new Error(`unexpected status from auth gateway: ${data.status || "(empty)"}`);
+}
+
+async function completeGitHubLogin(sessionId, callbackUrl, env, request = null) {
+  const { sessions } = await loadGitHubSessions(env);
+  const session = sessions[sessionId];
+  if (!session) throw new Error("session not found or expired");
+  if (callbackUrl.length > GITHUB_MAX_CALLBACK_LEN) throw new Error("callback URL is too long");
+
+  let u;
+  try { u = new URL(callbackUrl); } catch { throw new Error("invalid callback URL"); }
+  const q = u.searchParams;
+  if (q.get("error")) {
+    const desc = q.get("error_description");
+    throw new Error(`authorization failed: ${q.get("error")}${desc ? `: ${desc}` : ""}`);
+  }
+  const state = q.get("state") || "";
+  if (session.state && state && state !== session.state) {
+    throw new Error("state mismatch: possible CSRF or invalid session");
+  }
+  const code = q.get("code") || "";
+  if (!code) throw new Error("callback URL missing code parameter");
+
+  let redirectUri = session.redirectUri || GITHUB_PORTAL_REDIRECT_URI;
+  if (!redirectUri.includes("login_option=")) redirectUri += "?login_option=github";
+
+  const resp = await fetch(`${KIRO_AUTH_GATEWAY_BASE}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": GITHUB_SOCIAL_USER_AGENT },
+    body: JSON.stringify({ code, code_verifier: session.codeVerifier || "", redirect_uri: redirectUri }),
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`token exchange failed (HTTP ${resp.status}): ${text.slice(0, 300)}`);
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error("parse token exchange response failed"); }
+
+  await dropGitHubSession(env, sessions, sessionId);
+  return saveGitHubAccount(data, env, request, "github_portal@kiro.dev");
 }
 
 async function startIamSsoLogin(startUrl, region = DEFAULT_REGION, env, request = null) {
