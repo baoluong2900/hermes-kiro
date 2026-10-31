@@ -72,7 +72,8 @@ export const __internals = {
   streamOpenAIResponse, streamClaudeResponse,
   nonStreamOpenAIResponse, nonStreamClaudeResponse,
   EmptyUpstreamResponse,
-  buildOpenAIKiroPayload, shortenToolName,
+  buildOpenAIKiroPayload, shortenToolName, buildClaudeUserInputMessage,
+  buildClaudeKiroPayload, normalizeUpstreamFailure,
 };
 `);
   return (await import(file)).__internals;
@@ -517,6 +518,28 @@ test("a replayed assistant tool_call keeps the name the spec used (bug 4)", () =
   assert.equal(replayed.name, specName);
 });
 
+// Symptom guarded: a tool-continuation turn carried content "." next to its
+// structured toolResults, a placeholder sitting between the call and its
+// result. The Kiro client sends content "" there.
+test("a tool-continuation turn sends content \"\" with structured results", () => {
+  const payload = W.buildOpenAIKiroPayload({
+    model: "claude-sonnet-5",
+    tools: [{ type: "function", function: { name: "get_weather", description: "d", parameters: { type: "object" } } }],
+    messages: [
+      { role: "user", content: "weather in Hanoi?" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Hanoi"}' } }] },
+      { role: "tool", tool_call_id: "call_1", content: "31C" },
+    ],
+  }, "claude-sonnet-5", false);
+  const cur = payload.conversationState.currentMessage.userInputMessage;
+  assert.equal(cur.content, "");
+  assert.equal(cur.userInputMessageContext.toolResults.length, 1);
+
+  const claude = W.buildClaudeUserInputMessage([{ type: "tool_result", toolUseId: "toolu_1", text: "31C" }], "claude-sonnet-5");
+  assert.equal(claude.content, "");
+  assert.equal(W.buildClaudeUserInputMessage([], "claude-sonnet-5").content, ".");
+});
+
 test("a replayed tool_call name is shortened the same way the spec is (bug 4)", () => {
   const longName = "mcp__some_really_long_server_name__doTheThingWithAVeryLongSuffix";
   const padded = longName + "_padded_out_beyond_sixty_four_characters";
@@ -534,4 +557,44 @@ test("a replayed tool_call name is shortened the same way the spec is (bug 4)", 
   const assistantTurn = payload.conversationState.history.find((h) => h.assistantResponseMessage);
   assert.equal(assistantTurn.assistantResponseMessage.toolUses[0].name, specName);
   assert.ok(specName.length <= 64);
+});
+
+// Symptom guarded: content over 350K chars was split into fake user turns, each
+// answered by an invented "Acknowledged part i/n. Please continue." assistant
+// turn, and an upstream overflow made the gateway drop half the history and
+// retry. Requests now travel whole, and an overflow is reported to the client.
+test("large content is sent whole: no split turns, no compaction", () => {
+  const big = "x".repeat(1_000_000);
+  const result = "r".repeat(500_000);
+  for (const payload of [
+    W.buildOpenAIKiroPayload({
+      model: "claude-sonnet-5",
+      tools: [{ type: "function", function: { name: "read", description: "d", parameters: { type: "object" } } }],
+      messages: [
+        { role: "system", content: big },
+        { role: "user", content: big },
+        { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_1", content: result },
+      ],
+    }, "claude-sonnet-5", false),
+    W.buildClaudeKiroPayload({
+      model: "claude-sonnet-5",
+      system: big,
+      messages: [{ role: "user", content: big }, { role: "assistant", content: "ok" }, { role: "user", content: big }],
+    }, "claude-sonnet-5", false),
+  ]) {
+    const body = JSON.stringify(payload);
+    assert.ok(!body.includes("Acknowledged part"), "fake acknowledgement turns were injected");
+    assert.ok(!body.includes("compacted"), "history was compacted");
+    for (const h of payload.conversationState.history) {
+      const c = h.userInputMessage?.content;
+      if (typeof c === "string" && c.startsWith("x")) assert.equal(c.length >= 1_000_000, true, "a user turn was split");
+    }
+  }
+});
+
+test("an upstream overflow is reported with the wording clients compact on", () => {
+  const failure = W.normalizeUpstreamFailure(400, '{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}');
+  assert.equal(failure.status, 400);
+  assert.match(failure.message, /^prompt is too long/);
 });

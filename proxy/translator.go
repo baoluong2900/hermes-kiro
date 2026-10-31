@@ -276,6 +276,33 @@ type ClaudeUsage struct {
 
 // ==================== Claude -> Kiro 转换 ====================
 
+// buildCurrentMessageContent shapes the current user message's content field.
+//
+// The real Kiro client sends content:"" on a tool-continuation turn: the tool
+// output lives only in the structured toolResults. Writing it into content as
+// "Tool results:\n\n..." as well sent every tool output upstream twice and
+// modelled tool activity as prose for the model to imitate.
+//
+// The "." fallback is reserved for a degenerate final user turn (no text, no
+// images, no tool results). It is never used on a tool turn, where an injected
+// "." would sit between a tool call and its result.
+func buildCurrentMessageContent(text string, images []KiroImage, toolResults []KiroToolResult, structuredToolResults bool) string {
+	switch {
+	case strings.TrimSpace(text) != "":
+		return text
+	case len(images) > 0:
+		return normalizeUserContent("", true)
+	case structuredToolResults:
+		return ""
+	case len(toolResults) > 0:
+		// Orphaned results (their tool call is gone, e.g. context compaction
+		// dropped it). They cannot be sent structurally, so narrate them.
+		return buildToolResultsContinuation(toolResults)
+	default:
+		return minimalFallbackUserContent
+	}
+}
+
 func ClaudeToKiro(req *ClaudeRequest) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
@@ -372,16 +399,7 @@ func ClaudeToKiro(req *ClaudeRequest) *KiroPayload {
 	}
 
 	// 构建最终内容
-	finalContent := ""
-	if currentContent != "" {
-		finalContent = currentContent
-	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
-	} else if len(currentToolResults) > 0 {
-		finalContent = buildToolResultsContinuation(currentToolResults)
-	} else {
-		finalContent = minimalFallbackUserContent
-	}
+	finalContent := buildCurrentMessageContent(currentContent, currentImages, currentToolResults, keepCurrentToolResults)
 
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
@@ -1633,16 +1651,7 @@ func OpenAIToKiro(req *OpenAIRequest) *KiroPayload {
 	}
 
 	// 构建最终内容
-	finalContent := currentContent
-	if finalContent == "" {
-		if len(currentImages) > 0 {
-			finalContent = normalizeUserContent("", true)
-		} else if len(currentToolResults) > 0 {
-			finalContent = buildToolResultsContinuation(currentToolResults)
-		} else {
-			finalContent = minimalFallbackUserContent
-		}
-	}
+	finalContent := buildCurrentMessageContent(currentContent, currentImages, currentToolResults, keepCurrentToolResults)
 
 	// 转换工具
 	kiroTools := convertOpenAITools(req.Tools)

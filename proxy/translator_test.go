@@ -284,7 +284,10 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	}
 }
 
-func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
+// Symptom guarded: on a tool-continuation turn the tool output was sent twice,
+// once structured in toolResults and once as "Tool results:" prose in content.
+// The Kiro client sends content:"" there; the structured results carry the turn.
+func TestToolContinuationSendsEmptyContentWithStructuredResults(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
 		Messages: []OpenAIMessage{
@@ -301,14 +304,48 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req)
-	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
-
-	if !strings.Contains(content, toolResultsContinuationPrefix) {
-		t.Fatalf("expected tool continuation prefix, got %q", content)
+	cur := OpenAIToKiro(req).ConversationState.CurrentMessage.UserInputMessage
+	if cur.Content != "" {
+		t.Fatalf("tool continuation content must be empty, got %q", cur.Content)
 	}
-	if !strings.Contains(content, "result-1") {
-		t.Fatalf("expected tool result text in continuation content, got %q", content)
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 ||
+		cur.UserInputMessageContext.ToolResults[0].Content[0].Text != "result-1" {
+		t.Fatalf("tool result must travel structured, got %+v", cur.UserInputMessageContext)
+	}
+
+	claude := ClaudeToKiro(&ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "find data"},
+			{Role: "assistant", Content: []interface{}{map[string]interface{}{
+				"type": "tool_use", "id": "toolu_1", "name": "fetch", "input": map[string]interface{}{},
+			}}},
+			{Role: "user", Content: []interface{}{map[string]interface{}{
+				"type": "tool_result", "tool_use_id": "toolu_1", "content": "result-1",
+			}}},
+		},
+	}).ConversationState.CurrentMessage.UserInputMessage
+	if claude.Content != "" || len(claude.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("claude tool continuation: content=%q results=%+v", claude.Content, claude.UserInputMessageContext)
+	}
+}
+
+// Results whose tool call is gone (client compaction dropped it) cannot be sent
+// structurally, so they are the one case still narrated into content.
+func TestOrphanedToolResultsAreNarratedIntoContent(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "find data"},
+			{Role: "tool", ToolCallID: "call_gone", Content: "result-1"},
+		},
+	}
+	cur := OpenAIToKiro(req).ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(cur.Content, toolResultsContinuationPrefix) || !strings.Contains(cur.Content, "result-1") {
+		t.Fatalf("orphaned tool output lost, got %q", cur.Content)
+	}
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		t.Fatalf("orphaned results must not be sent structurally")
 	}
 }
 

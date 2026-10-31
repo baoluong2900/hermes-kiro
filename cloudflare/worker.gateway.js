@@ -238,8 +238,11 @@ function isTransientModelRejection(status, text) {
 
 const CONTENT_LENGTH_EXCEEDED_PATTERNS = /content_length_exceeds_threshold|input content length exceeds threshold|content length exceeds|content_length_exceeded|input is too long|input too long|payload too large|request entity too large|content too large|exceeds maximum allowed size|exceeds single-turn threshold/i;
 
+// Mirrors Anthropic's wording ("prompt is too long: ...") because clients such
+// as Claude Code pattern-match it to compact their own context and retry. The
+// gateway never trims or splits the request itself (same as Go).
 const CONTENT_LENGTH_EXCEEDED_MESSAGE =
-  "Input content length exceeds Kiro's single-turn threshold (~350k chars). The gateway automatically chunks text, but this request exceeded upstream limits. Please try running /compact or starting a new session.";
+  "prompt is too long: exceeds the maximum input tokens for this model";
 
 function isContentLengthExceeded(status, text) {
   const s = extractErrorString(text);
@@ -5731,17 +5734,6 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
         let errText = await upstreamResp.text();
         lastError = new Error(`HTTP ${upstreamResp.status}: ${errText.slice(0, 300)}`);
 
-        if (isContentLengthExceeded(upstreamResp.status, errText) && !payload.__contentLengthRetried) {
-          payload.__contentLengthRetried = true;
-          compactPayloadOnContentLengthOverflow(payload);
-          routing = await callKiroWithAccountResilience(env, account, payload, requestedKiroModel);
-          upstreamResp = withReleaseOnBodyEnd(routing.response, routing.release);
-          if (!upstreamResp.ok) {
-            errText = await upstreamResp.text();
-            lastError = new Error(`HTTP ${upstreamResp.status}: ${errText.slice(0, 300)}`);
-          }
-        }
-
         if (!upstreamResp.ok) {
           if (shouldTryNextAccount(upstreamResp.status, errText)) {
             lastFailure = selectPoolFailure(lastFailure, accountRoutingFailure(routing, upstreamResp, errText, account));
@@ -5889,96 +5881,6 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
     apiKey: keyDisplayName, ip: clientIp, startTime, inputTokens: estimateInputTokens(body),
   });
   return jsonResponse({ error: { message: failMessage, type: openaiErrorType(failStatus) } }, failStatus, { ...cors, ...failHeaders });
-}
-
-// Maximum characters in a single Kiro text block / content string (~350k chars / ~90k tokens).
-// Kiro's validator enforces a per-content block length threshold on individual strings
-// (throwing CONTENT_LENGTH_EXCEEDS_THRESHOLD if a single content block exceeds ~1MB).
-// However, Kiro fully supports 1M context across multiple conversation turns and blocks.
-// Chunking large single blocks preserves 100% of the input text with zero content loss.
-const MAX_KIRO_CONTENT_BLOCK_LEN = 350_000;
-
-function splitContentIntoChunks(str, chunkSize = MAX_KIRO_CONTENT_BLOCK_LEN) {
-  if (str === null || str === undefined) return [""];
-  const s = typeof str === "string" ? str : String(str);
-  if (s.length <= chunkSize) return [s];
-  const chunks = [];
-  for (let i = 0; i < s.length; i += chunkSize) {
-    chunks.push(s.slice(i, i + chunkSize));
-  }
-  return chunks;
-}
-
-function pushChunkedUserMessage(history, uim, modelId) {
-  if (typeof uim === "string") {
-    uim = { content: uim, origin: "KIRO_CLI", modelId: modelId || DEFAULT_MODEL };
-  }
-  const content = uim?.content || "";
-  if (content.length <= MAX_KIRO_CONTENT_BLOCK_LEN) {
-    history.push({ userInputMessage: uim });
-    return;
-  }
-  const chunks = splitContentIntoChunks(content, MAX_KIRO_CONTENT_BLOCK_LEN);
-  for (let i = 0; i < chunks.length; i++) {
-    const isLast = i === chunks.length - 1;
-    const chunkUim = {
-      content: chunks[i],
-      origin: uim?.origin || "KIRO_CLI",
-      modelId: modelId || uim?.modelId || DEFAULT_MODEL,
-    };
-    if (isLast && uim?.userInputMessageContext) {
-      chunkUim.userInputMessageContext = uim.userInputMessageContext;
-    }
-    history.push({ userInputMessage: chunkUim });
-    if (!isLast) {
-      history.push({
-        assistantResponseMessage: {
-          content: `Acknowledged part ${i + 1}/${chunks.length}. Please continue.`,
-        },
-      });
-    }
-  }
-}
-
-function compactPayloadOnContentLengthOverflow(payload) {
-  if (!payload || !payload.conversationState) return;
-  const cs = payload.conversationState;
-  const history = cs.history;
-  if (!Array.isArray(history) || history.length === 0) {
-    const cur = cs.currentMessage?.userInputMessage;
-    if (cur && typeof cur.content === "string" && cur.content.length > 200_000) {
-      const chunks = splitContentIntoChunks(cur.content, 200_000);
-      cs.history = [];
-      for (let i = 0; i < chunks.length - 1; i++) {
-        cs.history.push({
-          userInputMessage: { content: chunks[i], origin: "KIRO_CLI", modelId: cur.modelId || "auto" },
-        });
-        cs.history.push({
-          assistantResponseMessage: { content: `Acknowledged part ${i + 1}/${chunks.length}. Please continue.` },
-        });
-      }
-      cur.content = chunks[chunks.length - 1];
-    }
-    return;
-  }
-
-  // Preserve recent history while compacting older turns
-  const keepTurns = Math.max(4, Math.floor(history.length / 2));
-  let tail = history.slice(history.length - keepTurns);
-  while (tail.length > 0 && tail[0].assistantResponseMessage) {
-    tail.shift();
-  }
-
-  const modelId = cs.currentMessage?.userInputMessage?.modelId || "auto";
-  const placeholder = {
-    userInputMessage: {
-      content: "[Earlier conversation history was compacted to fit upstream threshold.]",
-      origin: "KIRO_CLI",
-      modelId,
-    },
-  };
-
-  cs.history = [placeholder, ...tail];
 }
 
 function collectToolResultIDs(toolResults) {
@@ -6168,7 +6070,7 @@ function buildOpenAIKiroPayload(input, model, thinking) {
     pendingContent = "";
     pendingToolResults = [];
     if (targetHistory) {
-      pushChunkedUserMessage(targetHistory, uim, modelId);
+      targetHistory.push({ userInputMessage: uim });
     }
     return uim;
   }
@@ -6184,11 +6086,10 @@ function buildOpenAIKiroPayload(input, model, thinking) {
       pendingContent += (pendingContent ? "\n" : "") + uText;
     } else if (m.role === "tool") {
       const rawText = flattenContent(m.content);
-      const chunks = splitContentIntoChunks(rawText, MAX_KIRO_CONTENT_BLOCK_LEN);
       pendingToolResults.push({
         toolUseId: normalizeToolUseId(m.tool_call_id || m.toolCallId),
         status: "success",
-        content: chunks.map((c) => ({ text: c })),
+        content: [{ text: rawText }],
       });
     } else if (m.role === "assistant") {
       if (pendingContent || pendingToolResults.length > 0) {
@@ -6234,26 +6135,11 @@ function buildOpenAIKiroPayload(input, model, thinking) {
   const curUIM = flushUser();
   // Use the same neutral placeholder now and when this turn enters history.
   // Changing an empty current turn to "." only on replay breaks the prefix.
-  if (!curUIM.content || !curUIM.content.trim()) curUIM.content = ".";
-  if (curUIM && typeof curUIM.content === "string" && curUIM.content.length > MAX_KIRO_CONTENT_BLOCK_LEN) {
-    const chunks = splitContentIntoChunks(curUIM.content, MAX_KIRO_CONTENT_BLOCK_LEN);
-    for (let i = 0; i < chunks.length - 1; i++) {
-      history.push({
-        userInputMessage: {
-          content: chunks[i],
-          origin: "KIRO_CLI",
-          modelId,
-        },
-      });
-      history.push({
-        assistantResponseMessage: {
-          content: `Acknowledged part ${i + 1}/${chunks.length}. Please continue.`,
-        },
-      });
-    }
-    curUIM.content = chunks[chunks.length - 1];
+  // A tool-continuation turn keeps content "" like the Kiro client (and Go
+  // buildCurrentMessageContent): the structured toolResults carry the turn.
+  if ((!curUIM.content || !curUIM.content.trim()) && !(curUIM.userInputMessageContext?.toolResults?.length > 0)) {
+    curUIM.content = ".";
   }
-
   if (Array.isArray(input.tools) && input.tools.length > 0) {
     if (!curUIM.userInputMessageContext) curUIM.userInputMessageContext = {};
     curUIM.userInputMessageContext.tools = convertTools(input.tools);
@@ -6370,17 +6256,6 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
       if (!upstreamResp.ok) {
         let errText = await upstreamResp.text();
         lastError = new Error(`HTTP ${upstreamResp.status}: ${errText.slice(0, 300)}`);
-
-        if (isContentLengthExceeded(upstreamResp.status, errText) && !payload.__contentLengthRetried) {
-          payload.__contentLengthRetried = true;
-          compactPayloadOnContentLengthOverflow(payload);
-          routing = await callKiroWithAccountResilience(env, account, payload, requestedKiroModel);
-          upstreamResp = withReleaseOnBodyEnd(routing.response, routing.release);
-          if (!upstreamResp.ok) {
-            errText = await upstreamResp.text();
-            lastError = new Error(`HTTP ${upstreamResp.status}: ${errText.slice(0, 300)}`);
-          }
-        }
 
         if (!upstreamResp.ok) {
           if (shouldTryNextAccount(upstreamResp.status, errText)) {
@@ -6594,12 +6469,10 @@ function buildClaudeUserInputMessage(blocks, modelId) {
     if (b.type === "text") {
       text += (text ? "\n" : "") + b.text;
     } else if (b.type === "tool_result") {
-      const rawText = b.text || "";
-      const chunks = splitContentIntoChunks(rawText, MAX_KIRO_CONTENT_BLOCK_LEN);
       toolResults.push({
         toolUseId: b.toolUseId,
         status: b.status || "success",
-        content: chunks.map((chunk) => ({ text: chunk })),
+        content: [{ text: b.text || "" }],
       });
     }
   }
@@ -6610,7 +6483,9 @@ function buildClaudeUserInputMessage(blocks, modelId) {
   }
 
   return {
-    content: text && text.trim() ? text : ".",
+    // Tool-result turns keep content "" (results travel structured); "." is
+    // only for a turn that carries nothing at all.
+    content: text && text.trim() ? text : (toolResults.length > 0 ? "" : "."),
     origin: "KIRO_CLI",
     modelId,
     userInputMessageContext: ctx,
@@ -6688,21 +6563,18 @@ function buildClaudeKiroPayload(input, model, thinking) {
 
   // Dedicated system prompt priming turns in history
   if (systemText && systemText.trim()) {
-    const systemChunks = splitContentIntoChunks(systemText.trim(), MAX_KIRO_CONTENT_BLOCK_LEN);
-    for (const chunk of systemChunks) {
-      history.push({
-        userInputMessage: {
-          content: chunk,
-          origin: "KIRO_CLI",
-          modelId,
-        },
-      });
-      history.push({
-        assistantResponseMessage: {
-          content: "I will follow these instructions.",
-        },
-      });
-    }
+    history.push({
+      userInputMessage: {
+        content: systemText.trim(),
+        origin: "KIRO_CLI",
+        modelId,
+      },
+    });
+    history.push({
+      assistantResponseMessage: {
+        content: "I will follow these instructions.",
+      },
+    });
   }
 
   const histMsgs = [...messages];
@@ -6712,7 +6584,7 @@ function buildClaudeKiroPayload(input, model, thinking) {
     const blocks = parseAnthropicBlocks(m.content);
     if (m.role === "user") {
       const uim = buildClaudeUserInputMessage(blocks, modelId);
-      pushChunkedUserMessage(history, uim, modelId);
+      history.push({ userInputMessage: uim });
     } else if (m.role === "assistant") {
       history.push({ assistantResponseMessage: buildClaudeAssistantMessage(blocks) });
     }
@@ -6726,25 +6598,6 @@ function buildClaudeKiroPayload(input, model, thinking) {
     curUIM = buildClaudeUserInputMessage([], modelId);
   } else {
     curUIM = buildClaudeUserInputMessage(curBlocks, modelId);
-  }
-
-  if (curUIM && typeof curUIM.content === "string" && curUIM.content.length > MAX_KIRO_CONTENT_BLOCK_LEN) {
-    const chunks = splitContentIntoChunks(curUIM.content, MAX_KIRO_CONTENT_BLOCK_LEN);
-    for (let i = 0; i < chunks.length - 1; i++) {
-      history.push({
-        userInputMessage: {
-          content: chunks[i],
-          origin: "KIRO_CLI",
-          modelId,
-        },
-      });
-      history.push({
-        assistantResponseMessage: {
-          content: `Acknowledged part ${i + 1}/${chunks.length}. Please continue.`,
-        },
-      });
-    }
-    curUIM.content = chunks[chunks.length - 1];
   }
 
   if (Array.isArray(input.tools) && input.tools.length > 0) {
