@@ -57,7 +57,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			if account != nil {
 				accountID = account.ID
 			}
-			h.recordFailureWithDuration("claude", req.Model, accountID, err, time.Since(reqStart).Milliseconds())
+			h.recordFailureWithDuration(w, "claude", req.Model, accountID, err, time.Since(reqStart).Milliseconds())
 			status := 502
 			errType := "api_error"
 			if isAuthErrorMessage(err.Error()) {
@@ -83,7 +83,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses)
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
-				h.recordFailureWithDuration("claude", req.Model, lastAccountID, searchErr, time.Since(reqStart).Milliseconds())
+				h.recordFailureWithDuration(w, "claude", req.Model, lastAccountID, searchErr, time.Since(reqStart).Milliseconds())
 				setRetryAfterHeader(w, searchErr)
 				h.sendClaudeError(w, upstreamErrorHTTPStatus(searchErr), "api_error", "Web search failed: "+searchErr.Error())
 				return
@@ -108,7 +108,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input))
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
-				h.recordFailureWithDuration("claude", req.Model, lastAccountID, sErr, time.Since(reqStart).Milliseconds())
+				h.recordFailureWithDuration(w, "claude", req.Model, lastAccountID, sErr, time.Since(reqStart).Milliseconds())
 				setRetryAfterHeader(w, sErr)
 				h.sendClaudeError(w, upstreamErrorHTTPStatus(sErr), "api_error", "Web search failed: "+sErr.Error())
 				return
@@ -130,7 +130,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			h.pool.UpdateStats(lastAccountID, inputTokens+outputTokens, totalCredits)
 		}
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits)
-		h.recordSuccessLog("claude", req.Model, lastAccountID, inputTokens+outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog(w, "claude", req.Model, lastAccountID, inputTokens, outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
 
 		if req.Stream {
 			h.renderWebSearchLoopSSE(w, req.Model, content, stopReason, inputTokens, outputTokens)

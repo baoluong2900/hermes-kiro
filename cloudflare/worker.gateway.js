@@ -22,18 +22,29 @@ const THINKING_SUFFIX = "-thinking";
 const KIRO_USER_AGENT = "aws-sdk-js/1.0.0 ua/2.1 os/macos#15.3.1 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-0.11.107";
 const KIRO_AMZ_USER_AGENT = "aws-sdk-js/1.0.0 KiroIDE-0.11.107";
 
-// Published catalog. Only Opus 5 / 4.8 / 4.7, Sonnet 5 and the GPT-5.6 tiers are
-// offered; Claude 4.6 / 4.5 / 4 / 3.x and the GLM / DeepSeek / Qwen / MiniMax
-// entries were retired. Legacy names still resolve through MODEL_ALIASES and
-// mapKiroModel so existing clients keep working, they are just not advertised.
+// Published catalog. Live upstream ids verified by metered probes on
+// 2026-10-22: Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / 4.5, Sonnet 5.5 / 5 / 4.6 / 4.5,
+// Haiku 4.5 and the GPT-5.6 tiers all answer. Claude 4 / 4.1 / 3.x and the
+// GLM / DeepSeek / Qwen / MiniMax entries are retired (INVALID_MODEL_ID).
+//
+// Pricing matters here: a client that asks for opus-4.6 or haiku-4.5 must get
+// exactly that model. Folding "retired" ids onto a newer sibling silently
+// upgraded every such request to a model Kiro meters at 1.4x–3x the credits
+// (same 9k-token prompt: opus-4.6 0.225 Cr vs opus-4.7 0.326 Cr; haiku-4.5
+// 0.005 Cr vs sonnet-5 0.015 Cr).
 const VALID_KIRO_MODELS = new Set([
   "auto",
   "claude-opus-5.5",
   "claude-opus-5",
   "claude-opus-4.8",
   "claude-opus-4.7",
+  "claude-opus-4.6",
+  "claude-opus-4.5",
   "claude-sonnet-5.5",
   "claude-sonnet-5",
+  "claude-sonnet-4.6",
+  "claude-sonnet-4.5",
+  "claude-haiku-4.5",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
@@ -51,10 +62,19 @@ const FALLBACK_MODELS = [
   "claude-opus-4.8-thinking",
   "claude-opus-4.7",
   "claude-opus-4.7-thinking",
+  "claude-opus-4.6",
+  "claude-opus-4.6-thinking",
+  "claude-opus-4.5",
+  "claude-opus-4.5-thinking",
   "claude-sonnet-5.5",
   "claude-sonnet-5.5-thinking",
   "claude-sonnet-5",
   "claude-sonnet-5-thinking",
+  "claude-sonnet-4.6",
+  "claude-sonnet-4.6-thinking",
+  "claude-sonnet-4.5",
+  "claude-sonnet-4.5-thinking",
+  "claude-haiku-4.5",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
@@ -111,25 +131,25 @@ const MODEL_ALIASES = new Map([
   ["opus5", "claude-opus-5"],
   ["claude-opus", "claude-opus-5"],
   ["opus", "claude-opus-5"],
-  ["claude-sonnet-4.6", "claude-sonnet-5"],
-  ["claude-sonnet-4-6", "claude-sonnet-5"],
-  ["claude-sonnet-4.5", "claude-sonnet-5"],
-  ["claude-sonnet-4-5", "claude-sonnet-5"],
-  ["claude-sonnet-4", "claude-sonnet-5"],
-  ["claude-opus-4.6", "claude-opus-4.7"],
-  ["claude-opus-4-6", "claude-opus-4.7"],
-  ["claude-opus-4.5", "claude-opus-4.7"],
-  ["claude-opus-4-5", "claude-opus-4.7"],
-  ["claude-haiku-4.5", "claude-sonnet-5"],
-  ["claude-haiku-4-5", "claude-sonnet-5"],
+  ["claude-sonnet-4.6", "claude-sonnet-4.6"],
+  ["claude-sonnet-4-6", "claude-sonnet-4.6"],
+  ["claude-sonnet-4.5", "claude-sonnet-4.5"],
+  ["claude-sonnet-4-5", "claude-sonnet-4.5"],
+  ["claude-sonnet-4", "claude-sonnet-4.5"],
+  ["claude-opus-4.6", "claude-opus-4.6"],
+  ["claude-opus-4-6", "claude-opus-4.6"],
+  ["claude-opus-4.5", "claude-opus-4.5"],
+  ["claude-opus-4-5", "claude-opus-4.5"],
+  ["claude-haiku-4.5", "claude-haiku-4.5"],
+  ["claude-haiku-4-5", "claude-haiku-4.5"],
   ["claude-3-7-sonnet", "claude-sonnet-5"],
   ["claude-3-7-sonnet-20250219", "claude-sonnet-5"],
   ["claude-3-5-sonnet", "claude-sonnet-5"],
   ["claude-3-5-sonnet-20241022", "claude-sonnet-5"],
   ["claude-3-5-sonnet-20240620", "claude-sonnet-5"],
-  ["claude-3-5-haiku", "claude-sonnet-5"],
-  ["claude-3-5-haiku-20241022", "claude-sonnet-5"],
-  ["claude-3-haiku", "claude-sonnet-5"],
+  ["claude-3-5-haiku", "claude-haiku-4.5"],
+  ["claude-3-5-haiku-20241022", "claude-haiku-4.5"],
+  ["claude-3-haiku", "claude-haiku-4.5"],
   ["claude-3-opus", "claude-opus-4.7"],
   ["claude-3-opus-20240229", "claude-opus-4.7"],
   ["claude-3-sonnet", "claude-sonnet-5"],
@@ -247,8 +267,14 @@ function isContentLengthExceeded(status, text) {
 // client error, abandoned every remaining account, and answered 429 while the
 // rest of the pool sat idle — the failure the client reports as
 // "Retry failed: rate_limit_error".
+//
+// 402 is upstream's "this credential is out of credits/overage". It is per
+// credential, and sequential routing pins traffic to the first account until it
+// runs dry — while its stored usageCurrent is only as fresh as the last quota
+// refresh. Failing fast on 402 would strand every request on the drained
+// account instead of moving on to the next one.
 function shouldTryNextAccount(status, text) {
-  return RETRYABLE_STATUSES.has(status) || isTransientModelRejection(status, text);
+  return RETRYABLE_STATUSES.has(status) || status === 402 || isTransientModelRejection(status, text);
 }
 
 // A throttle that outlived the retry ramp is still a throttle. Passing upstream's
@@ -296,28 +322,17 @@ function sleep(ms) {
 //             `model-gate:<account identity>`), holding a permit until the
 //             Response body reaches EOF/cancel/error, with stale leases that
 //             self-expire so a crashed worker cannot deadlock a slot.
-//   Layer 2 — a bounded, de-duped fallback chain plus a per-account+model
-//             cooldown recorded in the same DO, triggered ONLY by
-//             INVALID_MODEL_ID (never a genuine 4xx).
+//   Layer 2 — a per-account+model cooldown recorded in the same DO, triggered
+//             ONLY by INVALID_MODEL_ID (never a genuine 4xx). There is NO
+//             model fallback: a throttled model is reported to the client.
 // ---------------------------------------------------------------------------
 
-// Ordered fallback targets per requested model. The requested model itself is
-// always tried first (prepended by resolveFallbackCandidates), so these lists
-// only name the alternatives. Every alternative must be a live model id that
-// mapKiroModel can emit. Chains are shallow on purpose: one premium demotion to
-// Sonnet, then a GPT tier, so a throttled Opus degrades to something that
-// answers rather than marching through every model.
-const MODEL_FALLBACK_CHAIN = {
-  "claude-opus-5.5": ["claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-opus-5": ["claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-opus-4.8": ["claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-opus-4.7": ["claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-sonnet-5": ["gpt-5.6-sol"],
-  "auto": ["gpt-5.6-sol", "claude-sonnet-5"],
-  "gpt-5.6-sol": ["claude-sonnet-5"],
-  "gpt-5.6-terra": ["gpt-5.6-sol", "claude-sonnet-5"],
-  "gpt-5.6-luna": ["gpt-5.6-sol", "claude-sonnet-5"],
-};
+// No model substitution. The client's model is the only candidate: when Kiro
+// throttles or rejects it, the error is normalized and returned to the client.
+// Silent fallback used to re-route a throttled Opus onto a different model
+// (including gpt-5.6-sol, metered 3–6x higher) and bill the client for a model
+// it never asked for. Operator decision 2026-10-22: a model error is an error.
+const MODEL_FALLBACK_CHAIN = {};
 
 // Requested model first, then its fallbacks, de-duped so no candidate repeats
 // and the chain can never cycle back to an already-tried model.
@@ -441,6 +456,9 @@ async function acquireModelPermit(env, account, model, opts = {}) {
     // Fail open only when the DO control plane itself is unavailable. A real
     // gate denial has ok:false and must be observed rather than bypassed.
     if (result === null) return { ok: true, release: async () => {} };
+    if (result.cooledDown) {
+      return { ok: false, kind: "local_cooldown", waitMs: Math.max(0, Number(result.cooldownMs) || Number(result.waitMs) || 0) };
+    }
     if (result.ok && result.leaseId) {
       const leaseId = result.leaseId;
       let released = false;
@@ -762,7 +780,76 @@ function rebuildPayloadWithModel(payload, modelId) {
 //   sleep(ms)                     -> pollable sleep (injected for tests)
 //   onTokenRefresh()              -> reactive 401/403 refresh; returns truthy to
 //                                    retry the SAME candidate under the SAME permit
-// Returns { response, requestedModel, actualModel, fallbackApplied }.
+// The client-facing answer when every candidate was refused. Exactly one of
+// these causes is an upstream event. The other two are this gateway declining
+// to call upstream at all, and reporting either of them as "Kiro throttled
+// this model" is a false report: it sends the operator hunting a phantom
+// upstream rate limit for requests upstream never received, and it tells the
+// client to back off from a model that is perfectly healthy.
+//
+// Keep the status 429 in every case — the client's correct action is the same
+// (retry later) — but label the cause so the response body and the request log
+// say which of the two it was.
+function modelExhaustionFailure(cause) {
+  if (cause.kind === "upstream_throttle") {
+    const norm = normalizeUpstreamFailure(cause.status, cause.text);
+    return { ...norm, kind: cause.kind };
+  }
+  if (cause.kind === "local_admission") {
+    return {
+      status: 429,
+      kind: cause.kind,
+      message: `Gateway admission limit reached for ${cause.model || "this model"} on this account (local concurrency gate, not an upstream Kiro throttle — upstream was not called). Lower concurrency or retry in a few seconds.`,
+      headers: { "Retry-After": "2" },
+    };
+  }
+  if (cause.kind === "local_cooldown") {
+    return {
+      status: 429,
+      kind: cause.kind,
+      message: `Kiro throttled ${cause.model || "this model"} moments ago; the gateway is holding that model for a short cooldown and did not call upstream again. Retry shortly.`,
+      headers: { "Retry-After": "2" },
+    };
+  }
+  // Missing diagnostic evidence must never be invented as an upstream rejection.
+  return {
+    status: 429,
+    kind: "unknown",
+    message: "The requested model is temporarily unavailable; the gateway could not determine whether the cause was admission pressure or an upstream failure. Retry shortly.",
+    headers: { "Retry-After": "3" },
+  };
+}
+
+// Retain the evidence and originating account across the entire pool walk.
+// A later local skip must not replace an observed upstream failure, and raw
+// HTTP failures must keep their status and retry hint instead of becoming 502.
+function accountRoutingFailure(routing, response, text, account) {
+  const normalized = routing.failure || normalizeUpstreamFailure(response.status, text);
+  const headers = { ...normalized.headers };
+  const retryAfter = response.headers.get("Retry-After");
+  if (retryAfter) headers["Retry-After"] = retryAfter;
+  return {
+    ...normalized,
+    headers,
+    kind: normalized.kind || (isTransientModelRejection(response.status, text) ? "upstream_throttle" : "upstream_http"),
+    accountId: account.id,
+    account: account.email || account.id,
+  };
+}
+
+function selectPoolFailure(previous, next) {
+  if (!previous) return next;
+  const observedUpstream = (failure) => String(failure.kind || "").startsWith("upstream_");
+  if (observedUpstream(previous) && !observedUpstream(next)) return previous;
+  return next;
+}
+
+// Returns { response, requestedModel, actualModel, fallbackApplied, release,
+//           failure } where `failure` is the normalized { status, message,
+//           headers, kind } the pool-exhaustion path should report. It is only
+//           present when every candidate was refused, and it is the authority
+//           on what happened — the dispatch loops must prefer it over
+//           re-deriving a cause from the response body text.
 async function callKiroResilient(opts) {
   const {
     requestedModel,
@@ -776,23 +863,41 @@ async function callKiroResilient(opts) {
   } = opts;
 
   const candidates = resolveFallbackCandidates(requestedModel);
-  let lastThrottle = null; // { status, text } from the most recent INVALID_MODEL_ID
+  let lastThrottle = null;  // { status, text } a REAL upstream INVALID_MODEL_ID
+  let lastAdmission = null; // { model, waitMs } this gateway's own gate refused
+  let lastCooldown = null;  // { model } a real throttle is still being deferred
   let lastEmpty = null;    // internal 503 raised by bounded event-stream preflight
 
   for (const model of candidates) {
     // Skip a model that is actively cooling down; consult BEFORE any upstream
     // call so a known-throttled model costs nothing.
-    if (isCooledDown && (await isCooledDown(model))) continue;
+    if (isCooledDown && (await isCooledDown(model))) {
+      // The cooldown is the memory of a real upstream rejection, so a throttle
+      // is the honest cause — but record it as a deferral, not a fresh
+      // rejection, so the exhaustion path can say the gateway held back.
+      lastCooldown = { model };
+      continue;
+    }
 
     // One permit per candidate attempt. A reactive token refresh is an inner
     // retry of the SAME attempt and must reuse this single permit.
     const permit = acquire ? await acquire(model) : { ok: true, release: async () => {} };
     if (!permit || !permit.ok) {
-      // Local admission pressure is not an upstream INVALID_MODEL_ID signal.
-      // Demote this request to a lighter candidate, but do not poison the model
-      // cooldown for every later request — only a real upstream rejection may
-      // write cooldown state.
-      lastThrottle = { status: 400, text: JSON.stringify({ reason: "INVALID_MODEL_ID" }) };
+      // Cooldown may have started while this request waited behind a lease.
+      if (permit?.kind === "local_cooldown") {
+        lastCooldown = { model, waitMs: permit.waitMs };
+        continue;
+      }
+      // Local admission pressure is NOT an upstream INVALID_MODEL_ID signal.
+      // Recording it as one is what made this gateway answer "Kiro throttled
+      // this model (upstream reported INVALID_MODEL_ID)" for a request upstream
+      // never saw: the premium gate allows one in-flight call per credential
+      // with 1.2s spacing, so a client firing more than ~25 concurrent Opus
+      // requests simply exhausts the 30s admission budget. Reproduced live —
+      // 8 of 30 concurrent opus-4.6(low) requests failed this way after
+      // exactly 2 x 30s with zero upstream calls. Keep the cause separate so
+      // the exhaustion path can report the truth.
+      lastAdmission = { model, waitMs: permit && permit.waitMs };
       continue;
     }
 
@@ -866,16 +971,30 @@ async function callKiroResilient(opts) {
       requestedModel,
       actualModel: null,
       fallbackApplied: true,
+      failure: {
+        status: 503,
+        message: "Kiro returned empty responses for every model candidate",
+        headers: { "Retry-After": "3" },
+        kind: "upstream_empty",
+      },
       release: async () => {},
     };
   }
 
+  // Every candidate was refused. Name the cause instead of assuming the worst:
+  // a real upstream INVALID_MODEL_ID outranks the local refusals, because it is
+  // the only one that actually came from Kiro.
+  const cause = lastThrottle
+    ? { kind: "upstream_throttle", status: lastThrottle.status, text: lastThrottle.text }
+    : lastAdmission
+      ? { kind: "local_admission", model: lastAdmission.model, waitMs: lastAdmission.waitMs }
+      : lastCooldown
+        ? { kind: "local_cooldown", model: lastCooldown.model }
+        : { kind: "unknown" };
+
   // Every candidate was throttled or skipped: normalize to a 429 the client can
   // obey, never a raw 400.
-  const norm = normalizeUpstreamFailure(
-    lastThrottle ? lastThrottle.status : 400,
-    lastThrottle ? lastThrottle.text : JSON.stringify({ reason: "INVALID_MODEL_ID" }),
-  );
+  const norm = modelExhaustionFailure(cause);
   return {
     response: jsonResponse(
       { error: { message: norm.message, type: "rate_limit_error" } },
@@ -885,6 +1004,7 @@ async function callKiroResilient(opts) {
     requestedModel,
     actualModel: null,
     fallbackApplied: true,
+    failure: norm,
     release: async () => {},
   };
 }
@@ -945,8 +1065,11 @@ export class ApiKeyQuota {
     return { keys, initializedNow: true };
   }
 
-  async saveApiKeyCatalog(keys) {
-    await this.state.storage.put({ catalog: keys, catalogInitialized: true });
+  async saveApiKeyCatalog(keys, usageRequestIds = null) {
+    const values = { catalog: keys, catalogInitialized: true };
+    if (usageRequestIds) values.catalogUsageRequestIds = usageRequestIds;
+    // Counter changes and replay markers must commit together.
+    await this.state.storage.put(values);
   }
 
   // Holds are kept as dated entries rather than one running total so a leaked
@@ -1155,6 +1278,8 @@ export class ApiKeyQuota {
     }
 
     if (url.pathname.startsWith("/catalog/")) {
+      const previous = this.catalogQueue || Promise.resolve();
+      const task = previous.catch(() => {}).then(async () => {
       const loaded = await this.loadApiKeyCatalog(body.seed);
       if (!loaded) {
         return jsonResponse({ ok: false, error: "API key catalog is not initialized" }, 409);
@@ -1190,6 +1315,7 @@ export class ApiKeyQuota {
       let entry = null;
       let removed = null;
       let details = {};
+      let usageRequestIds = null;
 
       if (action === "list") {
         if (Array.isArray(body.seed)) {
@@ -1261,14 +1387,26 @@ export class ApiKeyQuota {
         const idx = findIndex(String(body.id || ""));
         if (idx >= 0) {
           entry = keys[idx];
-          details = applyApiKeyUsage(entry, body.usage || {});
-          changed = true;
+          const requestId = typeof body.usage?.requestId === "string" ? body.usage.requestId.trim() : "";
+          const stored = requestId ? await this.state.storage.get("catalogUsageRequestIds") : null;
+          usageRequestIds = requestId ? (Array.isArray(stored) ? stored : []) : null;
+          const marker = JSON.stringify([entry.id, requestId]);
+          if (requestId && usageRequestIds.includes(marker)) {
+            details = { duplicate: true, creditsUsed: Number(entry.creditsUsed ?? entry.credits) || 0 };
+          } else {
+            details = applyApiKeyUsage(entry, body.usage || {});
+            if (requestId) {
+              usageRequestIds.push(marker);
+              if (usageRequestIds.length > SETTLED_ID_LIMIT) usageRequestIds.splice(0, usageRequestIds.length - SETTLED_ID_LIMIT);
+            }
+            changed = true;
+          }
         }
       } else {
         return jsonResponse({ ok: false, error: "Unknown API key catalog action" }, 404);
       }
 
-      if (changed) await this.saveApiKeyCatalog(keys);
+      if (changed) await this.saveApiKeyCatalog(keys, usageRequestIds);
       return jsonResponse({
         ok: true,
         keys,
@@ -1278,6 +1416,9 @@ export class ApiKeyQuota {
         initialized: loaded.initializedNow,
         changed,
       });
+      });
+      this.catalogQueue = task.then(() => {}, () => {});
+      return task;
     }
 
     const storedUsed = Number(await this.state.storage.get("used")) || 0;
@@ -1478,6 +1619,13 @@ export class ApiKeyQuota {
       const policy = modelGatePolicy(model);
 
       if (url.pathname === "/model-gate/acquire") {
+        // Recheck under the same DO operation as lease admission: a queued
+        // caller may have observed status before another request was rejected.
+        if (gate.cooldownUntilMs > now) {
+          await this.state.storage.put(key, gate);
+          const cooldownMs = gate.cooldownUntilMs - now;
+          return jsonResponse({ ok: false, cooledDown: true, cooldownMs, waitMs: cooldownMs });
+        }
         // Concurrency and request-start rate are separate upstream limits. A
         // free slot is not enough: every grant must also respect start spacing,
         // otherwise two non-premium slots open in the same millisecond and
@@ -2610,6 +2758,7 @@ async function recordRequestStats(env, ctx, isSuccess, tokensIn = 0, tokensOut =
         const current = keys.find((item) => item.id === apiKeyId || item.key === apiKeyId);
         if (current) {
           const usage = {
+            requestId: requestId || normalizedLogEntry?.id || "",
             tokensIn: Number(tokensIn) || 0,
             tokensOut: Number(tokensOut) || 0,
             credits: Number(credits) || 0,
@@ -2641,7 +2790,7 @@ async function recordRequestStats(env, ctx, isSuccess, tokensIn = 0, tokensOut =
           if (updated && usageDetails && Number(updated.creditsUsed) > Number(usageDetails.settledCredits)) {
             await pushApiKeyLiveUsage(env, apiKeyId, {}, null, Number(updated.creditsUsed) || 0);
           }
-          if (updated) {
+          if (updated && !usageDetails?.duplicate) {
             await incrementPeerOverlay(env, current.id, {
               credits: Number(credits) || 0,
               requests: 1,
@@ -3366,6 +3515,7 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
     if (!acc) return jsonResponse({ ok: false, success: false, error: "Account not found" }, 404, cors);
 
     try {
+      const before = `${acc.accessToken}|${acc.refreshToken}|${acc.profileArn}`;
       const quota = await fetchAccountUsageLimits(acc);
       if (quota.ok) {
         acc.usageCurrent = quota.usageCurrent;
@@ -3375,6 +3525,11 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
         if (quota.email) acc.email = quota.email;
         await setKV(env, "config:accounts", accounts, request);
         return jsonResponse({ ok: true, success: true, account: toAccountView(acc) }, 200, cors);
+      }
+      // A refresh may have rotated the refresh token before the quota call
+      // failed; dropping it would strand the account on a dead credential.
+      if (`${acc.accessToken}|${acc.refreshToken}|${acc.profileArn}` !== before) {
+        await setKV(env, "config:accounts", accounts, request);
       }
       return jsonResponse({ ok: false, success: false, error: quota.error || "Failed to fetch quota" }, 200, cors);
     } catch (e) {
@@ -3959,7 +4114,8 @@ async function handleAdminAPI(request, env, ctx, path, cors) {
           email: String(body.email || nickname || (existingIdx >= 0 ? accounts[existingIdx].email : "") || id).trim(),
           userId: String(body.userId || "").trim(),
           nickname,
-          authMethod: authMethodHint === "idc" ? "idc" : "social",
+          authMethod: authMethodHint === "idc" ||
+            (String(body.clientId || "").trim() && String(body.clientSecret || "").trim()) ? "idc" : "social",
           provider: String(body.provider || "").trim(),
           region: preferredRegion,
           accessToken,
@@ -4298,10 +4454,10 @@ async function syncKiroModels(env, request = null) {
   return { ok: true, models: defaults };
 }
 
-async function fetchKiroProfileArn(accessToken) {
+async function fetchKiroProfileArn(accessToken, region = DEFAULT_REGION) {
   if (!accessToken) return null;
   try {
-    const resp = await fetch("https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles", {
+    const resp = await fetch(`${codewhispererRestBase(region)}/ListAvailableProfiles`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -4324,7 +4480,7 @@ async function probeAccount(acc, modelId = "auto") {
     const isApiKey = acc.authMethod === "api_key" || String(acc.accessToken || "").startsWith("ksk_");
 
     if (!isApiKey && !acc.profileArn && acc.accessToken) {
-      acc.profileArn = await fetchKiroProfileArn(acc.accessToken);
+      acc.profileArn = await fetchKiroProfileArn(acc.accessToken, region);
       if (acc.profileArn) acc.hasProfileArn = true;
     }
 
@@ -4395,7 +4551,11 @@ async function probeAccount(acc, modelId = "auto") {
       onAssistantChunk(txt) { textContent += txt; },
     });
 
-    const reply = textContent.trim() || "ok";
+    // A successful HTTP status alone does not prove the model answered.
+    const reply = textContent.trim();
+    if (!reply) {
+      return { ok: false, error: "Kiro returned no assistant text for the account probe; an empty response is not a successful model check" };
+    }
     return { ok: true, reply };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -4566,6 +4726,77 @@ async function refreshSocialAccountCredential(acc) {
   }
 }
 
+function parseUsageLimitsPayload(data) {
+  let usageCurrent = 0;
+  let usageLimit = 0;
+  if (Array.isArray(data?.usageBreakdownList)) {
+    const breakdown = data.usageBreakdownList.find((b) => b.resourceType === "AGENTIC_REQUEST") || data.usageBreakdownList[0];
+    if (breakdown) {
+      usageCurrent = breakdown.currentUsage || 0;
+      usageLimit = breakdown.usageLimit || 0;
+    }
+  }
+  return {
+    ok: true,
+    usageCurrent,
+    usageLimit,
+    nextResetUnix: Number(data?.nextDateReset || 0),
+    plan: data?.subscriptionInfo ? (data.subscriptionInfo.subscriptionTitle || data.subscriptionInfo.type || "") : "",
+    email: data?.userInfo?.email || "",
+  };
+}
+
+// codewhispererRestBase mirrors the Go server's regionalizeURL: us-east-1 keeps
+// the codewhisperer host, every other region is served from q.{region}.
+function codewhispererRestBase(region) {
+  const r = String(region || DEFAULT_REGION).trim().toLowerCase();
+  if (!r || r === "us-east-1" || !/^[a-z]{2}(-[a-z]+)+-\d$/.test(r)) {
+    return "https://codewhisperer.us-east-1.amazonaws.com";
+  }
+  return `https://q.${r}.amazonaws.com`;
+}
+
+// fetchUsageLimitsByProfile is the KIRO_CLI management call; it requires a profileArn.
+async function fetchUsageLimitsByProfile(acc, region) {
+  const resp = await fetch(`https://management.${region}.kiro.dev/`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-amz-json-1.0",
+      "X-Amz-Target": "AmazonCodeWhispererService.GetUsageLimits",
+      "Authorization": `Bearer ${acc.accessToken}`,
+    },
+    body: JSON.stringify({ origin: "KIRO_CLI", profileArn: acc.profileArn }),
+  });
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    return { ok: false, status: resp.status, error: `HTTP ${resp.status}: ${errTxt.slice(0, 200)}` };
+  }
+  return parseUsageLimitsPayload(await resp.json());
+}
+
+// fetchUsageLimitsRest is the IDE REST call. AWS Builder ID accounts have no
+// Kiro profile (ListAvailableProfiles answers 403 "AWS Builder ID is not
+// supported"), and this endpoint serves them without one — same as the Go
+// server's ensureRestProfileArn soft path.
+async function fetchUsageLimitsRest(acc, region) {
+  let url = `${codewhispererRestBase(region)}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true`;
+  if (acc.profileArn) url += `&profileArn=${encodeURIComponent(acc.profileArn)}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${acc.accessToken}`,
+      "User-Agent": "aws-sdk-js/1.0.18 KiroAPIProxy",
+      "x-amz-user-agent": "aws-sdk-js/1.0.18 KiroAPIProxy",
+    },
+  });
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    return { ok: false, status: resp.status, error: `HTTP ${resp.status}: ${errTxt.slice(0, 200)}` };
+  }
+  return parseUsageLimitsPayload(await resp.json());
+}
+
 async function fetchAccountUsageLimits(acc) {
   const isApiKey = acc.authMethod === "api_key" || String(acc.accessToken || "").startsWith("ksk_");
   const region = acc.region || DEFAULT_REGION;
@@ -4574,55 +4805,59 @@ async function fetchAccountUsageLimits(acc) {
     return probeKiroApiKey(acc.accessToken, region);
   }
 
-  if (!String(acc.profileArn || "").trim()) {
-    if (String(acc.authMethod || "").toLowerCase() === "social") {
-      const refreshed = await refreshSocialAccountCredential(acc);
-      if (!refreshed.ok) return refreshed;
-    }
-    if (!String(acc.profileArn || "").trim()) {
-      return { ok: false, error: "OAuth account is missing profileArn; sign in to Kiro again and export a fresh JSON file" };
-    }
-  }
+  const isSocial = String(acc.authMethod || "").toLowerCase() === "social";
+  let refreshed = false;
+  const renew = async () => {
+    const r = await refreshAccountCredential(acc);
+    if (r.ok) refreshed = true;
+    return r;
+  };
 
   try {
-    const host = `management.${region}.kiro.dev`;
-    const resp = await fetch(`https://${host}/`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-amz-json-1.0",
-        "X-Amz-Target": "AmazonCodeWhispererService.GetUsageLimits",
-        "Authorization": `Bearer ${acc.accessToken}`,
-      },
-      body: JSON.stringify({ origin: "KIRO_CLI", profileArn: acc.profileArn }),
-    });
-
-    if (!resp.ok) {
-      const errTxt = await resp.text();
-      return { ok: false, error: `HTTP ${resp.status}: ${errTxt.slice(0, 200)}` };
+    // An imported JSON is usually hours old; with an expired bearer every lookup
+    // below fails, so renew first when the stored expiry says so (or is unknown
+    // and there is no access token at all).
+    const expiresAt = Number(acc.expiresAt || acc.tokenExpires || 0);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!acc.accessToken || (expiresAt && nowSec >= expiresAt - TOKEN_REFRESH_SKEW_SECONDS)) {
+      const r = await renew();
+      if (!r.ok) return r;
     }
 
-    const data = await resp.json();
-    let usageCurrent = 0;
-    let usageLimit = 0;
-    if (Array.isArray(data.usageBreakdownList)) {
-      const breakdown = data.usageBreakdownList.find((b) => b.resourceType === "AGENTIC_REQUEST") || data.usageBreakdownList[0];
-      if (breakdown) {
-        usageCurrent = breakdown.currentUsage || 0;
-        usageLimit = breakdown.usageLimit || 0;
+    // Resolve a missing profileArn. Kiro IDE exports for Builder ID / IdC never
+    // carry one, and the social refresh endpoint only sometimes returns it.
+    if (!String(acc.profileArn || "").trim()) {
+      if (isSocial && !refreshed) {
+        const r = await renew();
+        if (!r.ok) return r;
       }
+      if (!String(acc.profileArn || "").trim()) {
+        const arn = await fetchKiroProfileArn(acc.accessToken, region);
+        if (arn) acc.profileArn = arn;
+      }
+      if (!String(acc.profileArn || "").trim() && isSocial) {
+        // Kiro desktop social logins (Google/GitHub) share one service profile.
+        acc.profileArn = GITHUB_DEFAULT_PROFILE_ARN;
+      }
+      if (acc.profileArn) acc.hasProfileArn = true;
     }
-    const nextResetUnix = Number(data.nextDateReset || 0);
-    const plan = data.subscriptionInfo ? (data.subscriptionInfo.subscriptionTitle || data.subscriptionInfo.type || "") : "";
-    const email = data.userInfo ? data.userInfo.email : "";
 
-    return {
-      ok: true,
-      usageCurrent,
-      usageLimit,
-      nextResetUnix,
-      plan,
-      email,
-    };
+    const query = () => (acc.profileArn ? fetchUsageLimitsByProfile(acc, region) : fetchUsageLimitsRest(acc, region));
+    let result = await query();
+
+    // Unknown expiry + rejected bearer: renew once and retry.
+    if (!result.ok && (result.status === 401 || result.status === 403) && !refreshed) {
+      const r = await renew();
+      if (r.ok) result = await query();
+    }
+    // A profile-scoped lookup that still fails can fall back to the REST call.
+    if (!result.ok && acc.profileArn) {
+      const rest = await fetchUsageLimitsRest(acc, region);
+      if (rest.ok) result = rest;
+    }
+
+    if (!result.ok) return { ok: false, error: result.error };
+    return result;
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -5302,10 +5537,88 @@ async function generateCodeChallenge(verifier) {
 
 // ==================== OpenAI Chat Completions & Translation ====================
 
+// 9router-style request overrides travel inside the model id:
+//   "kr/claude-opus-4.6(low)"              -> provider prefix + effort suffix
+//   "claude-opus-5.5-thinking-agentic(low)" -> synthetic -thinking/-agentic tags
+// None of these exist upstream. Strip them so the real id resolves exactly
+// instead of falling through substring heuristics onto a different model.
+const MODEL_EFFORT_SUFFIX = /^(.*)\(([^()]+)\)\s*$/;
+
+function stripModelDecorations(rawModel) {
+  let m = String(rawModel || "").trim();
+  const suffix = m.match(MODEL_EFFORT_SUFFIX);
+  if (suffix) m = suffix[1].trim();
+  const slash = m.lastIndexOf("/");
+  if (slash >= 0 && slash < m.length - 1) m = m.slice(slash + 1);
+  if (m.endsWith("-agentic")) m = m.slice(0, -"-agentic".length);
+  if (m.endsWith("-thinking")) m = m.slice(0, -"-thinking".length);
+  return m;
+}
+
+// Effort the client asked for, from any of the shapes Kiro CLI / 9router
+// accept: the "(low)" model suffix, OpenAI reasoning_effort / reasoning.effort,
+// Claude output_config.effort or thinking.budget_tokens. Returns a normalized
+// level or "" when nothing explicit was requested — the gateway must not
+// invent an effort the client never asked for.
+function requestedEffortLevel(input) {
+  const suffix = String(input?.model || "").match(MODEL_EFFORT_SUFFIX);
+  const candidates = [
+    suffix ? suffix[2] : "",
+    input?.output_config?.effort,
+    input?.reasoning_effort,
+    typeof input?.reasoning === "object" && input.reasoning ? input.reasoning.effort : "",
+  ];
+  for (const raw of candidates) {
+    const level = String(raw || "").trim().toLowerCase();
+    if (!level) continue;
+    if (/^\d+$/.test(level)) return budgetToEffortLevel(Number(level));
+    if (["none", "off", "disabled", "auto"].includes(level)) return "";
+    if (["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(level)) return level;
+    return "";
+  }
+  const thinking = input?.thinking;
+  if (thinking && typeof thinking === "object") {
+    if (thinking.type === "disabled") return "";
+    const budget = Number(thinking.budget_tokens);
+    if (Number.isFinite(budget) && budget > 0) return budgetToEffortLevel(budget);
+  }
+  return "";
+}
+
+// Mirrors 9router's LEVEL_TO_BUDGET thresholds (low 1024, medium 8192, high 24576).
+function budgetToEffortLevel(budget) {
+  if (!(budget > 0)) return "";
+  if (budget <= 1024) return "low";
+  if (budget <= 8192) return "medium";
+  return "high";
+}
+
+// Kiro's schema-specific effort fields, mirroring Kiro CLI buildEffortRequestFields:
+// GPT-5.6 takes `reasoning.effort`; Claude 4.6+ takes `output_config.effort`
+// with adaptive thinking. Claude 4.5 rejected additionalModelRequestFields in
+// 9router's live smoke, so those ids get nothing. Verified live 2026-10-22 that
+// opus-4.6/4.7/4.8/5/5.5, sonnet-5/5.5 and gpt-5.6-sol all accept the field.
+function kiroEffortRequestFields(input, modelId) {
+  const level = requestedEffortLevel(input);
+  if (!level) return null;
+  const id = String(modelId || "").toLowerCase();
+  if (id.startsWith("gpt-5.6")) {
+    const effort = level === "max" || level === "ultra" ? "xhigh" : level === "minimal" ? "low" : level;
+    return { reasoning: { effort } };
+  }
+  const claude = id.match(/^claude-(?:opus|sonnet|haiku)-(\d+)(?:\.(\d+))?$/);
+  if (!claude) return null;
+  const major = Number(claude[1]);
+  const minor = claude[2] === undefined ? null : Number(claude[2]);
+  const supported = major > 4 || (major === 4 && minor !== null && minor >= 6);
+  if (!supported) return null;
+  const effort = level === "minimal" ? "low" : ["xhigh", "max", "ultra"].includes(level) ? "high" : level;
+  return { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort } };
+}
+
 function mapKiroModel(rawModel) {
   if (!rawModel) return "auto";
-  let m = String(rawModel).trim();
-  if (m.endsWith("-thinking")) m = m.slice(0, -"-thinking".length);
+  let m = stripModelDecorations(rawModel);
 
   // 1. Direct Kiro model IDs — pass through
   if (VALID_KIRO_MODELS.has(m)) return m;
@@ -5322,14 +5635,16 @@ function mapKiroModel(rawModel) {
   if (lm.includes("opus-5") || lm.includes("opus 5") || lm.includes("opus5")) return "claude-opus-5";
   if (lm.includes("opus-4.8") || lm.includes("opus-4-8")) return "claude-opus-4.8";
   if (lm.includes("opus-4.7") || lm.includes("opus-4-7")) return "claude-opus-4.7";
-  // Opus 4.6 / 4.5 are retired; fold them onto the oldest Opus still served.
-  if (lm.includes("opus-4.6") || lm.includes("opus-4-6")) return "claude-opus-4.7";
-  if (lm.includes("opus-4.5") || lm.includes("opus-4-5")) return "claude-opus-4.7";
+  // Opus 4.6 / 4.5 are still served and cheaper than 4.7 — never upgrade them.
+  if (lm.includes("opus-4.6") || lm.includes("opus-4-6")) return "claude-opus-4.6";
+  if (lm.includes("opus-4.5") || lm.includes("opus-4-5")) return "claude-opus-4.5";
   if (lm.includes("opus")) return "claude-opus-5";
 
-  // Every retired Sonnet / Haiku generation resolves to Sonnet 5.
+  if (lm.includes("sonnet-4.6") || lm.includes("sonnet-4-6")) return "claude-sonnet-4.6";
+  if (lm.includes("sonnet-4.5") || lm.includes("sonnet-4-5")) return "claude-sonnet-4.5";
   if (lm.includes("sonnet")) return "claude-sonnet-5";
-  if (lm.includes("haiku")) return "claude-sonnet-5";
+  // Haiku 4.5 is live and the cheapest Claude tier; 3.x Haiku names land there.
+  if (lm.includes("haiku")) return "claude-haiku-4.5";
 
   if (lm.startsWith("gpt-5.6-sol")) return "gpt-5.6-sol";
   if (lm.startsWith("gpt-5.6-terra")) return "gpt-5.6-terra";
@@ -5376,7 +5691,8 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
   const requestId = crypto.randomUUID();
 
   const [accounts, settings] = await Promise.all([getAccounts(env), getSettings(env)]);
-  const candidates = pickCandidates(accounts, env, settings);
+  const affinity = kiroRoutingAffinity(request, body, apiKeyId, model);
+  const candidates = pickCandidates(accounts, env, settings, affinity);
   if (candidates.length === 0) {
     // See handleClaudeMessages: free, but it still has to be visible.
     await finishFailedRequest(env, ctx, {
@@ -5390,15 +5706,19 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
   }
 
   let lastError = null;
-  // Set only for an INVALID_MODEL_ID throttle, so the exhaustion path can answer
-  // with the normalized 429 + Retry-After instead of upstream's misleading 400.
+  // Preserve structured evidence across accounts; local skips cannot erase an
+  // upstream result or its original account attribution.
   let lastFailure = null;
   // Credits upstream already metered on attempts that then failed. Owed even
   // though no response reached the client.
   let owedCredits = 0;
   let lastAccount = null;
+  // Every credential this request walked, so an exhausted pool is not logged
+  // as if the last account had been the only one tried.
+  const attemptedAccountIds = [];
   for (const account of candidates) {
     lastAccount = account;
+    attemptedAccountIds.push(account.id);
     try {
       const payload = buildOpenAIKiroPayload(body, model, thinking);
       const requestedKiroModel = mapKiroModel(model);
@@ -5424,22 +5744,7 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
 
         if (!upstreamResp.ok) {
           if (shouldTryNextAccount(upstreamResp.status, errText)) {
-            // Carry the normalized throttle forward so the exhaustion path can
-            // answer with 429 + Retry-After instead of upstream's misleading 400.
-            if (isTransientModelRejection(upstreamResp.status, errText)) {
-              lastFailure = normalizeUpstreamFailure(upstreamResp.status, errText);
-            } else if (upstreamResp.status === 429 && routing.actualModel === null) {
-              // callKiroResilient already exhausted every model candidate for this
-              // credential. Preserve its normalized semantics while still letting
-              // the outer loop try another account when the pool has one.
-              lastFailure = normalizeUpstreamFailure(400, errText);
-            } else if (upstreamResp.status === 503 && routing.actualModel === null) {
-              lastFailure = {
-                status: 503,
-                message: "Kiro returned empty responses for every model candidate",
-                headers: { "Retry-After": "3" },
-              };
-            }
+            lastFailure = selectPoolFailure(lastFailure, accountRoutingFailure(routing, upstreamResp, errText, account));
             continue;
           }
           const failure = normalizeUpstreamFailure(upstreamResp.status, errText);
@@ -5461,7 +5766,7 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
 
       const estInTokens = estimateInputTokens(body);
       if (isStream) {
-        const clientResponse = streamOpenAIResponse(upstreamResp, rawModel, cors, async (credits, tokens, isSuccess, inTokens = 0) => {
+        const clientResponse = streamOpenAIResponse(upstreamResp, rawModel, cors, async (credits, tokens, isSuccess, inTokens = 0, streamError = null) => {
           // Upstream counts when it reported them. The local estimate is kept
           // but flagged, so the dashboard never presents a guess as a
           // measurement. `finalOut` used to fall back to a hardcoded 30, which
@@ -5489,7 +5794,10 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
             endpoint: "/v1/chat/completions",
             model: rawModel,
             status: isSuccess ? "success" : "error",
-            statusCode: isSuccess ? 200 : 500,
+            statusCode: isSuccess ? 200 : (streamError?.statusCode || 500),
+            error: streamError?.message || "",
+            actualModel: routing.actualModel,
+            retryCredits: owedCredits,
             credits: finalCredits,
             metered: finalCredits > 0,
             tokensEstimated,
@@ -5502,11 +5810,11 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
             durationMs: Date.now() - startTime,
             kind: "openai",
           }, apiKeyId, account.id, rawModel, settled?.used, requestId);
-        }, ctx);
+        }, ctx, { estimatedInputTokens: estInTokens, includeUsage: body.stream_options?.include_usage === true });
         return addModelRoutingHeaders(clientResponse, rawModel, routing.actualModel, routing.fallbackApplied);
       }
 
-      const nonStreamRes = await nonStreamOpenAIResponse(upstreamResp, rawModel, cors);
+      const nonStreamRes = await nonStreamOpenAIResponse(upstreamResp, rawModel, cors, { estimatedInputTokens: estInTokens });
       const tokensEstimated = !(nonStreamRes.inputTokens > 0);
       const finalIn = nonStreamRes.inputTokens > 0 ? nonStreamRes.inputTokens : estInTokens;
       const finalOut = nonStreamRes.outputTokens > 0 ? nonStreamRes.outputTokens : (nonStreamRes.tokens || 0);
@@ -5527,6 +5835,8 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
         model: rawModel,
         status: "success",
         statusCode: 200,
+        actualModel: routing.actualModel,
+        retryCredits: owedCredits,
         credits: finalCredits,
         metered: finalCredits > 0,
         tokensEstimated,
@@ -5543,6 +5853,11 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
       return addModelRoutingHeaders(nonStreamRes.response, rawModel, routing.actualModel, routing.fallbackApplied);
     } catch (err) {
       lastError = err;
+      lastFailure = selectPoolFailure(lastFailure, {
+        status: upstreamErrorStatus(err), message: upstreamErrorMessage(err), headers: {},
+        kind: err instanceof KiroUpstreamException && err.isModelThrottle ? "upstream_throttle" : "upstream_error",
+        accountId: account.id, account: account.email || account.id,
+      });
       // Whatever upstream metered before it failed is already owed.
       owedCredits += partialCreditsOf(err);
       // See handleClaudeMessages: a self-inflicted rejection is not worth
@@ -5566,9 +5881,11 @@ async function handleOpenAIChat(request, env, ctx, cors, apiKeyId) {
   const failHeaders = lastFailure ? lastFailure.headers : {};
   await finishFailedRequest(env, ctx, {
     apiKeyId, reservation, requestId, owedCredits, status: failStatus, message: failMessage,
+    failureKind: lastFailure ? lastFailure.kind : undefined,
     endpoint: "/v1/chat/completions", kind: "openai", model: rawModel,
-    account: lastAccount ? (lastAccount.email || lastAccount.id) : "",
-    accountId: lastAccount ? lastAccount.id : "",
+    account: lastFailure ? lastFailure.account : (lastAccount ? (lastAccount.email || lastAccount.id) : ""),
+    accountId: lastFailure ? lastFailure.accountId : (lastAccount ? lastAccount.id : ""),
+    attemptedAccountIds,
     apiKey: keyDisplayName, ip: clientIp, startTime, inputTokens: estimateInputTokens(body),
   });
   return jsonResponse({ error: { message: failMessage, type: openaiErrorType(failStatus) } }, failStatus, { ...cors, ...failHeaders });
@@ -5673,16 +5990,19 @@ function collectToolResultIDs(toolResults) {
   return ids;
 }
 
+function toolUsesMatchResultIDs(toolUses, resultIDs) {
+  if (!Array.isArray(toolUses) || toolUses.length === 0 || !resultIDs || toolUses.length !== resultIDs.size) return false;
+  const seen = new Set();
+  return toolUses.every((call) => {
+    if (!call?.toolUseId || !call.name || seen.has(call.toolUseId) || !resultIDs.has(call.toolUseId)) return false;
+    seen.add(call.toolUseId);
+    return true;
+  });
+}
+
 function currentToolResultsMatchLastAssistant(history, currentToolResultIDs) {
-  if (!currentToolResultIDs || currentToolResultIDs.size === 0) return false;
   if (!Array.isArray(history) || history.length === 0) return false;
-  const last = history[history.length - 1];
-  const arm = last && last.assistantResponseMessage;
-  if (!arm || !Array.isArray(arm.toolUses) || arm.toolUses.length === 0) return false;
-  for (const tu of arm.toolUses) {
-    if (!currentToolResultIDs.has(tu.toolUseId)) return false;
-  }
-  return true;
+  return toolUsesMatchResultIDs(history[history.length - 1]?.assistantResponseMessage?.toolUses, currentToolResultIDs);
 }
 
 function stripPollutedToolCallText(content) {
@@ -5720,8 +6040,9 @@ function narrateToolResults(toolResults, names) {
   return "Tool results:\n\n" + parts.join("\n\n");
 }
 
-function sanitizeKiroHistory(history, currentToolResultIDs) {
+function sanitizeKiroHistory(history, currentToolResultIDs, toolSpecs = []) {
   if (!Array.isArray(history) || history.length === 0) return history;
+  const specNames = new Set(toolSpecs.map((spec) => spec?.toolSpecification?.name).filter(Boolean));
 
   const toolNames = new Map();
   for (const turn of history) {
@@ -5735,27 +6056,30 @@ function sanitizeKiroHistory(history, currentToolResultIDs) {
     }
   }
 
-  let activeIdx = -1;
-  if (currentToolResultIDs && currentToolResultIDs.size > 0) {
-    const last = history[history.length - 1];
-    const arm = last && last.assistantResponseMessage;
-    if (arm && Array.isArray(arm.toolUses) && arm.toolUses.length > 0) {
-      let allCovered = true;
-      for (const tu of arm.toolUses) {
-        if (!currentToolResultIDs.has(tu.toolUseId)) {
-          allCovered = false;
-          break;
-        }
-      }
-      if (allCovered) {
-        activeIdx = history.length - 1;
-      }
+  // Keep complete adjacent tool exchanges structured. Rewriting a previously
+  // current tool result into prose on the next request changes the cached
+  // prefix and loses the call arguments. Only damaged/orphaned pairs need the
+  // legacy narration fallback (for example after client-side compaction).
+  const pairedAssistants = new Set();
+  const pairedUsers = new Set();
+  const usedToolIDs = new Set();
+  for (let i = 0; i < history.length; i++) {
+    const calls = history[i]?.assistantResponseMessage?.toolUses;
+    const results = history[i + 1]?.userInputMessage?.userInputMessageContext?.toolResults || [];
+    const resultIDs = i === history.length - 1 ? currentToolResultIDs : collectToolResultIDs(results);
+    if (toolUsesMatchResultIDs(calls, resultIDs) &&
+        (i === history.length - 1 || (results.length === resultIDs.size && calls.every((call) => specNames.has(call.name)))) &&
+        calls.every((call) => !usedToolIDs.has(call.toolUseId))) {
+      pairedAssistants.add(i);
+      if (i + 1 < history.length) pairedUsers.add(i + 1);
+      for (const call of calls) usedToolIDs.add(call.toolUseId);
     }
-  } else if (history.length > 0) {
-    const last = history[history.length - 1];
-    if (last && last.assistantResponseMessage && Array.isArray(last.assistantResponseMessage.toolUses) && last.assistantResponseMessage.toolUses.length > 0) {
-      activeIdx = history.length - 1;
-    }
+  }
+
+  // Preserve the existing assistant-prefill behaviour when no results were
+  // supplied. This is not a completed historical tool exchange.
+  if (!currentToolResultIDs?.size && history[history.length - 1]?.assistantResponseMessage?.toolUses?.length) {
+    pairedAssistants.add(history.length - 1);
   }
 
   for (let i = 0; i < history.length; i++) {
@@ -5766,7 +6090,7 @@ function sanitizeKiroHistory(history, currentToolResultIDs) {
         arm.content = stripPollutedToolCallText(arm.content);
       }
       if (Array.isArray(arm.toolUses) && arm.toolUses.length > 0) {
-        if (i !== activeIdx) {
+        if (!pairedAssistants.has(i)) {
           delete arm.toolUses;
         }
       }
@@ -5775,7 +6099,7 @@ function sanitizeKiroHistory(history, currentToolResultIDs) {
     const uim = turn && turn.userInputMessage;
     if (uim && uim.userInputMessageContext) {
       const ctx = uim.userInputMessageContext;
-      if (Array.isArray(ctx.toolResults) && ctx.toolResults.length > 0) {
+      if (Array.isArray(ctx.toolResults) && ctx.toolResults.length > 0 && !pairedUsers.has(i)) {
         const narrated = narrateToolResults(ctx.toolResults, toolNames);
         uim.content = joinHistoryText(uim.content, narrated);
         delete ctx.toolResults;
@@ -5862,7 +6186,7 @@ function buildOpenAIKiroPayload(input, model, thinking) {
       const rawText = flattenContent(m.content);
       const chunks = splitContentIntoChunks(rawText, MAX_KIRO_CONTENT_BLOCK_LEN);
       pendingToolResults.push({
-        toolUseId: m.tool_call_id || m.toolCallId || "",
+        toolUseId: normalizeToolUseId(m.tool_call_id || m.toolCallId),
         status: "success",
         content: chunks.map((c) => ({ text: c })),
       });
@@ -5880,7 +6204,7 @@ function buildOpenAIKiroPayload(input, model, thinking) {
             } catch {}
           }
           return {
-            toolUseId: tc.id || `toolu_${crypto.randomUUID().slice(0, 10)}`,
+            toolUseId: normalizeToolUseId(tc.id) || `toolu_${crypto.randomUUID().slice(0, 10)}`,
             // Verbatim, matching the Go reference (translator.go:1282). The
             // OpenAI tool specs go out through convertTools, which only
             // shortens names and never camelCases them. Sanitizing here turned
@@ -5892,11 +6216,25 @@ function buildOpenAIKiroPayload(input, model, thinking) {
           };
         });
       }
+      // Echo prior native thinking back when the client preserved both halves.
+      // An unsigned reasoning_content is dropped: the upstream rejects
+      // reasoning it cannot verify.
+      if (typeof m.signature === "string" && m.signature) {
+        arm.reasoningContent = {
+          reasoningText: {
+            text: typeof m.reasoning_content === "string" ? m.reasoning_content : "",
+            signature: m.signature,
+          },
+        };
+      }
       history.push({ assistantResponseMessage: arm });
     }
   }
 
   const curUIM = flushUser();
+  // Use the same neutral placeholder now and when this turn enters history.
+  // Changing an empty current turn to "." only on replay breaks the prefix.
+  if (!curUIM.content || !curUIM.content.trim()) curUIM.content = ".";
   if (curUIM && typeof curUIM.content === "string" && curUIM.content.length > MAX_KIRO_CONTENT_BLOCK_LEN) {
     const chunks = splitContentIntoChunks(curUIM.content, MAX_KIRO_CONTENT_BLOCK_LEN);
     for (let i = 0; i < chunks.length - 1; i++) {
@@ -5921,12 +6259,22 @@ function buildOpenAIKiroPayload(input, model, thinking) {
     curUIM.userInputMessageContext.tools = convertTools(input.tools);
   }
 
-  const currentToolResultIDs = collectToolResultIDs(curUIM?.userInputMessageContext?.toolResults);
+  const currentResults = curUIM?.userInputMessageContext?.toolResults || [];
+  const currentToolResultIDs = collectToolResultIDs(currentResults);
   const keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs);
+  // A Set alone hides duplicate results. Reject malformed active exchanges
+  // locally instead of spending upstream calls on an unanswerable tool pair.
+  if (currentResults.length > 0 && (currentResults.length !== currentToolResultIDs.size || !keepCurrentToolResults ||
+      !history[history.length - 1]?.assistantResponseMessage?.toolUses?.every((call) =>
+        curUIM.userInputMessageContext.tools?.some((spec) => spec.toolSpecification?.name === call.name)))) {
+    throw new KiroUpstreamException("ValidationException", "Current tool results must uniquely match declared tools and the preceding assistant calls");
+  }
 
-  let finalHistory = keepCurrentToolResults
-    ? sanitizeKiroHistory(history, currentToolResultIDs)
-    : sanitizeKiroHistory(history, null);
+  let finalHistory = sanitizeKiroHistory(
+    history,
+    keepCurrentToolResults ? currentToolResultIDs : null,
+    curUIM?.userInputMessageContext?.tools || [],
+  );
 
   if (!keepCurrentToolResults && curUIM && curUIM.userInputMessageContext?.toolResults) {
     const narrated = narrateToolResults(curUIM.userInputMessageContext.toolResults, null);
@@ -5937,6 +6285,7 @@ function buildOpenAIKiroPayload(input, model, thinking) {
     }
   }
 
+  const effortFields = kiroEffortRequestFields(input, modelId);
   return {
     conversationState: {
       conversationId: crypto.randomUUID(),
@@ -5945,6 +6294,7 @@ function buildOpenAIKiroPayload(input, model, thinking) {
       chatTriggerType: "MANUAL",
       agentTaskType: "vibe",
     },
+    ...(effortFields ? { additionalModelRequestFields: effortFields } : {}),
   };
 }
 
@@ -5979,7 +6329,8 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
   const requestId = crypto.randomUUID();
 
   const [accounts, settings] = await Promise.all([getAccounts(env), getSettings(env)]);
-  const candidates = pickCandidates(accounts, env, settings);
+  const affinity = kiroRoutingAffinity(request, body, apiKeyId, model);
+  const candidates = pickCandidates(accounts, env, settings, affinity);
   if (candidates.length === 0) {
     // Nothing was metered, so this costs nothing — but it is still a request the
     // client saw fail, and a failure that leaves no row is a failure nobody can
@@ -5996,15 +6347,19 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
   }
 
   let lastError = null;
-  // Set only for an INVALID_MODEL_ID throttle, so the exhaustion path can answer
-  // with the normalized 429 + Retry-After instead of upstream's misleading 400.
+  // Preserve structured evidence across accounts; local skips cannot erase an
+  // upstream result or its original account attribution.
   let lastFailure = null;
   // Credits upstream already metered on attempts that then failed. Owed even
   // though no response reached the client.
   let owedCredits = 0;
   let lastAccount = null;
+  // Every credential this request walked, so an exhausted pool is not logged
+  // as if the last account had been the only one tried.
+  const attemptedAccountIds = [];
   for (const account of candidates) {
     lastAccount = account;
+    attemptedAccountIds.push(account.id);
     try {
       const payload = buildClaudeKiroPayload(body, model, thinking);
       const requestedKiroModel = mapKiroModel(model);
@@ -6029,18 +6384,7 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
 
         if (!upstreamResp.ok) {
           if (shouldTryNextAccount(upstreamResp.status, errText)) {
-            // Keep the normalized throttle for account-pool exhaustion.
-            if (isTransientModelRejection(upstreamResp.status, errText)) {
-              lastFailure = normalizeUpstreamFailure(upstreamResp.status, errText);
-            } else if (upstreamResp.status === 429 && routing.actualModel === null) {
-              lastFailure = normalizeUpstreamFailure(400, errText);
-            } else if (upstreamResp.status === 503 && routing.actualModel === null) {
-              lastFailure = {
-                status: 503,
-                message: "Kiro returned empty responses for every model candidate",
-                headers: { "Retry-After": "3" },
-              };
-            }
+            lastFailure = selectPoolFailure(lastFailure, accountRoutingFailure(routing, upstreamResp, errText, account));
             continue;
           }
           const failure = normalizeUpstreamFailure(upstreamResp.status, errText);
@@ -6062,7 +6406,7 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
 
       const estInTokens = estimateInputTokens(body);
       if (isStream) {
-        const clientResponse = streamClaudeResponse(upstreamResp, rawModel, cors, async (credits, tokens, isSuccess, inTokens = 0) => {
+        const clientResponse = streamClaudeResponse(upstreamResp, rawModel, cors, async (credits, tokens, isSuccess, inTokens = 0, streamError = null) => {
           // Upstream counts when it reported them. The local estimate is kept
           // but flagged, so the dashboard never presents a guess as a
           // measurement. `finalOut` used to fall back to a hardcoded 30, which
@@ -6090,7 +6434,10 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
             endpoint: "/v1/messages",
             model: rawModel,
             status: isSuccess ? "success" : "error",
-            statusCode: isSuccess ? 200 : 500,
+            statusCode: isSuccess ? 200 : (streamError?.statusCode || 500),
+            error: streamError?.message || "",
+            actualModel: routing.actualModel,
+            retryCredits: owedCredits,
             credits: finalCredits,
             metered: finalCredits > 0,
             tokensEstimated,
@@ -6103,11 +6450,11 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
             durationMs: Date.now() - startTime,
             kind: "anthropic",
           }, apiKeyId, account.id, rawModel, settled?.used, requestId);
-        }, ctx, { tools: body.tools });
+        }, ctx, { tools: body.tools, estimatedInputTokens: estInTokens });
         return addModelRoutingHeaders(clientResponse, rawModel, routing.actualModel, routing.fallbackApplied);
       }
 
-      const nonStreamRes = await nonStreamClaudeResponse(upstreamResp, rawModel, cors, { tools: body.tools });
+      const nonStreamRes = await nonStreamClaudeResponse(upstreamResp, rawModel, cors, { tools: body.tools, estimatedInputTokens: estInTokens });
       const tokensEstimated = !(nonStreamRes.inputTokens > 0);
       const finalIn = nonStreamRes.inputTokens > 0 ? nonStreamRes.inputTokens : estInTokens;
       const finalOut = nonStreamRes.outputTokens > 0 ? nonStreamRes.outputTokens : (nonStreamRes.tokens || 0);
@@ -6128,6 +6475,8 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
         model: rawModel,
         status: "success",
         statusCode: 200,
+        actualModel: routing.actualModel,
+        retryCredits: owedCredits,
         credits: finalCredits,
         metered: finalCredits > 0,
         tokensEstimated,
@@ -6144,6 +6493,11 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
       return addModelRoutingHeaders(nonStreamRes.response, rawModel, routing.actualModel, routing.fallbackApplied);
     } catch (err) {
       lastError = err;
+      lastFailure = selectPoolFailure(lastFailure, {
+        status: upstreamErrorStatus(err), message: upstreamErrorMessage(err), headers: {},
+        kind: err instanceof KiroUpstreamException && err.isModelThrottle ? "upstream_throttle" : "upstream_error",
+        accountId: account.id, account: account.email || account.id,
+      });
       // Whatever upstream metered before it failed is already owed.
       owedCredits += partialCreditsOf(err);
       // A request upstream rejected on its own merits (oversized context, bad
@@ -6169,9 +6523,11 @@ async function handleClaudeMessages(request, env, ctx, cors, apiKeyId) {
   const failHeaders = lastFailure ? lastFailure.headers : {};
   await finishFailedRequest(env, ctx, {
     apiKeyId, reservation, requestId, owedCredits, status: failStatus, message: failMessage,
+    failureKind: lastFailure ? lastFailure.kind : undefined,
     endpoint: "/v1/messages", kind: "anthropic", model: rawModel,
-    account: lastAccount ? (lastAccount.email || lastAccount.id) : "",
-    accountId: lastAccount ? lastAccount.id : "",
+    account: lastFailure ? lastFailure.account : (lastAccount ? (lastAccount.email || lastAccount.id) : ""),
+    accountId: lastFailure ? lastFailure.accountId : (lastAccount ? lastAccount.id : ""),
+    attemptedAccountIds,
     apiKey: keyDisplayName, ip: clientIp, startTime, inputTokens: estimateInputTokens(body),
   });
   return jsonResponse({ type: "error", error: { type: anthropicErrorType(failStatus), message: failMessage } }, failStatus, { ...cors, ...failHeaders });
@@ -6195,6 +6551,19 @@ function parseAnthropicBlocks(content) {
           input: typeof b.input === "object" ? b.input : {},
         };
       }
+      // Reasoning blocks are kept intact: one block, one signature, never
+      // merged with a neighbour. They are what buildClaudeAssistantMessage
+      // echoes back to Kiro as reasoningContent.
+      if (b.type === "thinking") {
+        return {
+          type: "thinking",
+          thinking: typeof b.thinking === "string" ? b.thinking : "",
+          signature: typeof b.signature === "string" ? b.signature : "",
+        };
+      }
+      if (b.type === "redacted_thinking") {
+        return { type: "redacted_thinking", data: typeof b.data === "string" ? b.data : "" };
+      }
       if (b.type === "tool_result") {
         let textContent = "";
         if (typeof b.content === "string") {
@@ -6206,7 +6575,7 @@ function parseAnthropicBlocks(content) {
         }
         return {
           type: "tool_result",
-          toolUseId: b.tool_use_id || b.toolUseId || "",
+          toolUseId: normalizeToolUseId(b.tool_use_id || b.toolUseId),
           status: b.is_error ? "error" : "success",
           text: textContent,
         };
@@ -6241,11 +6610,33 @@ function buildClaudeUserInputMessage(blocks, modelId) {
   }
 
   return {
-    content: text,
+    content: text && text.trim() ? text : ".",
     origin: "KIRO_CLI",
     modelId,
     userInputMessageContext: ctx,
   };
+}
+
+// selectKiroReasoningContent maps a turn's reasoning blocks onto the single
+// reasoningContent slot Kiro's history shape provides. The last block carrying
+// verifiable material wins and is copied verbatim: Anthropic pairs each
+// signature with the text of its own block and verifies the pair, so texts and
+// signatures must never be recombined across blocks.
+//
+// Unsigned thinking is dropped rather than forwarded. The upstream rejects
+// reasoning it cannot verify with HTTP 400 THINKING_SIGNATURE_INVALID, which no
+// retry and no other account can fix, and clients legitimately replay unsigned
+// thinking (we emit it whenever the upstream sent no signature).
+function selectKiroReasoningContent(blocks) {
+  let chosen = null;
+  for (const b of blocks) {
+    if (b.type === "thinking" && typeof b.signature === "string" && b.signature) {
+      chosen = { reasoningText: { text: typeof b.thinking === "string" ? b.thinking : "", signature: b.signature } };
+    } else if (b.type === "redacted_thinking" && typeof b.data === "string" && b.data) {
+      chosen = { redactedContent: b.data };
+    }
+  }
+  return chosen;
 }
 
 function buildClaudeAssistantMessage(blocks) {
@@ -6257,8 +6648,9 @@ function buildClaudeAssistantMessage(blocks) {
       text += (text ? "\n" : "") + b.text;
     } else if (b.type === "tool_use") {
       toolUses.push({
-        toolUseId: b.id,
-        name: b.name,
+        toolUseId: normalizeToolUseId(b.id),
+        // Match the sanitized current tool specification on every replay.
+        name: shortenToolName(sanitizeToolName(b.name)),
         input: b.input || {},
       });
     }
@@ -6267,6 +6659,13 @@ function buildClaudeAssistantMessage(blocks) {
   const arm = { content: text };
   if (toolUses.length > 0) {
     arm.toolUses = toolUses;
+  }
+  // Echo prior native reasoning back to Kiro so adaptive thinking stays
+  // consistent across turns — without it, a signed thinking block the client
+  // replays is silently dropped and the model loses its reasoning state.
+  const reasoningContent = selectKiroReasoningContent(blocks);
+  if (reasoningContent) {
+    arm.reasoningContent = reasoningContent;
   }
   return arm;
 }
@@ -6353,12 +6752,22 @@ function buildClaudeKiroPayload(input, model, thinking) {
     curUIM.userInputMessageContext.tools = convertClaudeTools(input.tools);
   }
 
-  const currentToolResultIDs = collectToolResultIDs(curUIM?.userInputMessageContext?.toolResults);
+  const currentResults = curUIM?.userInputMessageContext?.toolResults || [];
+  const currentToolResultIDs = collectToolResultIDs(currentResults);
   const keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs);
+  // A Set alone hides duplicate results. Reject malformed active exchanges
+  // locally instead of spending upstream calls on an unanswerable tool pair.
+  if (currentResults.length > 0 && (currentResults.length !== currentToolResultIDs.size || !keepCurrentToolResults ||
+      !history[history.length - 1]?.assistantResponseMessage?.toolUses?.every((call) =>
+        curUIM.userInputMessageContext.tools?.some((spec) => spec.toolSpecification?.name === call.name)))) {
+    throw new KiroUpstreamException("ValidationException", "Current tool results must uniquely match declared tools and the preceding assistant calls");
+  }
 
-  let finalHistory = keepCurrentToolResults
-    ? sanitizeKiroHistory(history, currentToolResultIDs)
-    : sanitizeKiroHistory(history, null);
+  let finalHistory = sanitizeKiroHistory(
+    history,
+    keepCurrentToolResults ? currentToolResultIDs : null,
+    curUIM?.userInputMessageContext?.tools || [],
+  );
 
   if (!keepCurrentToolResults && curUIM && curUIM.userInputMessageContext?.toolResults) {
     const narrated = narrateToolResults(curUIM.userInputMessageContext.toolResults, null);
@@ -6369,6 +6778,7 @@ function buildClaudeKiroPayload(input, model, thinking) {
     }
   }
 
+  const effortFields = kiroEffortRequestFields(input, modelId);
   return {
     conversationState: {
       conversationId: crypto.randomUUID(),
@@ -6377,6 +6787,7 @@ function buildClaudeKiroPayload(input, model, thinking) {
       chatTriggerType: "MANUAL",
       agentTaskType: "vibe",
     },
+    ...(effortFields ? { additionalModelRequestFields: effortFields } : {}),
   };
 }
 
@@ -6851,6 +7262,22 @@ function normalizeToolDesc(desc, name) {
   return "Tool: " + name;
 }
 
+// Kiro rejects toolUseIds outside [A-Za-z0-9_-]{1,64} with 400 "Invalid tool
+// use format" (e.g. "call_x|fc_y" from Responses-bridging clients). Mirrors Go
+// normalizeToolUseID: deterministic, so a tool call and its result still pair.
+function normalizeToolUseId(id) {
+  id = String(id || "").trim();
+  if (!id || /^[A-Za-z0-9_-]{1,64}$/.test(id)) return id;
+  // Sync FNV-1a pair (crypto.subtle is async); IDs differ only by hash, not Go's.
+  let a = 0x811c9dc5, b = 0x9e3779b9;
+  for (let i = 0; i < id.length; i++) {
+    const c = id.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x85ebca6b);
+  }
+  return `tooluse_${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 // Collapses over-long tool names. Mirrors Go shortenToolName
 // (proxy/translator.go:1047): mcp__server__tool -> mcp__tool when that fits in
 // 64 chars, otherwise a hard 64-char cut. The previous worker only did a
@@ -6946,9 +7373,28 @@ function sanitizeToolName(name) {
   return out === "" ? "tool" : out;
 }
 
+// A stable client session (or first real user turn) keeps a conversation on
+// the same credential across edge isolates. Never use a per-request UUID here.
+function kiroRoutingAffinity(request, body, apiKeyId, model) {
+  const headers = request?.headers;
+  const session = headers?.get("x-claude-code-session-id") || headers?.get("x-session-id") ||
+    body?.prompt_cache_key || body?.session_id || body?.conversation_id || body?.metadata?.user_id;
+  const anchor = session || (body?.messages || []).find((message) =>
+    message.role === "user" && flattenContent(message.content).trim())?.content;
+  const text = typeof anchor === "string" ? anchor : flattenContent(anchor);
+  if (!text || [".", "continue"].includes(text.trim().toLowerCase())) return "";
+  return `${apiKeyId || ""}:${mapKiroModel(model)}:${text.slice(0, 16384)}`;
+}
+
+function routingAffinityScore(affinity, accountId) {
+  let hash = 2166136261;
+  for (const c of `${affinity}:${accountId}`) hash = Math.imul(hash ^ c.charCodeAt(0), 16777619);
+  return hash >>> 0;
+}
+
 let _edgeRoundRobinIndex = 0;
 
-function pickCandidates(accounts, env, settings = null) {
+function pickCandidates(accounts, env, settings = null, affinity = "") {
   const enabled = accounts.filter((a) => a.enabled !== false && (a.accessToken || a.kiroApiKey));
   if (enabled.length === 0) return [];
 
@@ -6961,6 +7407,29 @@ function pickCandidates(accounts, env, settings = null) {
       sorted.push(enabled[(start + i) % n]);
     }
     return sorted;
+  }
+
+  // Smart routing must not chase the changing remaining-quota leader on
+  // every turn. Rendezvous ordering is stable across isolates and pool order;
+  // unavailable credentials remain failover candidates, never a hard pin.
+  if (mode === "smart" && affinity) {
+    const exhausted = (account) => !settings?.allowOverUsage && Number(account.usageLimit) > 0 &&
+      Number(account.usageCurrent) >= Number(account.usageLimit);
+    return enabled.sort((a, b) => Number(exhausted(a)) - Number(exhausted(b)) ||
+      routingAffinityScore(affinity, b.id) - routingAffinityScore(affinity, a.id) ||
+      String(a.id).localeCompare(String(b.id)));
+  }
+
+  // Sequential = the documented "use one account until it runs out": pool
+  // order, mirroring Go GetNextForModelExcluding. It used to fall through to the
+  // remaining-quota sort below, which re-elects the leader after every request
+  // and ping-pongs between near-tied accounts — round-robin in all but name.
+  // Quota-exhausted credentials stay as failover candidates at the back.
+  if (mode === "sequential") {
+    const exhausted = (account) => !settings?.allowOverUsage && Number(account.usageLimit) > 0 &&
+      Number(account.usageCurrent) >= Number(account.usageLimit);
+    // Array.prototype.sort is stable, so ties keep pool order.
+    return enabled.sort((a, b) => Number(exhausted(a)) - Number(exhausted(b)));
   }
 
   // Sort by smart quota strategy (highest remaining quota first)
@@ -7182,7 +7651,7 @@ function makeToolUseAssembler({ onOpen, onDelta, onFlush, nameMap } = {}) {
 
 // ==================== OpenAI Wire Streaming & Non-Streaming ====================
 
-function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
+function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null, opts = {}) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -7195,6 +7664,7 @@ function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
     let inputTokens = 0;
     let outputTokens = 0;
     let isSuccess = true;
+    let streamError = null;
     let toolIndex = 0;
     let finishReason = "stop";
     const toolIndexMap = new Map();
@@ -7256,7 +7726,7 @@ function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
       await parseAwsEventStream(upstream.body, {
         async onAssistantChunk(text) {
           if (!text) return;
-          tokenCount += Math.ceil(text.length / 4);
+          tokenCount += text.length;
           const chunk = {
             id,
             object: "chat.completion.chunk",
@@ -7268,7 +7738,7 @@ function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
         },
         async onReasoningChunk(text) {
           if (!text) return;
-          tokenCount += Math.ceil(text.length / 4);
+          tokenCount += text.length;
           const chunk = {
             id,
             object: "chat.completion.chunk",
@@ -7320,9 +7790,19 @@ function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
         choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
       };
       await writer.write(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+      if (opts.includeUsage) {
+        const promptTokens = inputTokens > 0 ? inputTokens : Math.max(0, Number(opts.estimatedInputTokens) || 0);
+        const completionTokens = outputTokens > 0 ? outputTokens : Math.ceil(tokenCount / 4);
+        const usageChunk = {
+          id, object: "chat.completion.chunk", created, model, choices: [],
+          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+        };
+        await writer.write(encoder.encode(`data: ${JSON.stringify(usageChunk)}\n\n`));
+      }
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (err) {
       isSuccess = false;
+      streamError = { statusCode: upstreamErrorStatus(err), message: upstreamErrorMessage(err) };
       // Mid-stream failures cannot change the status code, so the error has to
       // ride the SSE channel or the client sees a clean stop and retries.
       try {
@@ -7340,8 +7820,8 @@ function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
     } finally {
       clearInterval(pingTimer);
       try { await writer.close(); } catch (_) {}
-      const finalOut = outputTokens > 0 ? outputTokens : tokenCount;
-      if (onDone) await onDone(meteredCredits, finalOut, isSuccess, inputTokens);
+      const finalOut = outputTokens > 0 ? outputTokens : Math.ceil(tokenCount / 4);
+      if (onDone) await onDone(meteredCredits, finalOut, isSuccess, inputTokens, streamError);
     }
   })();
   // Settlement and usage recording happen after the last byte is written, so the
@@ -7361,7 +7841,7 @@ function streamOpenAIResponse(upstream, model, cors, onDone, ctx = null) {
   });
 }
 
-async function nonStreamOpenAIResponse(upstream, model, cors) {
+async function nonStreamOpenAIResponse(upstream, model, cors, opts = {}) {
   let content = "";
   let reasoning = "";
   let credits = 0;
@@ -7462,9 +7942,9 @@ async function nonStreamOpenAIResponse(upstream, model, cors) {
       finish_reason: finishReason,
     }],
     usage: {
-      prompt_tokens: inputTokens || 20,
+      prompt_tokens: inputTokens || Math.max(0, Number(opts.estimatedInputTokens) || 0),
       completion_tokens: tokens,
-      total_tokens: (inputTokens || 20) + tokens,
+      total_tokens: (inputTokens || Math.max(0, Number(opts.estimatedInputTokens) || 0)) + tokens,
     },
   };
 
@@ -7492,6 +7972,7 @@ function streamClaudeResponse(upstream, model, cors, onDone, ctx = null, opts = 
     let inputTokens = 0;
     let outputTokens = 0;
     let isSuccess = true;
+    let streamError = null;
     let nextIndex = 0;
     let openIndex = -1;
     let openType = "";
@@ -7565,7 +8046,7 @@ function streamClaudeResponse(upstream, model, cors, onDone, ctx = null, opts = 
           model,
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: { input_tokens: Math.max(0, Number(opts.estimatedInputTokens) || 0), output_tokens: 0 },
         },
       };
       await writer.write(encoder.encode(`event: message_start\ndata: ${JSON.stringify(startEv)}\n\n`));
@@ -7573,25 +8054,41 @@ function streamClaudeResponse(upstream, model, cors, onDone, ctx = null, opts = 
       await parseAwsEventStream(upstream.body, {
         async onReasoningChunk(text) {
           if (!text) return;
-          tokenCount += Math.ceil(text.length / 4);
+          tokenCount += text.length;
           if (openType !== "thinking") {
             await closeOpen();
             openIndex = nextIndex++;
             openType = "thinking";
-            const blockStart = { type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "" } };
+            const blockStart = { type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "", signature: "" } };
             await writer.write(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
           }
           const delta = { type: "content_block_delta", index: openIndex, delta: { type: "thinking_delta", thinking: text } };
           await writer.write(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`));
         },
         async onReasoningSignature(sig) {
-          if (!sig || openType !== "thinking") return;
+          if (!sig) return;
+          // A signature belongs to the reasoning block open right now, and it
+          // terminates that block: Anthropic's contract is signature_delta
+          // followed by content_block_stop, one signature per thinking block.
+          // When no block is open — display=omitted sends a signature with no
+          // reasoning text, and some upstreams sign after the answer started —
+          // wrap it in a thinking block of its own instead of dropping it.
+          // Dropping it makes the client replay unsigned reasoning on the next
+          // turn, which the upstream rejects outright.
+          if (openType !== "thinking") {
+            await closeOpen();
+            openIndex = nextIndex++;
+            openType = "thinking";
+            const blockStart = { type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "", signature: "" } };
+            await writer.write(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
+          }
           const delta = { type: "content_block_delta", index: openIndex, delta: { type: "signature_delta", signature: sig } };
           await writer.write(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`));
+          await closeOpen();
         },
         async onAssistantChunk(text) {
           if (!text) return;
-          tokenCount += Math.ceil(text.length / 4);
+          tokenCount += text.length;
           if (openType !== "text") {
             await closeOpen();
             openIndex = nextIndex++;
@@ -7635,17 +8132,18 @@ function streamClaudeResponse(upstream, model, cors, onDone, ctx = null, opts = 
       }
 
       // Use real token counts when available, fall back to estimate
-      const finalOutputTokens = outputTokens > 0 ? outputTokens : tokenCount;
-      const finalInputTokens = inputTokens > 0 ? inputTokens : 0;
+      const finalOutputTokens = outputTokens > 0 ? outputTokens : Math.ceil(tokenCount / 4);
+      const finalInputTokens = inputTokens > 0 ? inputTokens : Math.max(0, Number(opts.estimatedInputTokens) || 0);
 
       // 4. message_delta
-      const deltaEv = { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: finalOutputTokens } };
+      const deltaEv = { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: finalInputTokens, output_tokens: finalOutputTokens } };
       await writer.write(encoder.encode(`event: message_delta\ndata: ${JSON.stringify(deltaEv)}\n\n`));
 
       // 5. message_stop
       await writer.write(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`));
     } catch (err) {
       isSuccess = false;
+      streamError = { statusCode: upstreamErrorStatus(err), message: upstreamErrorMessage(err) };
       // The status line is long gone by the time upstream fails mid-stream, so
       // the only way to tell the client is an SSE error event. Without it the
       // client sees a clean end of stream and retries in a tight loop.
@@ -7662,8 +8160,8 @@ function streamClaudeResponse(upstream, model, cors, onDone, ctx = null, opts = 
     } finally {
       clearInterval(pingTimer);
       try { await writer.close(); } catch (_) {}
-      const finalOut = outputTokens > 0 ? outputTokens : tokenCount;
-      if (onDone) await onDone(meteredCredits, finalOut, isSuccess, inputTokens);
+      const finalOut = outputTokens > 0 ? outputTokens : Math.ceil(tokenCount / 4);
+      if (onDone) await onDone(meteredCredits, finalOut, isSuccess, inputTokens, streamError);
     }
   })();
   // Settlement and usage recording happen after the last byte is written, so the
@@ -7756,12 +8254,15 @@ async function nonStreamClaudeResponse(upstream, model, cors, opts = {}) {
 
   // Nothing came back at all. Throwing lets the caller fail over or return a
   // real error status instead of handing the client an empty assistant message.
-  if (!text && !reasoning && toolOrder.length === 0 && outputTokens === 0 && credits === 0) {
+  if (!text && !reasoning && !reasoningSig && toolOrder.length === 0 && outputTokens === 0 && credits === 0) {
     throw withPartialUsage(new EmptyUpstreamResponse(), credits, inputTokens, outputTokens);
   }
 
   const content = [];
-  if (reasoning) {
+  // A signature with no reasoning text is what display=omitted produces. The
+  // block still has to exist, or there is nowhere to carry the signature back
+  // and the next turn replays unsigned reasoning the upstream rejects.
+  if (reasoning || reasoningSig) {
     const tb = { type: "thinking", thinking: reasoning };
     if (reasoningSig) tb.signature = reasoningSig;
     content.push(tb);
@@ -7787,7 +8288,7 @@ async function nonStreamClaudeResponse(upstream, model, cors, opts = {}) {
     model,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: { input_tokens: inputTokens || 20, output_tokens: tokens },
+    usage: { input_tokens: inputTokens || Math.max(0, Number(opts.estimatedInputTokens) || 0), output_tokens: tokens },
   };
 
   return {
@@ -7908,6 +8409,9 @@ async function finishFailedRequest(env, ctx, opts) {
     timeUnix: Math.floor(Date.now() / 1000),
     account: opts.account || opts.accountId || "",
     accountId: opts.accountId || "",
+    ...(Array.isArray(opts.attemptedAccountIds) && opts.attemptedAccountIds.length > 1
+      ? { attemptedAccountIds: opts.attemptedAccountIds }
+      : {}),
     apiKeyId: opts.apiKeyId || "",
     apiKey: opts.apiKey || "",
     ip: opts.ip || "",
@@ -7916,6 +8420,12 @@ async function finishFailedRequest(env, ctx, opts) {
     status: "error",
     statusCode: opts.status,
     error: opts.message,
+    // Why it failed. `upstream_throttle` is the only value that means Kiro
+    // actually rejected the model; `local_admission` / `local_cooldown` mean
+    // this gateway never called upstream. Without this the dashboard shows an
+    // identical "Kiro throttled this model" row for both, and the operator
+    // debugs a phantom upstream rate limit.
+    ...(opts.failureKind ? { failureKind: opts.failureKind } : {}),
     credits: owed,
     metered: owed > 0,
     tokensEstimated: true,
@@ -8068,7 +8578,9 @@ async function dispatchEvent(eventType, payload, hooks) {
         await hooks.onToolUse(payload);
       }
       break;
+    case "metricsEvent":
     case "metadataEvent":
+      payload = payload.metricsEvent || payload.metadataEvent || payload;
       if (hooks.onMetadata) {
         await hooks.onMetadata(payload);
       }

@@ -79,8 +79,21 @@ func outputToMessages(items []ResponseOutputItem) []OpenAIMessage {
 		return nil
 	}
 	out := make([]OpenAIMessage, 0, len(items))
+	// pendingReasoning carries a stored reasoning item's encrypted_content onto
+	// the assistant turn that follows it, mirroring the inbound input parser so
+	// previous_response_id chains preserve reasoning continuity.
+	pendingReasoning := ""
+	takeReasoning := func() string {
+		r := pendingReasoning
+		pendingReasoning = ""
+		return r
+	}
 	for _, item := range items {
 		switch item.Type {
+		case "reasoning":
+			if item.EncryptedContent != "" {
+				pendingReasoning = item.EncryptedContent
+			}
 		case "message":
 			text := joinTextParts(item.Content)
 			role := item.Role
@@ -90,7 +103,11 @@ func outputToMessages(items []ResponseOutputItem) []OpenAIMessage {
 			if text == "" && role == "assistant" {
 				continue
 			}
-			out = append(out, OpenAIMessage{Role: role, Content: text})
+			msg := OpenAIMessage{Role: role, Content: text}
+			if role == "assistant" {
+				msg.RedactedReasoning = takeReasoning()
+			}
+			out = append(out, msg)
 		case "function_call":
 			tc := ToolCall{ID: item.CallID, Type: "function"}
 			if tc.ID == "" {
@@ -99,10 +116,19 @@ func outputToMessages(items []ResponseOutputItem) []OpenAIMessage {
 			tc.Function.Name = item.Name
 			tc.Function.Arguments = item.Arguments
 			out = append(out, OpenAIMessage{
-				Role:      "assistant",
-				Content:   "",
-				ToolCalls: []ToolCall{tc},
+				Role:              "assistant",
+				Content:           "",
+				ToolCalls:         []ToolCall{tc},
+				RedactedReasoning: takeReasoning(),
 			})
+		}
+	}
+	// A streamed response stores its reasoning item last (the upstream only
+	// reveals the blob after the text), so a still-pending blob belongs to the
+	// assistant turn that precedes it.
+	if pendingReasoning != "" {
+		if n := len(out); n > 0 && out[n-1].Role == "assistant" && out[n-1].RedactedReasoning == "" {
+			out[n-1].RedactedReasoning = pendingReasoning
 		}
 	}
 	return out

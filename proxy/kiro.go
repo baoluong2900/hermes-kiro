@@ -265,11 +265,55 @@ type KiroPayload struct {
 	ProfileArn      string           `json:"profileArn,omitempty"`
 	InferenceConfig *InferenceConfig `json:"inferenceConfig,omitempty"`
 
+	// Thinking and OutputConfig carry native Kiro/Claude adaptive thinking
+	// directives at the payload root. They are populated only when native
+	// thinking is enabled (see applyNativeThinking). Mirrored copies are also
+	// set on the current userInputMessage, matching the upstream contract.
+	Thinking     *KiroThinking     `json:"thinking,omitempty"`
+	OutputConfig *KiroOutputConfig `json:"output_config,omitempty"`
+
+	// AdditionalModelRequestFields carries provider-native request parameters
+	// the Kiro runtime forwards verbatim to the underlying model. GPT-family
+	// models take their reasoning effort here instead of via the Claude-style
+	// thinking/outputConfig directives:
+	//
+	//	"additionalModelRequestFields": { "reasoning": { "effort": "max" } }
+	//
+	// with no thinking/outputConfig anywhere in the body.
+	AdditionalModelRequestFields *KiroAdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
+
 	// ToolNameMap maps sanitized tool names (sent to Kiro) back to the
 	// original names supplied by the client. Used to restore original names
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+}
+
+// KiroThinking is the adaptive thinking directive understood by the Kiro API.
+// type is always "adaptive" for native thinking; display is "summarized" or
+// "omitted".
+type KiroThinking struct {
+	Type    string `json:"type"`
+	Display string `json:"display,omitempty"`
+}
+
+// KiroOutputConfig carries the adaptive thinking effort level.
+type KiroOutputConfig struct {
+	Effort string `json:"effort"`
+}
+
+// KiroAdditionalModelRequestFields mirrors the Bedrock-style
+// additionalModelRequestFields envelope the Kiro API accepts at the payload
+// root. Only the reasoning block is populated today.
+type KiroAdditionalModelRequestFields struct {
+	Reasoning *KiroReasoningEffort `json:"reasoning,omitempty"`
+}
+
+// KiroReasoningEffort is the GPT-family reasoning directive: a single effort
+// level drawn from the same ladder as Claude adaptive thinking
+// (low | medium | high | xhigh | max).
+type KiroReasoningEffort struct {
+	Effort string `json:"effort"`
 }
 
 type KiroUserInputMessage struct {
@@ -278,6 +322,12 @@ type KiroUserInputMessage struct {
 	Origin                  string                   `json:"origin"`
 	Images                  []KiroImage              `json:"images,omitempty"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
+
+	// Thinking and OutputConfig mirror the payload-root native thinking
+	// directives onto the current user message. Kiro expects camelCase
+	// (outputConfig) here, unlike the snake_case payload-root field.
+	Thinking     *KiroThinking     `json:"thinking,omitempty"`
+	OutputConfig *KiroOutputConfig `json:"outputConfig,omitempty"`
 }
 
 type UserInputMessageContext struct {
@@ -320,8 +370,37 @@ type KiroHistoryMessage struct {
 }
 
 type KiroAssistantResponseMessage struct {
-	Content  string        `json:"content"`
-	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+	Content          string                `json:"content"`
+	ToolUses         []KiroToolUse         `json:"toolUses,omitempty"`
+	ReasoningContent *KiroReasoningContent `json:"reasoningContent,omitempty"`
+}
+
+// KiroReasoningContent carries a prior assistant turn's native thinking back to
+// Kiro on history messages. Two mutually-exclusive shapes exist, mirroring
+// Anthropic's extended-thinking contract:
+//
+//   - Plaintext thinking (Claude): a reasoningText object whose signature is
+//     required by the upstream for adaptive thinking continuity, especially
+//     across tool-use turns.
+//
+//     "reasoningContent": { "reasoningText": { "text": "...", "signature": "..." } }
+//
+//   - Redacted/encrypted reasoning (GPT): an opaque base64 blob the upstream
+//     returns instead of plaintext, analogous to Anthropic's redacted_thinking
+//     block. It must be echoed back verbatim to preserve continuity.
+//
+//     "reasoningContent": { "redactedContent": "base64..." }
+//
+// ReasoningText is a pointer so a redacted-only turn does not serialize a
+// spurious empty reasoningText object.
+type KiroReasoningContent struct {
+	ReasoningText   *KiroReasoningText `json:"reasoningText,omitempty"`
+	RedactedContent string             `json:"redactedContent,omitempty"`
+}
+
+type KiroReasoningText struct {
+	Text      string `json:"text"`
+	Signature string `json:"signature,omitempty"`
 }
 
 type KiroToolUse struct {
@@ -346,6 +425,17 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnSignature is invoked when the upstream emits a cryptographic signature
+	// for the preceding native thinking block. Used to populate the Anthropic
+	// thinking block's signature so verifying clients accept it, and to echo
+	// the text/signature pair back on the next turn.
+	OnSignature func(signature string)
+	// OnRedactedReasoning is invoked when the upstream emits an opaque,
+	// encrypted reasoning payload (redactedContent) instead of plaintext
+	// thinking — as GPT models do. Mirrors Anthropic's redacted_thinking block.
+	// The blob arrives once (not as incremental deltas) and must be echoed back
+	// verbatim on history for multi-turn continuity.
+	OnRedactedReasoning func(data string)
 }
 
 // ==================== API Call ====================
@@ -980,6 +1070,32 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				producedOutput = true
 				if callback.OnText != nil {
 					callback.OnText(text, true)
+				}
+			}
+			// Native thinking blocks may carry their signature inline on the
+			// reasoning event rather than as a separate frame. Anthropic
+			// verifies the text/signature pair, so it has to be captured here
+			// or the next turn replays reasoning the upstream will reject.
+			if sig, ok := event["signature"].(string); ok && sig != "" {
+				producedOutput = true
+				if callback.OnSignature != nil {
+					callback.OnSignature(sig)
+				}
+			}
+			// GPT-family models return an opaque, encrypted reasoning blob
+			// under redactedContent instead of plaintext text. Surface it as
+			// a redacted_thinking block and round-trip it verbatim.
+			if redacted, ok := event["redactedContent"].(string); ok && redacted != "" {
+				producedOutput = true
+				if callback.OnRedactedReasoning != nil {
+					callback.OnRedactedReasoning(redacted)
+				}
+			}
+		case "reasoningContentSignatureEvent", "signatureEvent", "thinkingSignatureEvent":
+			if sig, ok := event["signature"].(string); ok && sig != "" {
+				producedOutput = true
+				if callback.OnSignature != nil {
+					callback.OnSignature(sig)
 				}
 			}
 		case "toolUseEvent":

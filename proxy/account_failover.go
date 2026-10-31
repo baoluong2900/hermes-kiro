@@ -12,10 +12,49 @@ import (
 
 const maxAccountRetryAttempts = 3
 
+// errNoAvailableAccounts is logged when the pool yields no eligible account
+// before any upstream call. Previously this 503 left no request-log entry, so
+// an operator saw a healthy-looking pool and a silent outage.
+var errNoAvailableAccounts = errors.New("No available accounts (every enabled account is cooling down, exhausted, or has an expired token)")
+
+// noAvailableAccountsRetryAfter is the Retry-After hint sent with the 503 the
+// pool returns when it has nothing to route to.
+//
+// Without it clients treat the 503 as a transient blip and retry immediately:
+// an exhausted pool produced bursts of four identical requests within six
+// seconds per client, which is pure log noise since not one of them can
+// succeed until an account recovers. A minute is short enough that a pool that
+// recovers quickly (a cooldown expiring) is picked up promptly, and long enough
+// to stop the hammering.
+const noAvailableAccountsRetryAfter = "60"
+
+// sendNoAvailableAccounts writes the pool-empty 503 for a client.
+//
+// The reason travels to the client, not just to the request log. The two used
+// to disagree — the log said "every enabled account is cooling down, exhausted,
+// or has an expired token" while the caller saw a bare "No available accounts"
+// — so whoever was reading the client side could not tell an exhausted quota
+// from a gateway bug without shell access to the host.
+func (h *Handler) sendNoAvailableAccounts(w http.ResponseWriter, kind string) {
+	w.Header().Set("Retry-After", noAvailableAccountsRetryAfter)
+	switch kind {
+	case endpointKindOpenAI:
+		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", errNoAvailableAccounts.Error())
+	default:
+		h.sendClaudeError(w, http.StatusServiceUnavailable, "api_error", errNoAvailableAccounts.Error())
+	}
+}
+
 const (
-	defaultQuotaCooldown = time.Hour
-	minQuotaCooldown     = 10 * time.Second
-	maxQuotaCooldown     = 24 * time.Hour
+	endpointKindClaude = "claude"
+	endpointKindOpenAI = "openai"
+)
+
+const (
+	defaultQuotaCooldown       = time.Hour
+	minQuotaCooldown           = 10 * time.Second
+	maxQuotaCooldown           = 24 * time.Hour
+	emptyResponseModelCooldown = 30 * time.Second
 )
 
 // upstreamQuotaError carries the upstream Retry-After hint across the API-call
@@ -205,9 +244,16 @@ func (h *Handler) handleAccountModelFailure(account *config.Account, model strin
 			if ue.ExceptionType == "EmptyUpstreamResponse" {
 				logger.Warnf("[AccountFailover] Soft failure (%s) on %s, not incrementing account error count", ue.ExceptionType, account.Email)
 				if model != "" {
-					h.pool.RecordModelCooldown(account.ID, model, defaultQuotaCooldown)
-					logger.Warnf("[AccountFailover] Model %s cooled down on %s for %v due to empty upstream response", model, account.Email, defaultQuotaCooldown)
+					// Empty streams are transient, not evidence of an hour-long quota block.
+					h.pool.RecordModelCooldown(account.ID, model, emptyResponseModelCooldown)
+					logger.Warnf("[AccountFailover] Model %s cooled down on %s for %v due to empty upstream response", model, account.Email, emptyResponseModelCooldown)
 				}
+				return
+			}
+			// A request rejected on its own merits (e.g. 400 "Invalid tool use
+			// format") fails on every account; counting it put the shared account
+			// in cooldown and 503'd every other key ("No available accounts").
+			if !ue.Retryable() {
 				return
 			}
 			h.pool.RecordError(account.ID, false)

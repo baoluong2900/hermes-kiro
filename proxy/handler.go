@@ -13,6 +13,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"math"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -49,17 +50,29 @@ func looksLikeKiroAPIKey(value string) bool {
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64   `json:"time"`      // Unix timestamp
-	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
-	Model     string  `json:"model"`     // Requested model
-	AccountID string  `json:"accountId"` // Account used
-	Status    string  `json:"status"`    // "success" or "error"
-	Error     string  `json:"error"`     // Error message (empty on success)
-	ErrorType string  `json:"errorType"` // Error category (empty on success)
-	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
-	Duration  int64   `json:"duration"`  // Request duration in ms
+	Time         int64  `json:"time"`      // Unix timestamp
+	Endpoint     string `json:"endpoint"`  // claude/openai/responses
+	Model        string `json:"model"`     // Requested model
+	AccountID    string `json:"accountId"` // Account used
+	Status       string `json:"status"`    // "success" or "error"
+	Error        string `json:"error"`     // Error message (empty on success)
+	ErrorType    string `json:"errorType"` // Error category (empty on success)
+	Tokens       int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	InputTokens  int    `json:"inputTokens,omitempty"`
+	OutputTokens int    `json:"outputTokens,omitempty"`
+	// Prompt-cache accounting for the request (Claude path only; 0 elsewhere).
+	CacheReadTokens  int     `json:"cacheReadTokens,omitempty"`
+	CacheWriteTokens int     `json:"cacheWriteTokens,omitempty"`
+	Credits          float64 `json:"credits"`              // Credits consumed (0 on failure)
+	Duration         int64   `json:"duration"`             // Request duration in ms
+	IP               string  `json:"ip,omitempty"`         // Client IP (first X-Forwarded-For hop)
+	ApiKeyID         string  `json:"apiKeyId,omitempty"`   // Authenticated API key ID
+	ApiKeyName       string  `json:"apiKeyName,omitempty"` // API key label (masked key when unnamed)
 }
+
+// requestLogMeta is the per-request identity attached to log entries. It is keyed
+// by the request's ResponseWriter so the deep log call sites only need `w`.
+type requestLogMeta struct{ IP, ApiKeyID, ApiKeyName string }
 
 const requestLogsMaxSize = 500
 
@@ -81,11 +94,15 @@ type Handler struct {
 	modelsCacheMu      sync.RWMutex
 	modelsCacheTime    int64
 	promptCache        *promptCacheTracker
+	sticky             *stickyRouter // conversation → account affinity for Kiro's per-account prefix cache
 	tokenRefreshMu     sync.Mutex
 	credentialImportMu sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	logMeta       sync.Map // http.ResponseWriter -> requestLogMeta, live only while the request runs
+	// requestLogsPath is the JSONL file backing requestLogs; empty disables persistence.
+	requestLogsPath string
 
 	microsoftSelections   map[string]*microsoftProfileSelection
 	microsoftSelectionsMu sync.Mutex
@@ -284,6 +301,7 @@ func NewHandler() *Handler {
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
 		pool:                 pool.GetPool(),
+		sticky:               newStickyRouter(),
 		totalRequests:        int64(totalReq),
 		successRequests:      int64(successReq),
 		failedRequests:       int64(failedReq),
@@ -297,6 +315,7 @@ func NewHandler() *Handler {
 		microsoftCanceled:    make(map[string]time.Time),
 		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
 	}
+	h.loadRequestLogs()
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// Credential renewal must not wait for the slow model/usage refresh cycle.
@@ -434,6 +453,35 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 	return withApiKeyContext(r, entry)
 }
 
+// trackRequestLog tags every log entry written for this request with the client IP
+// and API key; call the returned func when the request is done.
+func (h *Handler) trackRequestLog(w http.ResponseWriter, r *http.Request) func() {
+	meta := requestLogMeta{IP: requestClientIP(r), ApiKeyID: apiKeyIDFromContext(r.Context())}
+	if e := config.GetApiKeyEntry(meta.ApiKeyID); e != nil {
+		meta.ApiKeyName = e.Name
+		if meta.ApiKeyName == "" {
+			meta.ApiKeyName = config.MaskApiKey(e.Key)
+		}
+	}
+	h.logMeta.Store(w, meta)
+	return func() { h.logMeta.Delete(w) }
+}
+
+// requestClientIP is display-only (logs), so trusting proxy headers is acceptable.
+// Render fronts the service with Cloudflare, which overwrites CF-Connecting-IP.
+func requestClientIP(r *http.Request) string {
+	if ip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); ip != "" {
+		return ip
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return strings.TrimSpace(strings.Split(xff, ",")[0])
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 // ServeHTTP 路由分发
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -460,6 +508,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ar == nil {
 			return
 		}
+		defer h.trackRequestLog(w, ar)()
 		h.handleClaudeMessages(w, ar)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
@@ -472,12 +521,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ar == nil {
 			return
 		}
+		defer h.trackRequestLog(w, ar)()
 		h.handleOpenAIChat(w, ar)
 	case path == "/v1/responses" || path == "/responses":
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
 		}
+		defer h.trackRequestLog(w, ar)()
 		h.handleOpenAIResponses(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
@@ -495,8 +546,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStaticFile(w, r)
 
 	// 健康检查
-	case path == "/health" || path == "/":
+	case path == "/health" || (path == "/" && r.Method != http.MethodGet):
 		h.handleHealth(w, r)
+
+	// Public API-key quota checker (GET / mirrors the edge Worker landing page)
+	case path == "/" || isKeyPortalPath(path):
+		h.handleKeyPortal(w, r, path)
 
 	// 统计端点（需要 API Key 鉴权）
 	case path == "/v1/stats":
@@ -743,6 +798,7 @@ func (h *Handler) refreshModelsCache() {
 		}
 		h.pool.SetModelList(account.ID, modelIDs)
 		recordModelTokenLimits(models)
+		updateModelReasoningCapabilities(models)
 		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
@@ -771,6 +827,7 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	}
 	h.pool.SetModelList(account.ID, modelIDs)
 	recordModelTokenLimits(models)
+	updateModelReasoningCapabilities(models)
 
 	// 合并到聚合缓存
 	h.modelsCacheMu.Lock()
@@ -870,6 +927,11 @@ func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
 	}
 	if base.TokenLimits == nil {
 		base.TokenLimits = extra.TokenLimits
+	}
+	// The reasoning schema decides whether this model gets a thinking directive
+	// at all; an account whose view omits it must not erase a view that had it.
+	if base.AdditionalModelRequestFieldsSchema == nil {
+		base.AdditionalModelRequestFieldsSchema = extra.AdditionalModelRequestFieldsSchema
 	}
 	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
 	return base
@@ -1003,9 +1065,30 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
+	_, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
-	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
+
+	// Native adaptive thinking is what makes the upstream emit a signature, so
+	// resolve it before the payload is built: when it is on, the prompt-injected
+	// <thinking_mode> block is skipped (the directive replaces it) and reasoning
+	// rendering is switched on even if nothing else asked for it.
+	reasoningIntent := resolveClaudeReasoningRequest(&req, suffixThinking)
+	reasoning := resolveReasoningDirectives(MapModel(req.Model), reasoningIntent, thinkingCfg)
+	promptThinking := thinking && !reasoning.Native.Enabled
+	// clientThinking is what the client itself asked for, before native
+	// thinking widened it. The web_search agentic loop discards reasoning
+	// output, so it keeps the narrower value and never pays for reasoning
+	// nobody reads.
+	clientThinking := thinking
+	thinking = thinking || reasoning.ProducesReasoning()
+	if blocks, signed := countClaudeThinkingSignals(&req); blocks > 0 {
+		logger.Debugf("[Thinking] %s native=%v effort=%q display=%q | incoming assistant thinking blocks=%d with-signature=%d",
+			req.Model, reasoning.Native.Enabled, reasoning.Effort(), reasoning.Native.Display, blocks, signed)
+	}
+
+	req.CacheReasoning = &reasoning
+	effectiveReq := cloneClaudeRequestForThinking(&req, promptThinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
@@ -1022,12 +1105,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// and returns client tool_use blocks as-is.
 	if hasWebSearchAmongTools(&req) {
 		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
-		h.runWebSearchLoop(w, &req, thinking, estimatedInputTokens, apiKeyID)
+		h.runWebSearchLoop(w, &req, clientThinking, estimatedInputTokens, apiKeyID)
 		return
 	}
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
+	kiroPayload := ClaudeToKiro(&req, promptThinking)
+	applyReasoningDecision(kiroPayload, reasoning)
 
 	// Stream or non-stream
 	if req.Stream {
@@ -1148,9 +1232,9 @@ func (h *Handler) proxyExternalClaude(w http.ResponseWriter, r *http.Request, bo
 				inputTokens = estimatedInputTokens
 			}
 			h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
-			h.recordSuccessLog("claude", req.Model, displayURL, inputTokens+outputTokens, 0, time.Since(reqStart).Milliseconds())
+			h.recordSuccessLog(w, "claude", req.Model, displayURL, inputTokens, outputTokens, 0, time.Since(reqStart).Milliseconds())
 		} else {
-			h.recordFailureWithDuration("claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
+			h.recordFailureWithDuration(w, "claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 		}
 		return true
 	}
@@ -1195,9 +1279,9 @@ func (h *Handler) proxyExternalClaude(w http.ResponseWriter, r *http.Request, bo
 			externalInputTokens = estimatedInputTokens
 		}
 		h.recordSuccessForApiKey(apiKeyID, externalInputTokens, externalOutputTokens, 0)
-		h.recordSuccessLog("claude", req.Model, displayURL, externalInputTokens+externalOutputTokens, 0, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog(w, "claude", req.Model, displayURL, externalInputTokens, externalOutputTokens, 0, time.Since(reqStart).Milliseconds())
 	} else {
-		h.recordFailureWithDuration("claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 	}
 	return true
 }
@@ -1501,8 +1585,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		messageStarted = true
 	}
 
+	// Cache-aware routing: keep this conversation on the account holding its
+	// warm prefix; a round-robin hop would miss Kiro's cache and re-read the
+	// whole prompt at full price.
+	stickyID := h.sticky.Lookup(payload.ConversationState.ConversationID)
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelSticky(model, stickyID, excluded)
 		if account == nil {
 			break
 		}
@@ -1525,10 +1614,30 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		var rawThinkingBuilder strings.Builder
 		activeBlockIndex := -1
 		activeBlockType := ""
+		// pendingSignature holds the upstream signature for the thinking block
+		// that is open right now. It is flushed as a signature_delta immediately
+		// before that block's content_block_stop, which is where Anthropic's
+		// wire contract puts it.
+		var pendingSignature string
+		// redactedReasoning holds every opaque reasoning blob the upstream sent,
+		// in order. Each is emitted as its own redacted_thinking block: the block
+		// is the unit clients echo back verbatim, so blobs must not collapse.
+		var redactedReasoning []string
 
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
 				return
+			}
+			// Emit a signature_delta before closing a thinking block so verifying
+			// clients accept the native reasoning content — and can replay the
+			// text/signature pair on the next turn.
+			if activeBlockType == "thinking" && pendingSignature != "" {
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{"type": "signature_delta", "signature": pendingSignature},
+				})
+				pendingSignature = ""
 			}
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
@@ -1553,8 +1662,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
-						"type":     "thinking",
-						"thinking": "",
+						"type":      "thinking",
+						"thinking":  "",
+						"signature": "",
 					},
 				})
 			} else {
@@ -1841,6 +1951,67 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnSignature: func(sig string) {
+				if sig == "" || normalizeStopHookJSON {
+					return
+				}
+				// A signature belongs to the reasoning block that is open right
+				// now, and it terminates that block: Anthropic's stream contract
+				// is signature_delta followed by content_block_stop, one
+				// signature per thinking block. Flushing here (rather than
+				// waiting for answer text to close the block) keeps the pair
+				// together and lets further reasoning open a fresh block with
+				// its own signature.
+				if activeBlockType == "thinking" {
+					pendingSignature = sig
+					closeActiveBlock() // emits the signature_delta, then stops the block
+					eventThinkingOpen = false
+					thinkingStarted = false
+					return
+				}
+				// No reasoning block is open. That happens when the upstream
+				// runs with display=omitted (signature, no reasoning text) or
+				// signs after the answer already started. Anthropic has no wire
+				// slot for a detached signature, so wrap it in a thinking block
+				// of its own rather than dropping it — dropping it would make
+				// the client replay unsigned reasoning on the next turn, which
+				// the upstream rejects outright.
+				if !thinking {
+					logger.Warnf("[Thinking] upstream sent a signature but reasoning rendering is off; it cannot be forwarded")
+					return
+				}
+				// The <think>/reasoning_content formats fold reasoning into the
+				// answer text, so there is no thinking block for a signature to
+				// belong to; inventing one would contradict the chosen format.
+				if thinkingFormat == "think" || thinkingFormat == "reasoning_content" {
+					logger.Warnf("[Thinking] upstream signature dropped: claudeFormat=%q renders reasoning as text, which cannot carry a signature", thinkingFormat)
+					return
+				}
+				processClaudeText("", false, true)
+				ensureMessageStart()
+				closeActiveBlock()
+				idx := nextContentIndex
+				nextContentIndex++
+				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         idx,
+					"content_block": map[string]string{"type": "thinking", "thinking": "", "signature": ""},
+				})
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]string{"type": "signature_delta", "signature": sig},
+				})
+				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": idx,
+				})
+			},
+			OnRedactedReasoning: func(data string) {
+				if data != "" && !normalizeStopHookJSON {
+					redactedReasoning = append(redactedReasoning, data)
+				}
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -1857,7 +2028,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 				h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 				continue
 			}
-			h.recordFailureWithDuration("claude", model, account.ID, err, time.Since(reqStart).Milliseconds())
+			h.recordFailureWithDuration(w, "claude", model, account.ID, err, time.Since(reqStart).Milliseconds())
 			// Upstream already metered whatever it streamed before dying, so the
 			// key owes for it. Without this the request left no usage trace at all.
 			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -1878,6 +2049,39 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			sendText("", 3)
 		}
 		closeActiveBlock()
+
+		// A signature that survives here never found a thinking block to attach
+		// to. Anthropic requires it to sit inside the block whose text it signs,
+		// so it cannot be forwarded; say so instead of dropping it silently,
+		// because the next turn then echoes unsigned reasoning back upstream.
+		if pendingSignature != "" {
+			logger.Warnf("[Thinking] upstream signature arrived with no open thinking block; it is not forwarded")
+			pendingSignature = ""
+		}
+
+		// Opaque (redacted) reasoning arrives as whole blobs, not deltas. Emit
+		// one self-contained redacted_thinking block per blob so clients can
+		// round-trip each of them back verbatim.
+		for _, data := range redactedReasoning {
+			if data == "" {
+				continue
+			}
+			ensureMessageStart()
+			idx := nextContentIndex
+			nextContentIndex++
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]string{
+					"type": "redacted_thinking",
+					"data": data,
+				},
+			})
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
@@ -1903,7 +2107,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogCache(w, "claude", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds(), cacheUsage)
+		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
 
 		if normalizeStopHookJSON {
 			h.sendClaudeBufferedTextStream(w, flusher, msgID, model, outputContent, inputTokens, outputTokens, cacheUsage, cacheProfile != nil)
@@ -1934,11 +2139,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 			return
 		}
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		h.recordFailureWithDuration(w, "claude", model, "", errNoAvailableAccounts, time.Since(reqStart).Milliseconds())
+		h.sendNoAvailableAccounts(w, endpointKindClaude)
 		return
 	}
 
-	h.recordFailureWithDuration("claude", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
+	h.recordFailureWithDuration(w, "claude", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 		return
 	}
@@ -2139,7 +2345,7 @@ func (h *Handler) recordPartialUsageForApiKey(apiKeyID string, inputTokens, outp
 	}
 }
 
-func (h *Handler) recordFailureWithDuration(endpoint, model, accountID string, err error, durationMs int64) {
+func (h *Handler) recordFailureWithDuration(w http.ResponseWriter, endpoint, model, accountID string, err error, durationMs int64) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 
@@ -2161,26 +2367,54 @@ func (h *Handler) recordFailureWithDuration(endpoint, model, accountID string, e
 		Duration:  durationMs,
 	}
 
-	h.appendRequestLog(entry)
+	h.appendRequestLog(w, entry)
 }
 
 // recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
-	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "success",
-		Tokens:    tokens,
-		Credits:   credits,
-		Duration:  durationMs,
+// openAIUsageMap is the Chat Completions usage object, with the OpenAI-shaped
+// prompt_tokens_details.cached_tokens when part of the prompt came from cache.
+func openAIUsageMap(inputTokens, outputTokens int, cacheUsage promptCacheUsage) map[string]interface{} {
+	usage := map[string]interface{}{
+		"prompt_tokens":     inputTokens,
+		"completion_tokens": outputTokens,
+		"total_tokens":      inputTokens + outputTokens,
 	}
-
-	h.appendRequestLog(entry)
+	if cacheUsage.CacheReadInputTokens > 0 {
+		usage["prompt_tokens_details"] = map[string]int{"cached_tokens": cacheUsage.CacheReadInputTokens}
+	}
+	return usage
 }
 
-func (h *Handler) appendRequestLog(entry RequestLog) {
+func (h *Handler) recordSuccessLog(w http.ResponseWriter, endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64) {
+	h.recordSuccessLogCache(w, endpoint, model, accountID, inputTokens, outputTokens, credits, durationMs, promptCacheUsage{})
+}
+
+// recordSuccessLogCache is recordSuccessLog plus the prompt-cache split, so the
+// log table can show how much of the input was served from a warm prefix.
+func (h *Handler) recordSuccessLogCache(w http.ResponseWriter, endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64, cacheUsage promptCacheUsage) {
+	entry := RequestLog{
+		CacheReadTokens:  cacheUsage.CacheReadInputTokens,
+		CacheWriteTokens: cacheUsage.CacheCreationInputTokens,
+		Time:             time.Now().Unix(),
+		Endpoint:         endpoint,
+		Model:            model,
+		AccountID:        accountID,
+		Status:           "success",
+		Tokens:           inputTokens + outputTokens,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		Credits:          credits,
+		Duration:         durationMs,
+	}
+
+	h.appendRequestLog(w, entry)
+}
+
+func (h *Handler) appendRequestLog(w http.ResponseWriter, entry RequestLog) {
+	if m, ok := h.logMeta.Load(w); ok {
+		meta := m.(requestLogMeta)
+		entry.IP, entry.ApiKeyID, entry.ApiKeyName = meta.IP, meta.ApiKeyID, meta.ApiKeyName
+	}
 	h.requestLogsMu.Lock()
 	if h.requestLogs == nil {
 		h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
@@ -2189,12 +2423,15 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 		h.requestLogs = h.requestLogs[1:]
 	}
 	h.requestLogs = append(h.requestLogs, entry)
+	h.persistRequestLogLocked(entry)
 	h.requestLogsMu.Unlock()
 }
 
 // classifyError categorizes an error message into a type for display.
 func classifyError(msg string) string {
 	switch {
+	case msg == errNoAvailableAccounts.Error():
+		return "pool"
 	case isQuotaErrorMessage(msg):
 		return "quota"
 	case isOverageErrorMessage(msg):
@@ -2238,8 +2475,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 	var lastAccountID string
 	reqStart := time.Now()
 
+	// Cache-aware routing: keep this conversation on the account holding its
+	// warm prefix; a round-robin hop would miss Kiro's cache and re-read the
+	// whole prompt at full price.
+	stickyID := h.sticky.Lookup(payload.ConversationState.ConversationID)
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelSticky(model, stickyID, excluded)
 		if account == nil {
 			break
 		}
@@ -2254,6 +2496,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 
 		var content string
 		var thinkingContent string
+		var thinkingSignature string
+		var redactedReasoning []string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
@@ -2280,6 +2524,18 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnSignature: func(sig string) {
+				// One reasoningContent slot per turn upstream: the last
+				// signature is the one that covers the turn's reasoning.
+				if sig != "" {
+					thinkingSignature = sig
+				}
+			},
+			OnRedactedReasoning: func(data string) {
+				if data != "" {
+					redactedReasoning = append(redactedReasoning, data)
+				}
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2303,6 +2559,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		if normalizeStopHookJSON {
 			finalContent = normalizeClaudeStopHookEvaluatorText(finalContent)
 			rawThinkingContent = ""
+			thinkingSignature = ""
+			redactedReasoning = nil
 			toolUses = nil
 		}
 
@@ -2317,7 +2575,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogCache(w, "claude", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds(), cacheUsage)
+		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -2330,14 +2589,21 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			case "think":
 				finalContent = "<think>" + responseThinkingContent + "</think>" + finalContent
 				responseThinkingContent = ""
+				// The reasoning is now prose inside the answer; there is no
+				// thinking block left for the signature to sign.
+				thinkingSignature = ""
 			case "reasoning_content":
 				finalContent = responseThinkingContent + finalContent
 				responseThinkingContent = ""
+				thinkingSignature = ""
 			default:
 			}
 		}
+		if !thinking {
+			thinkingSignature = ""
+		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		resp := KiroToClaudeResponseWithSignature(finalContent, responseThinkingContent, thinkingSignature, redactedReasoning, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2356,11 +2622,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 			return
 		}
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		h.recordFailureWithDuration(w, "claude", model, "", errNoAvailableAccounts, time.Since(reqStart).Milliseconds())
+		h.sendNoAvailableAccounts(w, endpointKindClaude)
 		return
 	}
 
-	h.recordFailureWithDuration("claude", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
+	h.recordFailureWithDuration(w, "claude", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	if h.fallbackToCLIProxyAPI(w, r, rawBody, req, normalizeStopHookJSON) {
 		return
 	}
@@ -2435,7 +2702,7 @@ func (h *Handler) proxyExternalOpenAI(w http.ResponseWriter, r *http.Request, bo
 		if cooldown, opened := externalCircuitFailure(baseURL, "", clientTimeout); opened {
 			logger.Warnf("[ExternalAPI] Circuit opened for %s for %s after repeated transport failures", displayURL, cooldown)
 		}
-		h.recordFailureWithDuration("openai", req.Model, displayURL, err, time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "openai", req.Model, displayURL, err, time.Since(reqStart).Milliseconds())
 		return false
 	}
 	defer resp.Body.Close()
@@ -2443,7 +2710,7 @@ func (h *Handler) proxyExternalOpenAI(w http.ResponseWriter, r *http.Request, bo
 		if cooldown, opened := externalCircuitFailure(baseURL, resp.Header.Get("Retry-After"), clientTimeout); opened {
 			logger.Warnf("[ExternalAPI] Circuit opened for %s for %s after repeated HTTP %d responses", displayURL, cooldown, resp.StatusCode)
 		}
-		h.recordFailureWithDuration("openai", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "openai", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 		return false
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -2451,7 +2718,7 @@ func (h *Handler) proxyExternalOpenAI(w http.ResponseWriter, r *http.Request, bo
 	}
 
 	if resp.StatusCode >= 400 {
-		h.recordFailureWithDuration("openai", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "openai", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(resp.StatusCode)
@@ -2500,7 +2767,7 @@ func (h *Handler) proxyExternalOpenAI(w http.ResponseWriter, r *http.Request, bo
 		externalInputTokens = estimatedInputTokens
 	}
 	h.recordSuccessForApiKey(apiKeyID, externalInputTokens, externalOutputTokens, 0)
-	h.recordSuccessLog("openai", req.Model, displayURL, externalInputTokens+externalOutputTokens, 0, time.Since(reqStart).Milliseconds())
+	h.recordSuccessLog(w, "openai", req.Model, displayURL, externalInputTokens, externalOutputTokens, 0, time.Since(reqStart).Milliseconds())
 	return true
 }
 
@@ -2537,28 +2804,38 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	thinking := suffixThinking
 	// OpenAI-style clients (Hermes among them) ask for extended reasoning with
 	// reasoning_effort rather than a model-name suffix. Honor it, otherwise a
 	// request for "high" silently ran without thinking.
-	if !thinking && strings.TrimSpace(req.ReasoningEffort) != "" {
+	if !thinking && strings.TrimSpace(req.ReasoningEffort) != "" && !reasoningEffortDisabled(req.ReasoningEffort) {
 		thinking = true
 	}
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	// Prefer the native reasoning directive when the model advertises one: it
+	// is what makes the upstream emit real reasoning (and a signature) instead
+	// of prompt-driven <thinking> text.
+	reasoning := resolveReasoningDirectives(MapModel(req.Model), resolveOpenAIReasoningRequest(&req, suffixThinking), thinkingCfg)
+	promptThinking := thinking && !reasoning.Native.Enabled
+	thinking = thinking || reasoning.ProducesReasoning()
+
+	kiroPayload := OpenAIToKiro(&req, promptThinking)
+	applyReasoningDecision(kiroPayload, reasoning)
+	cacheProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, cacheProfile)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, cacheProfile)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, cacheProfile *promptCacheProfile) {
 	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
 	if !admitted {
 		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
@@ -2585,8 +2862,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	var lastAccountID string
 	reqStart := time.Now()
 
+	stickyID := h.sticky.Lookup(payload.ConversationState.ConversationID)
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelSticky(model, stickyID, excluded)
 		if account == nil {
 			break
 		}
@@ -2597,6 +2875,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var toolCalls []ToolCall
 		var toolCallIndex int
@@ -2611,6 +2890,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
+		// thinkingSignature is the upstream signature for this turn's native
+		// reasoning. Only the reasoning_content format has somewhere to put it —
+		// the <think>/<thinking> formats fold reasoning into the answer text,
+		// which leaves nothing for a signature to sign.
+		var thinkingSignature string
 		responseStarted := false
 
 		sendChunk := func(content string, thinkingState int) {
@@ -2877,6 +3161,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnSignature: func(sig string) {
+				if sig != "" {
+					thinkingSignature = sig
+				}
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2891,7 +3180,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 				continue
 			}
-			h.recordFailureWithDuration("openai", model, account.ID, err, time.Since(reqStart).Milliseconds())
+			h.recordFailureWithDuration(w, "openai", model, account.ID, err, time.Since(reqStart).Milliseconds())
 			// Partial output was already generated and metered upstream; attribute
 			// it instead of dropping the request from the key's usage entirely.
 			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -2929,6 +3218,28 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			sendChunk("", 3)
 		}
 
+		// Hand the native reasoning signature to the client so it can replay the
+		// signed pair on the next turn (we read it back from the assistant
+		// message's "signature" field).
+		if thinking && thinkingSignature != "" && thinkingFormat != "think" && thinkingFormat != "thinking" {
+			sigChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]string{"signature": thinkingSignature},
+					"finish_reason": nil,
+				}},
+			}
+			if data, mErr := json.Marshal(sigChunk); mErr == nil {
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+				flusher.Flush()
+				responseStarted = true
+			}
+		}
+
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
@@ -2951,7 +3262,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogCache(w, "openai", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds(), cacheUsage)
+		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
+		h.promptCache.Update(account.ID, cacheProfile)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2968,11 +3281,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"delta":         map[string]interface{}{},
 				"finish_reason": finishReason,
 			}},
-			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
-			},
+			"usage": openAIUsageMap(inputTokens, outputTokens, cacheUsage),
 		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
@@ -2982,17 +3291,18 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.recordFailureWithDuration(w, "openai", model, "", errNoAvailableAccounts, time.Since(reqStart).Milliseconds())
+		h.sendNoAvailableAccounts(w, endpointKindOpenAI)
 		return
 	}
 
-	h.recordFailureWithDuration("openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
+	h.recordFailureWithDuration(w, "openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, cacheProfile *promptCacheProfile) {
 	releaseCredit, admitted := globalCreditHolds.reserve(apiKeyID)
 	if !admitted {
 		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
@@ -3005,8 +3315,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	var lastAccountID string
 	reqStart := time.Now()
 
+	stickyID := h.sticky.Lookup(payload.ConversationState.ConversationID)
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelSticky(model, stickyID, excluded)
 		if account == nil {
 			break
 		}
@@ -3017,9 +3328,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
 		var reasoningContent string
+		var reasoningSignature string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
@@ -3038,6 +3351,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			},
+			OnSignature: func(sig string) {
+				if sig != "" {
+					reasoningSignature = sig
+				}
 			},
 		}
 
@@ -3067,21 +3385,28 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogCache(w, "openai", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds(), cacheUsage)
+		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
+		h.promptCache.Update(account.ID, cacheProfile)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		if !thinking {
+			reasoningSignature = ""
+		}
+		resp := KiroToOpenAIResponseWithReasoningSignature(finalContent, reasoningContent, reasoningSignature, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp["usage"] = openAIUsageMap(inputTokens, outputTokens, cacheUsage)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
 	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.recordFailureWithDuration(w, "openai", model, "", errNoAvailableAccounts, time.Since(reqStart).Milliseconds())
+		h.sendNoAvailableAccounts(w, endpointKindOpenAI)
 		return
 	}
 
-	h.recordFailureWithDuration("openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
+	h.recordFailureWithDuration(w, "openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
@@ -3431,6 +3756,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			"cooldownUntil":     h.pool.CooldownUntil(a.ID),
+			"priority":          a.Priority,
+			"routing":           h.pool.RoutingStateFor(a),
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -3515,6 +3843,9 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["weight"].(float64); ok {
 		existing.Weight = int(v)
+	}
+	if v, ok := updates["priority"].(float64); ok {
+		existing.Priority = int(v)
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
@@ -5216,6 +5547,7 @@ func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
 	h.requestLogs = h.requestLogs[:0]
+	h.rewriteRequestLogsLocked()
 	h.requestLogsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -5618,6 +5950,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
+		"priority":          account.Priority,
 		"overageStatus":     account.OverageStatus,
 		"overageCapability": account.OverageCapability,
 		"overageCap":        account.OverageCap,
@@ -5682,6 +6015,8 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		modelIDs = append(modelIDs, m.ModelId)
 	}
 	h.pool.SetModelList(id, modelIDs)
+	recordModelTokenLimits(models)
+	updateModelReasoningCapabilities(models)
 	h.modelsCacheMu.Lock()
 	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
 	h.modelsCacheTime = time.Now().Unix()
@@ -5717,18 +6052,22 @@ func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.GetThinkingConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"suffix":       cfg.Suffix,
-		"openaiFormat": cfg.OpenAIFormat,
-		"claudeFormat": cfg.ClaudeFormat,
+		"suffix":        cfg.Suffix,
+		"openaiFormat":  cfg.OpenAIFormat,
+		"claudeFormat":  cfg.ClaudeFormat,
+		"nativeMode":    cfg.NativeMode,
+		"nativeDisplay": cfg.NativeDisplay,
 	})
 }
 
 // apiUpdateThinkingConfig 更新 thinking 配置
 func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Suffix       string `json:"suffix"`
-		OpenAIFormat string `json:"openaiFormat"`
-		ClaudeFormat string `json:"claudeFormat"`
+		Suffix        string `json:"suffix"`
+		OpenAIFormat  string `json:"openaiFormat"`
+		ClaudeFormat  string `json:"claudeFormat"`
+		NativeMode    string `json:"nativeMode"`
+		NativeDisplay string `json:"nativeDisplay"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5749,10 +6088,40 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Native adaptive thinking is what makes the upstream emit a signature, so
+	// an invalid value must be rejected rather than silently falling back.
+	validNativeModes := map[string]bool{"off": true, "auto": true, "force": true}
+	if req.NativeMode != "" && !validNativeModes[strings.ToLower(req.NativeMode)] {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid nativeMode, must be: off, auto, or force"})
+		return
+	}
+	if req.NativeDisplay != "" && req.NativeDisplay != "summarized" && req.NativeDisplay != "omitted" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid nativeDisplay, must be: summarized or omitted"})
+		return
+	}
+
 	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+	if req.NativeMode != "" || req.NativeDisplay != "" {
+		current := config.GetThinkingConfig()
+		mode := req.NativeMode
+		if mode == "" {
+			mode = current.NativeMode
+		}
+		display := req.NativeDisplay
+		if display == "" {
+			display = current.NativeDisplay
+		}
+		if err := config.UpdateThinkingNativeConfig(mode, display); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -6326,7 +6695,7 @@ func (h *Handler) proxyExternalClaudeToOpenAI(w http.ResponseWriter, r *http.Req
 		if cooldown, opened := externalCircuitFailure(baseURL, "", clientTimeout); opened {
 			logger.Warnf("[ExternalAPI] Circuit opened for %s for %s after repeated transport failures", displayURL, cooldown)
 		}
-		h.recordFailureWithDuration("claude", req.Model, displayURL, err, time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "claude", req.Model, displayURL, err, time.Since(reqStart).Milliseconds())
 		return false
 	}
 	defer resp.Body.Close()
@@ -6334,7 +6703,7 @@ func (h *Handler) proxyExternalClaudeToOpenAI(w http.ResponseWriter, r *http.Req
 		if cooldown, opened := externalCircuitFailure(baseURL, resp.Header.Get("Retry-After"), clientTimeout); opened {
 			logger.Warnf("[ExternalAPI] Circuit opened for %s for %s after repeated HTTP %d responses", displayURL, cooldown, resp.StatusCode)
 		}
-		h.recordFailureWithDuration("claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 		return false
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -6343,7 +6712,7 @@ func (h *Handler) proxyExternalClaudeToOpenAI(w http.ResponseWriter, r *http.Req
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		h.recordFailureWithDuration("claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "claude", req.Model, displayURL, fmt.Errorf("HTTP %d", resp.StatusCode), time.Since(reqStart).Milliseconds())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
@@ -6466,6 +6835,6 @@ func (h *Handler) proxyExternalClaudeToOpenAI(w http.ResponseWriter, r *http.Req
 	}
 
 	h.recordSuccessForApiKey(apiKeyID, inTokens, outTokens, 0)
-	h.recordSuccessLog("claude", req.Model, displayURL, inTokens+outTokens, 0, time.Since(reqStart).Milliseconds())
+	h.recordSuccessLog(w, "claude", req.Model, displayURL, inTokens, outTokens, 0, time.Since(reqStart).Milliseconds())
 	return true
 }

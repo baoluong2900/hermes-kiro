@@ -4,16 +4,9 @@
   "main": "worker.gateway.js",
   "compatibility_date": "2025-02-01",
   "workers_dev": true,
-  "routes": [
-    {
-      "pattern": "kiro-go.hermesgate.app",
-      "custom_domain": true
-    },
-    {
-      "pattern": "kiro.hermesgate.app",
-      "custom_domain": true
-    }
-  ],
+  // Both Kiro hostnames reach the Render Go server through its embedded Cloudflare Tunnel.
+  // Keep routes empty: a Worker custom-domain deploy would reclaim production traffic.
+  "routes": [],
   "assets": {
     "directory": "../web",
     "binding": "ASSETS",

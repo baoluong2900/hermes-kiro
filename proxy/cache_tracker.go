@@ -69,7 +69,33 @@ func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
 }
 
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int) *promptCacheProfile {
-	blocks := flattenClaudeCacheBlocks(req)
+	return buildProfileFromBlocks(flattenClaudeCacheBlocks(req), totalInputTokens, req.Model)
+}
+
+// BuildOpenAIProfile builds a cache profile for Chat Completions, which has no
+// per-block cache_control. Kiro's server-side prefix cache applies regardless of
+// the client surface, so mirror Anthropic's automatic caching: every message
+// end is a breakpoint, and a growing conversation reads back its prefix on the
+// next turn. Without this the OpenAI route reported no cache figures at all.
+func (t *promptCacheTracker) BuildOpenAIProfile(req *OpenAIRequest, totalInputTokens int) *promptCacheProfile {
+	if req == nil || len(req.Messages) == 0 {
+		return nil
+	}
+	blocks := make([]cacheablePromptBlock, 0, len(req.Messages)+len(req.Tools)+1)
+	prelude := map[string]interface{}{"kind": "request_prelude", "model": req.Model}
+	blocks = append(blocks, cacheablePromptBlock{Value: prelude, Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude))})
+	for i, tool := range req.Tools {
+		v := map[string]interface{}{"kind": "tool", "tool_index": i, "name": tool.Function.Name, "description": tool.Function.Description, "input_schema": tool.Function.Parameters}
+		blocks = append(blocks, cacheablePromptBlock{Value: v, Tokens: estimateApproxTokens(canonicalizeCacheValue(v))})
+	}
+	for i, msg := range req.Messages {
+		v := map[string]interface{}{"kind": "message", "message_index": i, "role": msg.Role, "content": msg.Content, "tool_calls": msg.ToolCalls, "tool_call_id": msg.ToolCallID}
+		blocks = append(blocks, cacheablePromptBlock{Value: v, Tokens: estimateApproxTokens(canonicalizeCacheValue(v)), TTL: defaultPromptCacheTTL, IsMessageEnd: true})
+	}
+	return buildProfileFromBlocks(blocks, totalInputTokens, req.Model)
+}
+
+func buildProfileFromBlocks(blocks []cacheablePromptBlock, totalInputTokens int, model string) *promptCacheProfile {
 	if len(blocks) == 0 {
 		return nil
 	}
@@ -121,7 +147,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	return &promptCacheProfile{
 		Breakpoints:      breakpoints,
 		TotalInputTokens: totalInputTokens,
-		Model:            req.Model,
+		Model:            model,
 	}
 }
 
@@ -276,6 +302,16 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 		"kind":        "request_prelude",
 		"model":       req.Model,
 		"tool_choice": req.ToolChoice,
+	}
+	// The reasoning directive is part of the upstream request prefix: a turn
+	// sent at a different effort (or with thinking switched on) does not hit the
+	// prefix cached for the previous effort.
+	if d := req.CacheReasoning; d != nil {
+		prelude["reasoning"] = map[string]interface{}{
+			"effort":  d.Effort(),
+			"display": d.Native.Display,
+			"native":  d.Native.Enabled,
+		}
 	}
 	return cacheablePromptBlock{
 		Value:  prelude,

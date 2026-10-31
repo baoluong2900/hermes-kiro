@@ -7,11 +7,13 @@ import (
 	"time"
 )
 
-// apiKeyView is the response payload for listing/inspecting API keys. The Key field
-// is masked so admins can identify entries without exposing the secret.
+// apiKeyView is the response payload for listing/inspecting API keys. Every route
+// using it is behind admin auth; Key is included so the admin panel's Copy button works
+// (parity with the edge Worker, which also returns the plaintext key to admins).
 type apiKeyView struct {
 	ID            string  `json:"id"`
 	Name          string  `json:"name,omitempty"`
+	Key           string  `json:"key"`
 	KeyMasked     string  `json:"keyMasked"`
 	Enabled       bool    `json:"enabled"`
 	Migrated      bool    `json:"migrated,omitempty"`
@@ -31,6 +33,7 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 	return apiKeyView{
 		ID:            e.ID,
 		Name:          e.Name,
+		Key:           e.Key,
 		KeyMasked:     config.MaskApiKey(e.Key),
 		Enabled:       e.Enabled,
 		Migrated:      e.Migrated,

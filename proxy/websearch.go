@@ -519,7 +519,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		if account != nil {
 			accountID = account.ID
 		}
-		h.recordFailureWithDuration("claude", req.Model, accountID, err, time.Since(reqStart).Milliseconds())
+		h.recordFailureWithDuration(w, "claude", req.Model, accountID, err, time.Since(reqStart).Milliseconds())
 		// Prefer a real error over a silent empty body (issue #120 symptom).
 		status := 502
 		errType := "api_error"
@@ -551,7 +551,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
 	}
 	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
-	h.recordSuccessLog("claude", req.Model, accountID, inputTokens+outputTokens, 0, time.Since(reqStart).Milliseconds())
+	h.recordSuccessLog(w, "claude", req.Model, accountID, inputTokens, outputTokens, 0, time.Since(reqStart).Milliseconds())
 
 	if req.Stream {
 		h.streamWebSearchSSE(w, req.Model, query, toolUseID, results, inputTokens, outputTokens)

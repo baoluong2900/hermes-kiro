@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"regexp"
 	"strings"
 	"time"
@@ -260,14 +263,31 @@ type ClaudeRequest struct {
 	Stream      bool                  `json:"stream,omitempty"`
 	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	// OutputConfig mirrors Anthropic's root-level `output_config` object, the
+	// canonical location for the adaptive thinking effort level.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+	Tools        []ClaudeTool        `json:"tools,omitempty"`
+	ToolChoice   interface{}         `json:"tool_choice,omitempty"`
+	// CacheReasoning is the resolved upstream reasoning directive, including a
+	// model-pinned or configured effort. It is gateway-only fingerprint
+	// metadata — never client-controlled and never forwarded — so that changing
+	// the effort mid-conversation invalidates the prompt-cache prefix instead
+	// of reporting a cache hit the upstream did not give us.
+	CacheReasoning *reasoningDecision `json:"-"`
 }
 
 type ClaudeThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 	Display      string `json:"display,omitempty"`
+	// Effort is Anthropic's adaptive-thinking level (low | medium | high |
+	// xhigh | max). It coexists with the legacy budget_tokens form.
+	Effort string `json:"effort,omitempty"`
+}
+
+// ClaudeOutputConfig mirrors Anthropic's root-level `output_config` object.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -280,6 +300,7 @@ type ClaudeContentBlock struct {
 	Text      string       `json:"text,omitempty"`
 	Thinking  string       `json:"thinking,omitempty"`
 	Signature string       `json:"signature,omitempty"`
+	Data      string       `json:"data,omitempty"` // redacted_thinking opaque blob
 	ID        string       `json:"id,omitempty"`
 	Name      string       `json:"name,omitempty"`
 	Input     interface{}  `json:"input,omitempty"`
@@ -376,11 +397,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				})
 			}
 		} else if msg.Role == "assistant" {
-			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			content, toolUses, reasoning := extractClaudeAssistantContentWithThinking(msg.Content)
 			history = append(history, KiroHistoryMessage{
 				AssistantResponseMessage: &KiroAssistantResponseMessage{
 					Content:  content,
 					ToolUses: toolUses,
+					// Echo prior native reasoning back to Kiro so adaptive
+					// thinking stays consistent across turns. Each block's text
+					// and signature travel as the pair the model produced them
+					// as; unsigned reasoning is dropped rather than rejected
+					// upstream.
+					ReasoningContent: selectKiroReasoningContent(reasoning),
 				},
 			})
 		}
@@ -786,7 +813,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				}
 			}
 			toolResults = append(toolResults, KiroToolResult{
-				ToolUseID: toolUseID,
+				ToolUseID: normalizeToolUseID(toolUseID),
 				Content:   []KiroResultContent{{Text: resultContent}},
 				Status:    "success",
 			})
@@ -889,11 +916,90 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 }
 
 func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
+	text, toolUses, _ := extractClaudeAssistantContentWithThinking(content)
+	return text, toolUses
+}
+
+// claudeReasoningBlock is one reasoning block from a client-sent assistant turn,
+// kept intact. Anthropic pairs each signature with the text of its own block and
+// verifies the pair, so text and signature must never be recombined across
+// blocks: concatenating two thinking texts and attaching the last signature
+// produces a pair that cannot verify.
+//
+// Exactly one of the two shapes is populated: a plaintext thinking block carries
+// Text (+ Signature when signed), a redacted_thinking block carries Redacted.
+type claudeReasoningBlock struct {
+	Text      string
+	Signature string
+	Redacted  string
+}
+
+// signed reports whether the block carries material the upstream can verify or
+// must receive back verbatim. An unsigned thinking block is text the model
+// produced but that nothing depends on.
+func (b claudeReasoningBlock) signed() bool {
+	return b.Signature != "" || b.Redacted != ""
+}
+
+// selectKiroReasoningContent maps a turn's reasoning blocks onto the single
+// reasoningContent slot the Kiro history shape provides.
+//
+// Kiro's assistantResponseMessage carries exactly one reasoningContent — one
+// signature per assistant turn, including turns that emit several parallel tool
+// calls — so a client turn holding more than one reasoning block cannot be
+// represented in full. The last block that carries verifiable material wins: it
+// is the reasoning closest to the tool call or answer that follows, which is
+// what a continuation turn is about. The chosen block is copied verbatim;
+// nothing is merged.
+//
+// Unsigned thinking text is dropped outright rather than forwarded: the upstream
+// verifies the text/signature pair and rejects a reasoning block whose signature
+// is missing with HTTP 400 THINKING_SIGNATURE_INVALID ("Invalid `signature` in
+// `thinking` block"), which no retry and no other account can fix. Clients
+// legitimately replay unsigned thinking (we emit it whenever the upstream sent
+// no signature, e.g. display=omitted), so the whole conversation would become
+// unanswerable. The reasoning text nothing depends on is the safe thing to lose.
+func selectKiroReasoningContent(blocks []claudeReasoningBlock) *KiroReasoningContent {
+	var chosen *claudeReasoningBlock
+	dropped := 0
+	for i := range blocks {
+		if !blocks[i].signed() {
+			dropped++
+			continue
+		}
+		chosen = &blocks[i]
+	}
+	if dropped > 0 {
+		logger.Debugf("[Thinking] dropped %d unsigned thinking block(s) from a client assistant turn; the upstream rejects reasoning it cannot verify", dropped)
+	}
+	if chosen == nil {
+		return nil
+	}
+	if len(blocks) > 1 {
+		logger.Debugf("[Thinking] assistant turn carried %d reasoning blocks; upstream has one reasoningContent slot, keeping the last verifiable block verbatim", len(blocks))
+	}
+	if chosen.Redacted != "" && chosen.Text == "" && chosen.Signature == "" {
+		return &KiroReasoningContent{RedactedContent: chosen.Redacted}
+	}
+	return &KiroReasoningContent{
+		ReasoningText: &KiroReasoningText{
+			Text:      chosen.Text,
+			Signature: chosen.Signature,
+		},
+	}
+}
+
+// extractClaudeAssistantContentWithThinking is extractClaudeAssistantContent
+// plus the turn's reasoning blocks in order, so they can be echoed back to Kiro
+// as reasoningContent — which native adaptive thinking requires for continuity
+// across tool-use turns.
+func extractClaudeAssistantContentWithThinking(content interface{}) (string, []KiroToolUse, []claudeReasoningBlock) {
 	var text string
 	var toolUses []KiroToolUse
+	var reasoning []claudeReasoningBlock
 
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, nil
 	}
 
 	// Same dual-shape support as extractClaudeUserContent (JSON []interface{}
@@ -905,6 +1011,25 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 			if t, ok := block["text"].(string); ok {
 				text += t
 			}
+		case "thinking":
+			// One block, one signature: recorded as a pair and never merged
+			// with a neighbouring block.
+			rb := claudeReasoningBlock{}
+			if t, ok := block["thinking"].(string); ok {
+				rb.Text = t
+			}
+			if sig, ok := block["signature"].(string); ok {
+				rb.Signature = sig
+			}
+			if rb.Text != "" || rb.Signature != "" {
+				reasoning = append(reasoning, rb)
+			}
+		case "redacted_thinking":
+			// Opaque reasoning (GPT-style). The blob lives on "data"; echo it
+			// back verbatim for multi-turn continuity.
+			if d, ok := block["data"].(string); ok && d != "" {
+				reasoning = append(reasoning, claudeReasoningBlock{Redacted: d})
+			}
 		case "tool_use":
 			id, _ := block["id"].(string)
 			name, _ := block["name"].(string)
@@ -913,14 +1038,14 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 				input = make(map[string]interface{})
 			}
 			toolUses = append(toolUses, KiroToolUse{
-				ToolUseID: id,
+				ToolUseID: normalizeToolUseID(id),
 				Name:      name,
 				Input:     input,
 			})
 		}
 	}
 
-	return text, toolUses
+	return text, toolUses, reasoning
 }
 
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
@@ -1005,7 +1130,6 @@ func ensureObjectSchema(schema interface{}) interface{} {
 		return map[string]interface{}{"type": "object"}
 	}
 	cleaned := cloneSchemaMap(m)
-	delete(cleaned, "$schema")
 	flattenRootSchemaCombinators(cleaned)
 	cleanSchema(cleaned)
 	if _, hasType := cleaned["type"]; !hasType {
@@ -1175,6 +1299,12 @@ func cloneSchemaValue(v interface{}) interface{} {
 // cleanSchema 递归清理会导致 Kiro 400 的 schema 字段。
 func cleanSchema(m map[string]interface{}) {
 	delete(m, "additionalProperties")
+	// $schema is a JSON-Schema dialect artifact (e.g. the draft 2020-12 URL
+	// clients attach to input_schema). Kiro's native tool specs never carry it;
+	// forwarding it risks an upstream "improperly formed request". It usually
+	// only appears at the root, but nested subschemas (and branches merged up by
+	// flattenRootSchemaCombinators) can carry one too, so strip at every level.
+	delete(m, "$schema")
 
 	// required 必须是非空数组，否则 Kiro 会报 Improperly formed request。
 	if req, exists := m["required"]; exists {
@@ -1265,12 +1395,39 @@ func shortenToolName(name string) string {
 // ==================== Kiro -> Claude 转换 ====================
 
 func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+	return KiroToClaudeResponseWithSignature(content, thinkingContent, "", nil, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+}
+
+// KiroToClaudeResponseWithSignature assembles the Anthropic content blocks for a
+// non-streaming turn, carrying the upstream's native thinking signature on the
+// thinking block so verifying clients accept it (and can replay the signed pair
+// on the next turn).
+//
+// redactedReasoning holds every opaque reasoning blob the upstream sent, in
+// order: each becomes its own redacted_thinking block, because a block is the
+// unit Anthropic verifies and echoes back — collapsing several blobs into one
+// would corrupt all of them.
+func KiroToClaudeResponseWithSignature(content, thinkingContent, thinkingSignature string, redactedReasoning []string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
-	if thinkingContent != "" || includeEmptyThinkingBlock {
+	if thinkingContent != "" || includeEmptyThinkingBlock || thinkingSignature != "" {
 		blocks = append(blocks, ClaudeContentBlock{
-			Type:     "thinking",
-			Thinking: thinkingContent,
+			Type:      "thinking",
+			Thinking:  thinkingContent,
+			Signature: thinkingSignature,
+		})
+	}
+
+	// Opaque (redacted) reasoning: surface each blob as its own native
+	// redacted_thinking block so Anthropic-compatible clients can round-trip
+	// them back verbatim, in the order the upstream produced them.
+	for _, data := range redactedReasoning {
+		if data == "" {
+			continue
+		}
+		blocks = append(blocks, ClaudeContentBlock{
+			Type: "redacted_thinking",
+			Data: data,
 		})
 	}
 
@@ -1331,6 +1488,16 @@ type OpenAIMessage struct {
 	Content    interface{} `json:"content"`
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
+	// ReasoningContent/Signature carry a prior assistant turn's native thinking
+	// back to the gateway. Clients that preserve both can round-trip signed
+	// reasoning into Kiro's reasoningContent slot; an unsigned reasoning_content
+	// is dropped, because the upstream rejects reasoning it cannot verify.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Signature        string `json:"signature,omitempty"`
+	// RedactedReasoning carries the opaque, encrypted reasoning blob GPT-family
+	// models emit. Not part of the Chat Completions wire format; populated
+	// internally and echoed back as reasoningContent.redactedContent.
+	RedactedReasoning string `json:"-"`
 }
 
 type ToolCall struct {
@@ -1486,18 +1653,36 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 					input = make(map[string]interface{})
 				}
 				toolUses = append(toolUses, KiroToolUse{
-					ToolUseID: tc.ID,
+					ToolUseID: normalizeToolUseID(tc.ID),
 					Name:      tc.Function.Name,
 					Input:     input,
 				})
 			}
 
-			history = append(history, KiroHistoryMessage{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content:  content,
-					ToolUses: toolUses,
-				},
-			})
+			asst := &KiroAssistantResponseMessage{
+				Content:  content,
+				ToolUses: toolUses,
+			}
+			// Echo prior native thinking back to Kiro when the client preserved
+			// it. GPT-style encrypted reasoning (redactedContent) takes
+			// precedence over plaintext reasoning_content: it is the opaque blob
+			// the upstream needs verbatim to resume its reasoning state.
+			if msg.RedactedReasoning != "" {
+				// A /v1/responses envelope carries signed plaintext reasoning,
+				// which the upstream accepts as reasoningText; anything else is
+				// a GPT-style encrypted blob echoed back verbatim.
+				asst.ReasoningContent = kiroReasoningFromOpaque(msg.RedactedReasoning)
+			} else if msg.Signature != "" {
+				asst.ReasoningContent = &KiroReasoningContent{
+					ReasoningText: &KiroReasoningText{
+						Text:      msg.ReasoningContent,
+						Signature: msg.Signature,
+					},
+				}
+			} else if msg.ReasoningContent != "" {
+				logger.Debugf("[Thinking] dropped unsigned reasoning_content from a client assistant turn; the upstream rejects reasoning it cannot verify")
+			}
+			history = append(history, KiroHistoryMessage{AssistantResponseMessage: asst})
 
 		case "tool":
 			cleanText, toolImages := extractOpenAIUserContent(msg.Content)
@@ -1512,7 +1697,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 				content = extractOpenAIMessageText(msg.Content)
 			}
 			currentToolResults = append(currentToolResults, KiroToolResult{
-				ToolUseID: msg.ToolCallID,
+				ToolUseID: normalizeToolUseID(msg.ToolCallID),
 				Content:   []KiroResultContent{{Text: content}},
 				Status:    "success",
 			})
@@ -1710,6 +1895,22 @@ func extractOpenAIMessageText(content interface{}) string {
 	}
 
 	return ""
+}
+
+// validToolUseIDPattern is the toolUseId shape Kiro accepts; anything else
+// (e.g. "call_x|fc_y" from Responses-bridging clients, or >64 chars) is
+// rejected with 400 "Invalid tool use format".
+var validToolUseIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// normalizeToolUseID maps a client tool-call ID onto a Kiro-valid one. The
+// mapping is deterministic so a tool call and its result still pair up.
+func normalizeToolUseID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" || validToolUseIDPattern.MatchString(id) {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return "tooluse_" + hex.EncodeToString(sum[:16])
 }
 
 // collectToolResultIDs returns the set of toolUseId values referenced by the
@@ -2387,6 +2588,8 @@ func parseBase64Image(data, format string) *KiroImage {
 		format = "png"
 	}
 
+	data, format = shrinkImageToLimit(data, format)
+
 	return &KiroImage{
 		Format: format,
 		Source: struct {
@@ -2496,6 +2699,16 @@ func extractThinkingFromContent(content string) (string, string) {
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
 func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
+	return KiroToOpenAIResponseWithReasoningSignature(content, reasoningContent, "", toolUses, inputTokens, outputTokens, model, thinkingFormat)
+}
+
+// KiroToOpenAIResponseWithReasoningSignature is KiroToOpenAIResponseWithReasoning
+// plus the upstream's native thinking signature. The signature is only emitted
+// in the "reasoning_content" format: the <think>/<thinking> formats fold the
+// reasoning into the answer text, so there is no reasoning field left for a
+// signature to belong to. Clients that echo the signature back on the next
+// assistant message get their reasoning accepted upstream instead of dropped.
+func KiroToOpenAIResponseWithReasoningSignature(content, reasoningContent, signature string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
 	finishReason := "stop"
 
 	message := map[string]interface{}{
@@ -2529,9 +2742,17 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			default: // "reasoning_content"
 				message["content"] = content
 				message["reasoning_content"] = reasoningContent
+				if signature != "" {
+					message["signature"] = signature
+				}
 			}
 		} else {
 			message["content"] = content
+			if signature != "" && thinkingFormat != "think" && thinkingFormat != "thinking" {
+				// display=omitted upstream: a signature with no reasoning text.
+				// It still has to reach the client to be replayed.
+				message["signature"] = signature
+			}
 		}
 	}
 

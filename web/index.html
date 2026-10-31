@@ -493,6 +493,23 @@
               <option value="think" data-i18n="settings.formatThinkOpenAI"></option>
             </select>
           </div>
+          <div class="form-group">
+            <label data-i18n="settings.nativeMode"></label>
+            <select id="thinkingNativeMode">
+              <option value="auto" data-i18n="settings.nativeModeAuto"></option>
+              <option value="force" data-i18n="settings.nativeModeForce"></option>
+              <option value="off" data-i18n="settings.nativeModeOff"></option>
+            </select>
+            <small data-i18n="settings.nativeModeHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.nativeDisplay"></label>
+            <select id="thinkingNativeDisplay">
+              <option value="summarized" data-i18n="settings.nativeDisplaySummarized"></option>
+              <option value="omitted" data-i18n="settings.nativeDisplayOmitted"></option>
+            </select>
+            <small data-i18n="settings.nativeDisplayHint"></small>
+          </div>
           <button class="btn btn-primary" id="saveThinkingBtn" data-i18n="settings.saveThinking"></button>
         </div>
 

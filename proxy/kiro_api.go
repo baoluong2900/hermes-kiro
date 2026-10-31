@@ -886,4 +886,10 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+
+	// AdditionalModelRequestFieldsSchema is the upstream JSON-Schema description
+	// of the provider-native request fields this model accepts. It is the only
+	// authority on which reasoning directive a model takes and which effort
+	// levels are legal — see model_capabilities.go.
+	AdditionalModelRequestFieldsSchema *ModelRequestFieldsSchema `json:"additionalModelRequestFieldsSchema,omitempty"`
 }

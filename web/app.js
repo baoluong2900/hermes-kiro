@@ -820,6 +820,29 @@
     return t(key) || type;
   }
 
+  // Why a failed request failed. `failureKind` is written by the gateway and is
+  // the only thing that separates a REAL Kiro throttle from this gateway's own
+  // admission gate / cooldown refusing to call upstream — both used to render
+  // as the identical "Kiro throttled this model" row, which sent the operator
+  // hunting a phantom upstream rate limit.
+  var LOG_FAILURE_KINDS = {
+    upstream_throttle: { label: 'logs.causeUpstreamThrottle', cls: 'throttle', tip: 'logs.causeUpstreamThrottleTip' },
+    local_admission: { label: 'logs.causeLocalAdmission', cls: 'admission', tip: 'logs.causeLocalAdmissionTip' },
+    local_cooldown: { label: 'logs.causeLocalCooldown', cls: 'cooldown', tip: 'logs.causeLocalCooldownTip' },
+    upstream_empty: { label: 'logs.causeUpstreamEmpty', cls: 'empty', tip: 'logs.causeUpstreamEmptyTip' },
+  };
+
+  function logFailureBadge(l) {
+    var kind = l && l.failureKind;
+    var spec = kind && LOG_FAILURE_KINDS[kind];
+    if (!spec) {
+      return '<span class="err-badge err-badge--' + escapeAttr((l && l.errorType) || 'unknown') + '">' +
+        escapeHtml(errorTypeLabel((l && l.errorType) || 'unknown')) + '</span>';
+    }
+    return '<span class="err-badge err-badge--' + spec.cls + '" title="' + escapeAttr(t(spec.tip)) + '">' +
+      escapeHtml(t(spec.label)) + '</span>';
+  }
+
   function formatLogTime(ts) {
     const d = new Date(ts * 1000);
     const pad = n => String(n).padStart(2, '0');
@@ -857,6 +880,17 @@
       return privacyModeEnabled ? maskEmail(acc.email) : acc.email;
     }
     return id.slice(0, 8);
+  }
+
+  // A request that exhausted the pool is stored under the last credential it
+  // tried; show how many others failed before it, with the full chain on hover.
+  function logAccountCell(l) {
+    const label = escapeHtml(accountLabel(l.accountId) || l.account || '-');
+    const tried = Array.isArray(l.attemptedAccountIds) ? l.attemptedAccountIds : [];
+    if (tried.length < 2) return label;
+    const chain = tried.map(id => accountLabel(id)).join(' → ');
+    return '<span title="' + escapeAttr('Tried in order: ' + chain) + '">' + label +
+      ' <span class="text-muted">+' + (tried.length - 1) + '</span></span>';
   }
 
   async function loadLogs() {
@@ -906,6 +940,7 @@
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
       '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.cacheHit')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
@@ -919,8 +954,7 @@
       if (!isSuccess) {
         const rawErr = String(l.error || 'Failed');
         detailCell = '<div class="log-detail-cell">' +
-          '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
-          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span>' +
+          logFailureBadge(l) +
           '<span class="log-msg" title="' + escapeAttr(rawErr) + '">' + escapeHtml(rawErr) + '</span>' +
           '</div>';
       } else {
@@ -937,14 +971,30 @@
         '<td>' + keyCell + '</td>' +
         '<td>' + escapeHtml(l.endpoint || (l.kind === 'claude' ? '/v1/messages' : '/v1/chat/completions')) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
-        '<td>' + escapeHtml(accountLabel(l.accountId) || l.account || '-') + '</td>' +
+        '<td>' + logAccountCell(l) + '</td>' +
         '<td>' + escapeHtml(tokensVal) + '</td>' +
+        '<td>' + logCacheCell(l) + '</td>' +
         '<td>' + escapeHtml(formatLogDuration(l)) + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';
     }
     html += '</tbody></table>';
     list.innerHTML = html;
+  }
+
+  // Cache column: tokens read from a warm prefix and the share of the input
+  // they covered; a write-only turn shows what was stored for the next one.
+  function logCacheCell(l) {
+    const read = Number(l.cacheReadTokens) || 0;
+    const write = Number(l.cacheWriteTokens) || 0;
+    if (!read && !write) return '<span class="text-muted">-</span>';
+    const input = Number(l.inputTokens) || 0;
+    const pct = read && input ? Math.min(100, Math.round(read * 100 / input)) : 0;
+    let html = read
+      ? '<span class="log-cache-hit" title="' + escapeAttr(t('logs.cacheRead')) + '">' + escapeHtml(formatNum(read)) + ' (' + pct + '%)</span>'
+      : '';
+    if (write) html += (read ? ' ' : '') + '<span class="text-muted text-xs" title="' + escapeAttr(t('logs.cacheWrite')) + '">+' + escapeHtml(formatNum(write)) + '</span>';
+    return html;
   }
 
   async function clearLogs() {
@@ -1085,6 +1135,9 @@
 
     if (!a.enabled) {
       out.push('<span class="badge badge-muted"><i class="fa-solid fa-power-off"></i> ' + escapeHtml(t('accounts.disabled')) + '</span>');
+    } else if (a.cooldownUntil && a.cooldownUntil * 1000 > Date.now()) {
+      const mins = Math.max(1, Math.ceil((a.cooldownUntil * 1000 - Date.now()) / 60000));
+      out.push('<span class="badge badge-warning" title="' + escapeHtml(new Date(a.cooldownUntil * 1000).toLocaleString()) + '"><i class="fa-solid fa-snowflake"></i> ' + escapeHtml(t('accounts.coolingDown')) + ' ' + mins + 'm</span>');
     } else {
       out.push('<span class="badge badge-success"><span class="status-dot"></span> ' + escapeHtml(t('accounts.normal')) + '</span>');
     }
@@ -1151,6 +1204,7 @@
     if (m === 'google') return '<i class="fa-brands fa-google" aria-hidden="true"></i>';
     if (m === 'builderid' || m === 'aws' || m === 'idc') return '<i class="fa-brands fa-aws" aria-hidden="true"></i>';
     if (m === 'external_idp' || m === 'azuread' || m === 'microsoft') return '<i class="fa-brands fa-microsoft" aria-hidden="true"></i>';
+    if (m === 'api_key' || m === 'apikey') return '<i class="fa-solid fa-key" aria-hidden="true"></i>';
     return '<i class="fa-solid fa-cloud" aria-hidden="true"></i>';
   }
   function getProviderAvatarClass(method) {
@@ -1196,7 +1250,9 @@
       const trialClass = trialPct > 90 ? 'critical' : trialPct > 70 ? 'high' : '';
       const isSelected = selectedAccounts.has(a.id);
       const weight = a.weight || 0;
-      const weightBadge = weight >= 1 ? '<span class="badge badge-warning" title="' + escapeAttr(t('detail.weight')) + ': ' + weight + '">P' + weight + '</span>' : '';
+      const priority = a.priority || 0;
+      const weightBadge = (priority ? '<span class="badge badge-warning" title="' + escapeAttr(t('detail.priority')) + ': ' + priority + '">P' + priority + '</span>' : '') +
+        (weight >= 2 ? '<span class="badge badge-info" title="' + escapeAttr(t('detail.weight')) + ': ' + weight + '">W' + weight + '</span>' : '');
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
       const idAttr = escapeAttr(a.id);
       const orderBadge = '<span class="account-index-badge">#' + (idx + 1) + '</span>';
@@ -1232,7 +1288,7 @@
         '</div>' +
         '<div class="account-meta">' +
         getSubBadge(a.subscriptionType, a) +
-        (weight >= 1 ? '<span class="badge badge-warning" title="' + escapeAttr(t('detail.weight')) + ': ' + weight + '">P' + weight + '</span>' : '') +
+        weightBadge +
         getTrialBadge(a) +
         overageBadge +
         (a.linkedCredentialCount > 1 ? '<span class="badge badge-info" title="Gateway usage is shared across credentials for this Kiro account">Shared · ' + a.linkedCredentialCount + '</span>' : '') +
@@ -1501,10 +1557,14 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div></div>' +
 
-      '<div class="detail-section"><h4><i class="fa-solid fa-arrow-up-wide-short"></i> ' + escapeHtml(t('detail.weight')) + ' (Priority)</h4>' +
+      '<div class="detail-section"><h4><i class="fa-solid fa-arrow-up-wide-short"></i> ' + escapeHtml(t('detail.priority')) + ' / ' + escapeHtml(t('detail.weight')) + '</h4>' +
+      '<div class="form-group">' +
+      '<input type="number" id="priorityInput" value="' + (a.priority || 0) + '" min="0" max="100" />' +
+      '<small>' + escapeHtml(t('detail.priorityHint')) + '</small>' +
+      '</div>' +
       '<div class="form-group">' +
       '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" />' +
-      '<small>' + escapeHtml(t('detail.weightHint')) + ' (0 = P0 mặc định, 1-10 = ưu tiên cao)</small>' +
+      '<small>' + escapeHtml(t('detail.weightHint')) + '</small>' +
       '</div>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
@@ -1612,7 +1672,8 @@
   }
   async function saveWeight(id) {
     const weight = parseInt($('weightInput').value, 10) || 0;
-    await putAccount(id, { weight }, t('detail.saved'));
+    const priority = parseInt($('priorityInput').value, 10) || 0;
+    await putAccount(id, { weight, priority }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -1932,13 +1993,17 @@
     $('thinkingSuffix').value = d.suffix || '-thinking';
     $('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
     $('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
+    if ($('thinkingNativeMode')) $('thinkingNativeMode').value = d.nativeMode || 'auto';
+    if ($('thinkingNativeDisplay')) $('thinkingNativeDisplay').value = d.nativeDisplay || 'summarized';
   }
   async function saveThinkingConfig() {
     const res = await api('/thinking', {
       method: 'POST', body: JSON.stringify({
         suffix: $('thinkingSuffix').value || '-thinking',
         openaiFormat: $('openaiThinkingFormat').value,
-        claudeFormat: $('claudeThinkingFormat').value
+        claudeFormat: $('claudeThinkingFormat').value,
+        nativeMode: $('thinkingNativeMode') ? $('thinkingNativeMode').value : '',
+        nativeDisplay: $('thinkingNativeDisplay') ? $('thinkingNativeDisplay').value : ''
       })
     });
     const d = await res.json();
@@ -2419,6 +2484,7 @@
       '<th>IP</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.cacheHit')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
@@ -2434,8 +2500,7 @@
       if (!isSuccess) {
         const rawErr = String(l.error || 'Failed');
         detailCell = '<div class="log-detail-cell">' +
-          '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
-          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span>' +
+          logFailureBadge(l) +
           '<span class="log-msg" title="' + escapeAttr(rawErr) + '">' + escapeHtml(rawErr) + '</span>' +
           '</div>';
       } else {
@@ -2447,6 +2512,7 @@
         '<td>' + ipCell + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(tokensVal) + '</td>' +
+        '<td>' + logCacheCell(l) + '</td>' +
         '<td>' + escapeHtml(formatLogDuration(l)) + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';
@@ -4852,6 +4918,13 @@
       if (!$('tabChannels').classList.contains('hidden')) loadChannelStatus();
     }, 5000);
   }
+
+  // Upstream error bodies are long JSON; the ellipsized cell hid everything past
+  // the first few characters and the hover title is unusable on touch. Click to expand.
+  document.addEventListener('click', (e) => {
+    const msg = e.target.closest && e.target.closest('.log-msg');
+    if (msg) msg.classList.toggle('log-msg--open');
+  });
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

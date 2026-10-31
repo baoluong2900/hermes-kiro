@@ -14,10 +14,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o kiro-go .
 
+FROM cloudflare/cloudflared:2026.10.7@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba AS cloudflared
+
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add bash ca-certificates
 
 WORKDIR /app
+COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY --chmod=755 deploy/docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --from=builder /app/kiro-go .
 COPY --from=builder /app/web ./web
 RUN mkdir -p /app/data
@@ -25,4 +29,5 @@ RUN mkdir -p /app/data
 EXPOSE 8080
 VOLUME /app/data
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["./kiro-go"]

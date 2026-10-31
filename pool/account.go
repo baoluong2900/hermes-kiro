@@ -4,6 +4,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,29 +15,37 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
+	mu             sync.RWMutex
+	accounts       []config.Account // weighted entries, grouped by priority tier descending
+	tiers          []accountTier    // slice ranges of p.accounts per priority tier, highest first
+	cursors        map[int]*uint64  // per-tier round-robin cursor
+	totalAccounts  int
+	cooldowns      map[string]time.Time            // 账号冷却时间
+	errorCounts    map[string]int                  // 连续错误计数
 	modelLists     map[string]map[string]bool      // accountID → set of modelIDs (from ListAvailableModels)
 	modelCooldowns map[string]map[string]time.Time // accountID → modelID → model-level cooldown
+}
+
+// accountTier marks the range [start, end) of p.accounts belonging to one
+// priority tier. Weight expansion happens inside a tier, so weight balances
+// traffic within a tier while priority decides which tier serves at all.
+type accountTier struct {
+	priority int
+	start    int
+	end      int
 }
 
 // NewTestPool constructs an isolated account pool for cross-package tests.
 // Production code should use GetPool.
 func NewTestPool(accounts ...config.Account) *AccountPool {
-	isolated := make([]config.Account, len(accounts))
-	copy(isolated, accounts)
-	return &AccountPool{
-		accounts:      isolated,
-		totalAccounts: len(isolated),
-		cooldowns:     make(map[string]time.Time),
-		errorCounts:   make(map[string]int),
+	p := &AccountPool{
+		cooldowns:      make(map[string]time.Time),
+		errorCounts:    make(map[string]int),
 		modelLists:     make(map[string]map[string]bool),
 		modelCooldowns: make(map[string]map[string]time.Time),
 	}
+	p.rebuild(accounts, true)
+	return p
 }
 
 var (
@@ -58,27 +67,50 @@ func GetPool() *AccountPool {
 	return pool
 }
 
-// Reload rebuilds the weighted account list from config.
-// Weight <= 1 → 1 entry; weight >= 2 → weight entries.
+// Reload rebuilds the tiered, weighted account list from config.
 // Over-quota accounts are dropped unless either the per-account upstream
 // Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
 // setting permits over-quota routing.
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	enabled := config.GetEnabledAccounts()
-	allowOverUsage := config.GetAllowOverUsage()
-	var weighted []config.Account
+	p.rebuild(config.GetEnabledAccounts(), config.GetAllowOverUsage())
+}
+
+// rebuild groups accounts by priority tier (highest first) and expands weight
+// inside each tier. Caller holds p.mu.
+func (p *AccountPool) rebuild(enabled []config.Account, allowOverUsage bool) {
+	byPriority := make(map[int][]config.Account)
+	priorities := make([]int, 0, 4)
 	for _, a := range enabled {
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
-		w := effectiveWeight(a.Weight)
-		for j := 0; j < w; j++ {
-			weighted = append(weighted, a)
+		if _, ok := byPriority[a.Priority]; !ok {
+			priorities = append(priorities, a.Priority)
+		}
+		for j := 0; j < effectiveWeight(a.Weight); j++ {
+			byPriority[a.Priority] = append(byPriority[a.Priority], a)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(priorities)))
+
+	weighted := make([]config.Account, 0, len(enabled))
+	tiers := make([]accountTier, 0, len(priorities))
+	cursors := make(map[int]*uint64, len(priorities))
+	for _, priority := range priorities {
+		start := len(weighted)
+		weighted = append(weighted, byPriority[priority]...)
+		tiers = append(tiers, accountTier{priority: priority, start: start, end: len(weighted)})
+		if cur, ok := p.cursors[priority]; ok {
+			cursors[priority] = cur // keep the round-robin position across reloads
+		} else {
+			cursors[priority] = new(uint64)
 		}
 	}
 	p.accounts = weighted
+	p.tiers = tiers
+	p.cursors = cursors
 	p.totalAccounts = len(enabled)
 }
 
@@ -88,10 +120,23 @@ func (p *AccountPool) GetNext() *config.Account {
 }
 
 // GetNextExcluding 获取下一个可用账号，并跳过指定账号。
-// 根据配置支持两种路由模式：
-// - sequential (默认): 始终优先使用首个可用账号，用尽额度/故障后才切换下一个
-// - round_robin (均衡): 轮询均衡分配请求至各可用账号
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
+	return p.pickRoutable("", excluded)
+}
+
+// pickRoutable walks priority tiers from highest to lowest and picks within
+// the first tier that yields a routable account. Inside a tier the configured
+// routing mode applies:
+//   - sequential (默认): first routable account, so one account is drained
+//     before the next takes over
+//   - round_robin (均衡): per-tier weighted round-robin
+//
+// An empty model skips the model-capability check.
+//
+// When every candidate is cooling down this returns nil: handing out the
+// account whose cooldown ends soonest would defeat the cooldown and retry-storm
+// an upstream that already said 429.
+func (p *AccountPool) pickRoutable(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -100,60 +145,106 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	}
 
 	allowOverUsage := config.GetAllowOverUsage()
-	routingMode := config.GetAccountRoutingMode()
+	roundRobin := config.GetAccountRoutingMode() == config.RoutingModeRoundRobin
 	now := time.Now()
-	n := len(p.accounts)
 	seen := make(map[string]bool)
 
-	var startIdx uint64
-	if routingMode == config.RoutingModeRoundRobin {
-		startIdx = atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+	for _, tier := range p.tiers {
+		n := tier.end - tier.start
+		start := 0
+		if roundRobin {
+			start = int((atomic.AddUint64(p.cursors[tier.priority], 1) - 1) % uint64(n))
+		}
+		for i := 0; i < n; i++ {
+			acc := &p.accounts[tier.start+(start+i)%n]
+			if seen[acc.ID] {
+				continue
+			}
+			seen[acc.ID] = true
+			if p.routableForModel(acc, model, excluded, allowOverUsage, now) {
+				return detachedAccount(acc)
+			}
+		}
 	}
-
-	// 查找可用账号
-	for i := 0; i < n; i++ {
-		var idx uint64
-		if routingMode == config.RoutingModeRoundRobin {
-			idx = (startIdx + uint64(i)) % uint64(n)
-		} else {
-			idx = uint64(i)
-		}
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// Skip accounts whose quota is exhausted, unless overrides apply.
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		return detachedAccount(acc)
-	}
-
-	// All otherwise-eligible accounts are cooling down. Returning the account
-	// whose cooldown expires first defeats the cooldown and creates a retry
-	// storm against an upstream that has already returned 429/transport errors.
-	// Fail fast until an account genuinely becomes eligible again.
 	return nil
+}
+
+// routableForModel applies the shared per-candidate rules of the selection
+// walk: not excluded, serves the model (skipped when model is empty), not
+// cooling down, token usable or refreshable on demand, and not quota-blocked.
+// pickRoutable and GetNextForModelSticky must agree on these, or a pinned
+// account could dodge the health rules. Caller holds p.mu.
+func (p *AccountPool) routableForModel(acc *config.Account, model string, excluded map[string]bool, allowOverUsage bool, now time.Time) bool {
+	if excluded != nil && excluded[acc.ID] {
+		return false
+	}
+	if model != "" && !p.accountHasModel(acc.ID, model) {
+		return false
+	}
+	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		return false
+	}
+	// Refreshable credentials are renewed by the handler (ensureValidToken)
+	// before any upstream call. Keeping them eligible lets a cold standby wake
+	// immediately instead of waiting for its background refresh sweep.
+	if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds && !acc.IsRefreshableCredential() {
+		return false
+	}
+	return !isQuotaBlocked(*acc, allowOverUsage)
+}
+
+// tierHasRoutable reports whether any account in the tier passes the shared
+// health rules. Caller holds p.mu.
+func (p *AccountPool) tierHasRoutable(tier accountTier, model string, excluded map[string]bool, allowOverUsage bool, now time.Time) bool {
+	for i := tier.start; i < tier.end; i++ {
+		if p.routableForModel(&p.accounts[i], model, excluded, allowOverUsage, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// inActiveTier reports whether the account at idx belongs to the highest
+// priority tier that still has a routable account. Strict priority outranks
+// cache locality: a pinned account below the active tier must yield so traffic
+// returns to the top tier as soon as it recovers. Caller holds p.mu.
+func (p *AccountPool) inActiveTier(idx int, model string, excluded map[string]bool, allowOverUsage bool, now time.Time) bool {
+	for _, tier := range p.tiers {
+		inTier := idx >= tier.start && idx < tier.end
+		if p.tierHasRoutable(tier, model, excluded, allowOverUsage, now) {
+			return inTier
+		}
+		if inTier {
+			return false
+		}
+	}
+	return false
+}
+
+// GetNextForModelSticky pins the request to preferredID when that account is
+// still routable and sits in the active priority tier, falling back to the
+// tiered walk otherwise. The prompt-cache layer uses it to keep a conversation
+// on the account holding its warm prefix: a round-robin hop to another account
+// would miss that cache and re-read the whole prompt at full price.
+func (p *AccountPool) GetNextForModelSticky(model, preferredID string, excluded map[string]bool) *config.Account {
+	if preferredID != "" {
+		p.mu.RLock()
+		allowOverUsage := config.GetAllowOverUsage()
+		now := time.Now()
+		for i := range p.accounts {
+			acc := &p.accounts[i]
+			if acc.ID != preferredID {
+				continue
+			}
+			if p.inActiveTier(i, model, excluded, allowOverUsage, now) && p.routableForModel(acc, model, excluded, allowOverUsage, now) {
+				p.mu.RUnlock()
+				return detachedAccount(acc)
+			}
+			break
+		}
+		p.mu.RUnlock()
+	}
+	return p.pickRoutable(model, excluded)
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -246,65 +337,9 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 }
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
-// 根据配置支持 sequential (默认单账号用尽模式) 与 round_robin (均衡模式)。
+// model 应为去掉 thinking 后缀的实际模型名；路由顺序与 GetNext 相同。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
-	}
-
-	allowOverUsage := config.GetAllowOverUsage()
-	routingMode := config.GetAccountRoutingMode()
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	var startIdx uint64
-	if routingMode == config.RoutingModeRoundRobin {
-		startIdx = atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-	}
-
-	for i := 0; i < n; i++ {
-		var idx uint64
-		if routingMode == config.RoutingModeRoundRobin {
-			idx = (startIdx + uint64(i)) % uint64(n)
-		} else {
-			idx = uint64(i)
-		}
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-		return detachedAccount(acc)
-	}
-
-	// Every account that supports this model is currently cooling down. Respect
-	// the cooldown instead of immediately selecting the least-bad account and
-	// hammering the same quota-limited upstream again.
-	return nil
+	return p.pickRoutable(model, excluded)
 }
 
 // GetByID 根据 ID 获取账号
@@ -373,6 +408,67 @@ func (p *AccountPool) RecordSuccess(id string) {
 	defer p.mu.Unlock()
 	delete(p.cooldowns, id)
 	p.errorCounts[id] = 0
+}
+
+// CooldownUntil returns the unix time the account's pool cooldown ends, or 0
+// when it is not cooling. Exposed so the admin UI can explain why an enabled
+// account with quota left still yields "No available accounts".
+func (p *AccountPool) CooldownUntil(id string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if cd, ok := p.cooldowns[id]; ok && time.Now().Before(cd) {
+		return cd.Unix()
+	}
+	return 0
+}
+
+// RoutingState is the live per-account routing picture the admin panel shows,
+// so an operator can see why an account — and with it a whole priority tier —
+// is passing traffic to the tier below it.
+type RoutingState struct {
+	// InPool reports whether the account sits in the weighted list at all
+	// (false: disabled, or quota-blocked at the last reload).
+	InPool bool `json:"inPool"`
+	// Cooldown reports an active failure/throttle cooldown; CooldownUntil is
+	// the unix time it lifts (0 when none).
+	Cooldown      bool  `json:"cooldown"`
+	CooldownUntil int64 `json:"cooldownUntil"`
+	// ErrorCount is the consecutive-error count toward the next cooldown.
+	ErrorCount int `json:"errorCount"`
+	// QuotaBlocked reports usage at the limit with no overage exemption.
+	QuotaBlocked bool `json:"quotaBlocked"`
+	// TokenExpiring reports an access token inside the refresh-skew window;
+	// refreshable credentials are renewed on demand before the upstream call.
+	TokenExpiring bool `json:"tokenExpiring"`
+	// Refreshable reports whether an expiring token can be renewed on demand.
+	Refreshable bool `json:"refreshable"`
+}
+
+// RoutingStateFor evaluates the same rules pickRoutable applies, for one
+// account. a may be any current copy of the account record; pool membership
+// and cooldowns always come from live state.
+func (p *AccountPool) RoutingStateFor(a config.Account) RoutingState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	st := RoutingState{
+		QuotaBlocked:  isQuotaBlocked(a, config.GetAllowOverUsage()),
+		TokenExpiring: a.ExpiresAt > 0 && now.Unix() > a.ExpiresAt-tokenRefreshSkewSeconds,
+		Refreshable:   a.IsRefreshableCredential(),
+		ErrorCount:    p.errorCounts[a.ID],
+	}
+	for i := range p.accounts {
+		if p.accounts[i].ID == a.ID {
+			st.InPool = true
+			break
+		}
+	}
+	if until, ok := p.cooldowns[a.ID]; ok && until.After(now) {
+		st.Cooldown = true
+		st.CooldownUntil = until.Unix()
+	}
+	return st
 }
 
 // RecordError 记录请求错误，设置冷却

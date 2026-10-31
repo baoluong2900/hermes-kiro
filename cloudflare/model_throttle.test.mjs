@@ -220,9 +220,18 @@ test("every live model id survives mapping untouched", () => {
   }
 });
 
-test("retired ids fold onto a model Kiro still serves", () => {
-  assert.equal(W.mapKiroModel("claude-opus-4.5"), "claude-opus-4.7");
-  assert.equal(W.mapKiroModel("claude-sonnet-4.5"), "claude-sonnet-5");
+test("still-served 4.x ids are passed through, never upgraded to a pricier sibling", () => {
+  // Live probe 2026-10-22: opus-4.5/4.6, sonnet-4.5/4.6 and haiku-4.5 all answer
+  // and are metered cheaper than the model they used to be folded onto.
+  assert.equal(W.mapKiroModel("claude-opus-4.5"), "claude-opus-4.5");
+  assert.equal(W.mapKiroModel("claude-opus-4.6"), "claude-opus-4.6");
+  assert.equal(W.mapKiroModel("claude-sonnet-4.5"), "claude-sonnet-4.5");
+  assert.equal(W.mapKiroModel("claude-haiku-4.5"), "claude-haiku-4.5");
+  // 9router-style decorations resolve to the exact id, not a substring guess.
+  assert.equal(W.mapKiroModel("kr/claude-opus-4.6(low)"), "claude-opus-4.6");
+  assert.equal(W.mapKiroModel("kr/claude-opus-5.5-thinking-agentic(low)"), "claude-opus-5.5");
+  // Genuinely retired ids still fold onto a live model.
+  assert.equal(W.mapKiroModel("claude-sonnet-4"), "claude-sonnet-4.5");
 });
 
 // ------------------------------------------------- shared ramp, raw-fetch paths

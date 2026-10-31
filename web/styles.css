@@ -2404,12 +2404,19 @@ img.brand-icon {
   font-family: var(--font-mono, monospace);
   font-size: 0.71875rem;
   line-height: 1.3;
-  cursor: help;
+  cursor: pointer;
   background: color-mix(in oklab, var(--destructive) 6%, transparent);
   padding: 0.125rem 0.35rem;
   border-radius: 4px;
   border: 1px solid color-mix(in oklab, var(--destructive) 15%, transparent);
   transition: all 0.15s ease;
+}
+
+.logs-table .log-msg--open {
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-width: none;
+  user-select: text;
 }
 
 .logs-table .log-msg:hover {
@@ -2441,12 +2448,19 @@ img.brand-icon {
 .err-badge--suspended { background: #fecaca; color: #7f1d1d; }
 .err-badge--overage { background: #ffedd5; color: #9a3412; }
 .err-badge--profile { background: #e0e7ff; color: #3730a3; }
+.err-badge--throttle { background: #fee2e2; color: #991b1b; }
+.err-badge--admission { background: #dbeafe; color: #1e40af; }
+.err-badge--cooldown { background: #fef3c7; color: #92400e; }
+.err-badge--empty { background: var(--muted); color: var(--muted-foreground); }
 .err-badge--unknown { background: var(--muted); color: var(--muted-foreground); }
 .dark .err-badge--quota { background: #451a03; color: #fde68a; }
 .dark .err-badge--auth { background: #450a0a; color: #fca5a5; }
 .dark .err-badge--suspended { background: #450a0a; color: #fca5a5; }
 .dark .err-badge--overage { background: #431407; color: #fdba74; }
 .dark .err-badge--profile { background: #1e1b4b; color: #a5b4fc; }
+.dark .err-badge--throttle { background: #450a0a; color: #fca5a5; }
+.dark .err-badge--admission { background: #172554; color: #93c5fd; }
+.dark .err-badge--cooldown { background: #451a03; color: #fde68a; }
 
 /* Login screen */
 .login-wrapper {
@@ -5546,3 +5560,5 @@ table th {
     padding: 0;
   }
 }
+
+.log-cache-hit { color: #34d399; font-family: ui-monospace, monospace; font-size: 0.75rem; }

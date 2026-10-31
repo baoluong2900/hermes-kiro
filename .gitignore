@@ -1,6 +1,9 @@
 # Build artifacts
 /kiro-go
 /kiro-go-*
+# `/kiro-go-*` does not match a dot suffix, so locally-built variants like
+# kiro-go.next slipped through and were staged as an 11MB binary.
+/kiro-go.*
 kiro-go.bak*
 /kiro-go.exe
 *.exe

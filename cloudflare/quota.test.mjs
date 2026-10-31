@@ -371,10 +371,11 @@ test("published model catalog", async () => {
   ]), put: async () => {} };
   const ids = (await (await W.handleModels({ KIRO_KV: kv }, {})).json()).data.map((m) => m.id);
 
-  for (const required of ["claude-opus-5-thinking", "claude-opus-4.8-thinking", "claude-opus-4.7-thinking"]) {
+  for (const required of ["claude-opus-5-thinking", "claude-opus-4.8-thinking", "claude-opus-4.7-thinking",
+                          "claude-opus-4.6", "claude-haiku-4.5"]) {
     assert.ok(ids.includes(required), `${required} must be advertised`);
   }
-  const retired = ids.filter((id) => /4\.6|4\.5|claude-3-|glm|deepseek|qwen|minimax|haiku|sonnet-4/.test(id));
+  const retired = ids.filter((id) => /claude-3-|glm|deepseek|qwen|minimax|sonnet-4$|opus-4$|opus-4\.1/.test(id));
   assert.deepEqual(retired, [], "retired and third-party ids must not be advertised");
 });
 

@@ -149,17 +149,19 @@ const LIVE_MODELS = [
   "claude-sonnet-5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "auto",
 ];
 
-// Exact chains from the architecture. First entry is always the requested model
-// itself (it gets tried before any fallback).
+// The requested model is the only candidate: no chain ever contains a second
+// model. Operator decision 2026-10-22 — a throttled or rejected model is an
+// error for the client, never a silent substitution (which previously billed
+// the client for gpt-5.6-sol at 3–6x the requested model's rate).
 const EXPECTED_CHAINS = {
-  "claude-opus-5": ["claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-opus-4.8": ["claude-opus-4.8", "claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-opus-4.7": ["claude-opus-4.7", "claude-sonnet-5", "gpt-5.6-sol"],
-  "claude-sonnet-5": ["claude-sonnet-5", "gpt-5.6-sol"],
-  "auto": ["auto", "gpt-5.6-sol", "claude-sonnet-5"],
-  "gpt-5.6-terra": ["gpt-5.6-terra", "gpt-5.6-sol", "claude-sonnet-5"],
-  "gpt-5.6-luna": ["gpt-5.6-luna", "gpt-5.6-sol", "claude-sonnet-5"],
-  "gpt-5.6-sol": ["gpt-5.6-sol", "claude-sonnet-5"],
+  "claude-opus-5": ["claude-opus-5"],
+  "claude-opus-4.8": ["claude-opus-4.8"],
+  "claude-opus-4.7": ["claude-opus-4.7"],
+  "claude-sonnet-5": ["claude-sonnet-5"],
+  "auto": ["auto"],
+  "gpt-5.6-terra": ["gpt-5.6-terra"],
+  "gpt-5.6-luna": ["gpt-5.6-luna"],
+  "gpt-5.6-sol": ["gpt-5.6-sol"],
 };
 
 test("fallback chain has the exact ordering the architecture specifies", () => {
@@ -235,7 +237,7 @@ test("active cooldown skips the original model and expiry restores it", async ()
   assert.ok(W.MODEL_COOLDOWN_MS === 30000, "cooldown window is 30 seconds");
 });
 
-test("resilient dispatch consults cooldown BEFORE calling and skips straight to fallback", async () => {
+test("resilient dispatch consults cooldown BEFORE calling and fails without an upstream call", async () => {
   assert.ok(W.callKiroResilient, "callKiroResilient must be exported");
   const tried = [];
   const send = async ({ model }) => {
@@ -248,13 +250,13 @@ test("resilient dispatch consults cooldown BEFORE calling and skips straight to 
     send,
     acquire: async () => ({ ok: true, release: async () => {} }),
     markCooldown: async () => {},
-    // opus is already cooling down; the first live attempt must be the fallback.
+    // opus is already cooling down; nothing else may be tried in its place.
     isCooledDown: async (model) => model === "claude-opus-5",
     sleep: async () => {},
   });
-  assert.equal(out.response.status, 200);
-  assert.equal(tried[0], "claude-sonnet-5", "cooled-down original is skipped without an upstream call");
-  assert.ok(!tried.includes("claude-opus-5"), "the cooled-down model is never called");
+  assert.equal(out.response.status, 429, "a cooled-down model is reported as a rate limit");
+  assert.deepEqual(tried, [], "no upstream call is made for a cooled-down model, and no other model is tried");
+  assert.equal(out.actualModel, null);
 });
 
 // ------------------------------ 4. premium gate serializes, isolates, expires
@@ -527,9 +529,11 @@ test("all candidate models throttling yields a normalized 429 with Retry-After",
   assert.equal(out.response.headers.get("Retry-After"), "3", "Retry-After is preserved");
 });
 
-test("a successful fallback carries requested/actual metadata for response headers", async () => {
+test("a throttled model is reported to the client, never replaced by another model", async () => {
   assert.ok(W.callKiroResilient, "callKiroResilient must be exported");
+  const tried = [];
   const send = async ({ model }) => {
+    tried.push(model);
     if (model === "claude-opus-5") return { response: new Response(THROTTLE_BODY, { status: 400 }) };
     return { response: new Response("ok", { status: 200 }) };
   };
@@ -542,10 +546,10 @@ test("a successful fallback carries requested/actual metadata for response heade
     isCooledDown: async () => false,
     sleep: async () => {},
   });
-  assert.equal(out.response.status, 200);
+  assert.equal(out.response.status, 429, "INVALID_MODEL_ID throttle is normalized to 429 for the client");
+  assert.deepEqual(tried, ["claude-opus-5"], "only the requested model is ever sent upstream");
   assert.equal(out.requestedModel, "claude-opus-5");
-  assert.equal(out.actualModel, "claude-sonnet-5", "actual model is the successful fallback");
-  assert.equal(out.fallbackApplied, true, "fallbackApplied flag is set so headers can be added");
+  assert.equal(out.actualModel, null, "no model answered");
 });
 
 test("cooling down the throttled model is recorded before falling back", async () => {
@@ -569,14 +573,11 @@ test("cooling down the throttled model is recorded before falling back", async (
 
 // ---------------------- 8. no permit leaks on failure / token refresh
 
-test("a failed candidate releases its permit before trying the next model", async () => {
+test("a throttled request releases its permit before returning the error", async () => {
   assert.ok(W.callKiroResilient, "callKiroResilient must be exported");
   let acquired = 0;
   let released = 0;
-  const send = async ({ model }) => {
-    if (model === "claude-opus-5") return { response: new Response(THROTTLE_BODY, { status: 400 }) };
-    return { response: new Response("ok", { status: 200 }) };
-  };
+  const send = async () => ({ response: new Response(THROTTLE_BODY, { status: 400 }) });
   const out = await W.callKiroResilient({
     requestedModel: "claude-opus-5",
     payload: samplePayload("claude-opus-5"),
@@ -586,14 +587,9 @@ test("a failed candidate releases its permit before trying the next model", asyn
     isCooledDown: async () => false,
     sleep: async () => {},
   });
-  assert.equal(out.response.status, 200);
-  // Two candidates attempted (opus throttled, sonnet ok) => two permits, and the
-  // throttled one must be released before the sonnet permit is acquired.
-  assert.equal(acquired, 2, "one permit per candidate attempt");
-  // The failed candidate's permit is released synchronously; the successful
-  // candidate's permit is handed to the body-end wrapper, so at least the
-  // failed one has been released by return.
-  assert.ok(released >= 1, "the failed candidate's permit is released, not leaked");
+  assert.equal(out.response.status, 429);
+  assert.equal(acquired, 1, "exactly one permit for the one requested model");
+  assert.equal(released, 1, "the failed attempt's permit is released, not leaked");
 });
 
 test("a reactive token refresh retry does not acquire a second permit for the same attempt", async () => {
@@ -813,32 +809,22 @@ async function runProductionFallbackScenario(endpoint, stream, { inStreamThrottl
       body: JSON.stringify(requestBody),
     }), env, ctx);
 
-    assert.equal(response.status, 200, `${endpoint} stream=${stream} status`);
-    assert.equal(response.headers.get("X-Kiro-Actual-Model"), "claude-sonnet-5");
-    assert.equal(
-      response.headers.get("X-Kiro-Model-Fallback"),
-      "claude-opus-5 -> claude-sonnet-5",
-      "fallback is transparent in headers",
-    );
+    const expectedStatus = emptyOriginal ? 503 : 429;
+    assert.equal(response.status, expectedStatus, `${endpoint} stream=${stream} status`);
+    assert.equal(response.headers.get("X-Kiro-Model-Fallback"), null, "no model substitution is ever advertised");
     const output = await response.text();
-    if (stream) {
-      assert.match(output, /fallback ok/);
-      assert.match(output, /"model":"claude-opus-5"/, "stream JSON keeps requested model");
-    } else {
-      const parsed = JSON.parse(output);
-      assert.equal(parsed.model, "claude-opus-5", "non-stream JSON keeps requested model");
-      assert.match(JSON.stringify(parsed), /fallback ok/);
-    }
+    assert.ok(!/fallback ok/.test(output), "no other model's output reaches the client");
+    assert.match(output, emptyOriginal ? /empty/i : /throttled|rate|model/i, "client sees the normalized upstream error");
     await ctx.drain();
 
     assert.deepEqual(
       upstreamModels,
-      ["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-sonnet-5"],
+      ["claude-opus-5", "claude-opus-5", "claude-opus-5", "claude-opus-5"],
       inStreamThrottle
-        ? "HTTP-200 exception frames use the bounded same-model ramp before fallback"
+        ? "HTTP-200 exception frames use the bounded same-model ramp, then fail"
         : emptyOriginal
-          ? "metadata-only empty streams retry the same model before fallback"
-          : "HTTP model throttles use the bounded same-model ramp before fallback",
+          ? "metadata-only empty streams retry the same model, then fail"
+          : "HTTP model throttles use the bounded same-model ramp, then fail",
     );
     const gateOps = namespace.operations.filter((op) => op.id === "model-gate:acc-integration");
     assert.ok(gateOps.some((op) => op.path === "/model-gate/acquire" && op.body.model === "claude-opus-5"));
@@ -846,20 +832,21 @@ async function runProductionFallbackScenario(endpoint, stream, { inStreamThrottl
       (op) => op.path === "/model-gate/cooldown" && op.body.model === "claude-opus-5",
     );
     assert.equal(cooledOriginal, !emptyOriginal, "only INVALID_MODEL_ID writes model cooldown");
-    assert.ok(gateOps.some((op) => op.path === "/model-gate/acquire" && op.body.model === "claude-sonnet-5"));
+    assert.ok(
+      !gateOps.some((op) => op.path === "/model-gate/acquire" && op.body.model !== "claude-opus-5"),
+      "no permit is ever acquired for a model the client did not ask for",
+    );
     assert.equal(
       gateOps.filter((op) => op.path === "/model-gate/release").length,
-      2,
-      "failed original and successful fallback each release exactly one permit",
+      1,
+      "the failed request releases exactly one permit",
     );
 
     const gate = namespace.get("model-gate:acc-integration");
-    for (const model of ["claude-opus-5", "claude-sonnet-5"]) {
-      const state = await gate.fetch("https://model-gate/model-gate/status", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model }),
-      });
-      assert.equal((await state.json()).inFlight, 0, `${model} has no leaked permit`);
-    }
+    const state = await gate.fetch("https://model-gate/model-gate/status", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-opus-5" }),
+    });
+    assert.equal((await state.json()).inFlight, 0, "claude-opus-5 has no leaked permit");
   } finally {
     globalThis.fetch = realFetch;
     globalThis.setTimeout = realSetTimeout;
@@ -955,7 +942,7 @@ test("all empty fallback candidates return overloaded 503 without model cooldown
   assert.equal(out.response.status, 503);
   assert.equal(out.response.headers.get("Retry-After"), "3");
   assert.equal(cooldowns, 0, "empty capacity symptom is not INVALID_MODEL_ID cooldown");
-  assert.equal(releases, 3, "each candidate releases its own permit");
+  assert.equal(releases, 1, "the single requested-model attempt releases its permit");
 });
 
 

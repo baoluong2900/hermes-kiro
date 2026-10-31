@@ -104,11 +104,24 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
+	thinking := suffixThinking
+	if req.Reasoning != nil && strings.TrimSpace(req.Reasoning.Effort) != "" && !reasoningEffortDisabled(req.Reasoning.Effort) {
+		thinking = true
+		openaiReq.ReasoningEffort = strings.TrimSpace(req.Reasoning.Effort)
+	}
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	// Prefer the upstream's native reasoning directive over the prompt-injected
+	// <thinking> block, so the model reasons for real instead of being asked to
+	// emit tags in its answer.
+	reasoning := resolveReasoningDirectives(MapModel(actualModel), resolveOpenAIReasoningRequest(openaiReq, suffixThinking), thinkingCfg)
+	promptThinking := thinking && !reasoning.Native.Enabled
+	thinking = thinking || reasoning.ProducesReasoning()
+
+	kiroPayload := OpenAIToKiro(openaiReq, promptThinking)
+	applyReasoningDecision(kiroPayload, reasoning)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
@@ -140,8 +153,9 @@ func (h *Handler) handleResponsesNonStream(
 	var lastAccountID string
 	reqStart := time.Now()
 
+	stickyID := h.sticky.Lookup(payload.ConversationState.ConversationID)
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelSticky(model, stickyID, excluded)
 		if account == nil {
 			break
 		}
@@ -153,26 +167,31 @@ func (h *Handler) handleResponsesNonStream(
 			continue
 		}
 
-		var content, reasoningContent string
-		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
 
+		// emit is nil: the same builder assembles the item list without
+		// streaming, so the non-stream body can never describe a different
+		// shape than the streaming path would have produced.
+		out := newResponsesOutputBuilder(thinking, nil)
+
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
-					reasoningContent += text
+					out.Reasoning(text)
 				} else {
-					content += text
+					out.Text(text)
 				}
 			},
-			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnToolUse:  func(tu KiroToolUse) { out.ToolUse(tu) },
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnSignature:         func(sig string) { out.Signature(sig) },
+			OnRedactedReasoning: func(blob string) { out.Redacted(blob) },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -184,10 +203,10 @@ func (h *Handler) handleResponsesNonStream(
 			continue
 		}
 
-		finalContent, _ := extractThinkingFromContent(content)
-		if !thinking {
-			reasoningContent = ""
-		}
+		items := out.Finish()
+		finalContent, _ := extractThinkingFromContent(out.AnswerText())
+		reasoningContent := out.ReasoningOutput()
+		toolUses := out.ToolUses()
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
@@ -199,9 +218,10 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog(w, "responses", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := newResponsesObject(respID, model, items, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -217,56 +237,26 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.recordFailureWithDuration(w, "responses", model, "", errNoAvailableAccounts, time.Since(reqStart).Milliseconds())
+		h.sendNoAvailableAccounts(w, endpointKindOpenAI)
 		return
 	}
-	h.recordFailureWithDuration("responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
+	h.recordFailureWithDuration(w, "responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
 	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
 }
 
-func buildResponsesObject(
-	id, model, content string, toolUses []KiroToolUse,
+// newResponsesObject assembles the terminal response object from an already
+// ordered output list. Both the non-stream path and the streaming path go
+// through here, so `response.completed` always mirrors what was emitted.
+func newResponsesObject(
+	id, model string, output []ResponseOutputItem,
 	inputTokens, outputTokens int, req *ResponsesRequest,
 ) *ResponsesObject {
-	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
-
-	if strings.TrimSpace(content) != "" {
-		output = append(output, ResponseOutputItem{
-			ID:     generateOutputItemID("msg"),
-			Type:   "message",
-			Role:   "assistant",
-			Status: "completed",
-			Content: []ResponseContentPart{{
-				Type: "output_text",
-				Text: content,
-			}},
-		})
-	}
-
-	for _, tu := range toolUses {
-		args, _ := json.Marshal(tu.Input)
-		output = append(output, ResponseOutputItem{
-			ID:        generateOutputItemID("fc"),
-			Type:      "function_call",
-			Status:    "completed",
-			CallID:    tu.ToolUseID,
-			Name:      tu.Name,
-			Arguments: string(args),
-		})
-	}
-
 	if len(output) == 0 {
-		output = append(output, ResponseOutputItem{
-			ID:     generateOutputItemID("msg"),
-			Type:   "message",
-			Role:   "assistant",
-			Status: "completed",
-			Content: []ResponseContentPart{{
-				Type: "output_text",
-				Text: "",
-			}},
-		})
+		// A turn that produced nothing still has to return a well-formed
+		// assistant message: clients index output[0] unconditionally.
+		output = []ResponseOutputItem{newMessageOutputItem(generateOutputItemID("msg"), "completed", "")}
 	}
 
 	return &ResponsesObject{
@@ -357,8 +347,9 @@ func (h *Handler) handleResponsesStream(
 	responseStarted := false
 	reqStart := time.Now()
 
+	stickyID := h.sticky.Lookup(payload.ConversationState.ConversationID)
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelSticky(model, stickyID, excluded)
 		if account == nil {
 			break
 		}
@@ -376,136 +367,30 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
 			inputTokens     int
 			outputTokens    int
 			credits         float64
 			realInputTokens int
 		)
 
-		messageItemID := generateOutputItemID("msg")
-		messageStarted := false
-		outputIndex := 0
-		contentIndex := 0
-
-		ensureMessageStarted := func() {
-			if messageStarted {
-				return
-			}
-			messageStarted = true
-			send("response.output_item.added", map[string]interface{}{
-				"type":         "response.output_item.added",
-				"output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id":      messageItemID,
-					"type":    "message",
-					"role":    "assistant",
-					"status":  "in_progress",
-					"content": []map[string]interface{}{},
-				},
-			})
-			send("response.content_part.added", map[string]interface{}{
-				"type":          "response.content_part.added",
-				"item_id":       messageItemID,
-				"output_index":  outputIndex,
-				"content_index": contentIndex,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": "",
-				},
-			})
-		}
+		out := newResponsesOutputBuilder(thinking, func(event string, payload map[string]interface{}) {
+			send(event, payload)
+			responseStarted = true
+		})
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
-				if text == "" {
-					return
-				}
 				if isThinking {
-					reasoningText.WriteString(text)
-					return
+					out.Reasoning(text)
+				} else {
+					out.Text(text)
 				}
-				fullText.WriteString(text)
-				ensureMessageStarted()
-				send("response.output_text.delta", map[string]interface{}{
-					"type":          "response.output_text.delta",
-					"item_id":       messageItemID,
-					"output_index":  outputIndex,
-					"content_index": contentIndex,
-					"delta":         text,
-				})
-				responseStarted = true
 			},
-			OnToolUse: func(tu KiroToolUse) {
-				if messageStarted {
-					send("response.content_part.done", map[string]interface{}{
-						"type":          "response.content_part.done",
-						"item_id":       messageItemID,
-						"output_index":  outputIndex,
-						"content_index": contentIndex,
-						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": fullText.String(),
-						},
-					})
-					send("response.output_item.done", map[string]interface{}{
-						"type":         "response.output_item.done",
-						"output_index": outputIndex,
-						"item": map[string]interface{}{
-							"id":     messageItemID,
-							"type":   "message",
-							"role":   "assistant",
-							"status": "completed",
-							"content": []map[string]interface{}{{
-								"type": "output_text",
-								"text": fullText.String(),
-							}},
-						},
-					})
-					messageStarted = false
-					outputIndex++
-				}
-
-				toolUses = append(toolUses, tu)
-				args, _ := json.Marshal(tu.Input)
-				fcID := generateOutputItemID("fc")
-				send("response.output_item.added", map[string]interface{}{
-					"type":         "response.output_item.added",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "in_progress",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": "",
-					},
-				})
-				send("response.function_call_arguments.delta", map[string]interface{}{
-					"type":         "response.function_call_arguments.delta",
-					"item_id":      fcID,
-					"output_index": outputIndex,
-					"delta":        string(args),
-				})
-				send("response.output_item.done", map[string]interface{}{
-					"type":         "response.output_item.done",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "completed",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": string(args),
-					},
-				})
-				outputIndex++
-				responseStarted = true
-			},
-			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:  func(c float64) { credits = c },
+			OnToolUse:           func(tu KiroToolUse) { out.ToolUse(tu) },
+			OnComplete:          func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnCredits:           func(c float64) { credits = c },
+			OnSignature:         func(sig string) { out.Signature(sig) },
+			OnRedactedReasoning: func(blob string) { out.Redacted(blob) },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
@@ -521,45 +406,17 @@ func (h *Handler) handleResponsesStream(
 				continue
 			}
 			sendFailure(err.Error())
-			h.recordFailureWithDuration("responses", model, account.ID, err, time.Since(reqStart).Milliseconds())
+			h.recordFailureWithDuration(w, "responses", model, account.ID, err, time.Since(reqStart).Milliseconds())
 			// Partial output was already generated and metered upstream; attribute
 			// it instead of dropping the request from the key's usage entirely.
 			h.recordPartialUsageForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 			return
 		}
 
-		finalContent, _ := extractThinkingFromContent(fullText.String())
-		reasoning := reasoningText.String()
-		if !thinking {
-			reasoning = ""
-		}
-
-		if messageStarted {
-			send("response.content_part.done", map[string]interface{}{
-				"type":          "response.content_part.done",
-				"item_id":       messageItemID,
-				"output_index":  outputIndex,
-				"content_index": contentIndex,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": finalContent,
-				},
-			})
-			send("response.output_item.done", map[string]interface{}{
-				"type":         "response.output_item.done",
-				"output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id":     messageItemID,
-					"type":   "message",
-					"role":   "assistant",
-					"status": "completed",
-					"content": []map[string]interface{}{{
-						"type": "output_text",
-						"text": finalContent,
-					}},
-				},
-			})
-		}
+		items := out.Finish()
+		finalContent, _ := extractThinkingFromContent(out.AnswerText())
+		reasoning := out.ReasoningOutput()
+		toolUses := out.ToolUses()
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
@@ -571,9 +428,10 @@ func (h *Handler) handleResponsesStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog(w, "responses", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := newResponsesObject(respID, model, items, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
@@ -594,9 +452,13 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
-		sendFailure("No available accounts")
+		h.recordFailureWithDuration(w, "responses", model, "", errNoAvailableAccounts, time.Since(reqStart).Milliseconds())
+		// The SSE envelope is already open so no Retry-After header is possible
+		// here, but the reason still has to reach the client rather than only
+		// the request log.
+		sendFailure(errNoAvailableAccounts.Error())
 		return
 	}
-	h.recordFailureWithDuration("responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
+	h.recordFailureWithDuration(w, "responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	sendFailure(lastErr.Error())
 }

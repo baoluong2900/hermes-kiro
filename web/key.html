@@ -1,0 +1,1423 @@
+<!DOCTYPE html>
+<html lang="vi" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kiro-Go</title>
+  <link rel="icon" type="image/png" href="/admin/icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/admin/vendor/fontawesome/css/all.min.css" />
+  <script>
+    (function() {
+      var savedTheme = localStorage.getItem("kiro_theme") || "dark";
+      if (savedTheme === "light") {
+        document.documentElement.classList.remove("dark");
+        document.documentElement.classList.add("light");
+      } else {
+        document.documentElement.classList.add("dark");
+        document.documentElement.classList.remove("light");
+      }
+    })();
+  </script>
+  <!-- Vendored copy (same as /admin) so the portal renders without the Tailwind CDN. -->
+  <script src="/admin/vendor/tailwindcss-browser/index.global.js"></script>
+  <style>
+    :root, html.light {
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --card-inner: #f8f9fb;
+      --border: #e5e7eb;
+      --border-hover: #cfd4dc;
+      --text-primary: #0b0d12;
+      --text-secondary: #4b5563;
+      --text-muted: #8b93a1;
+      --table-head: #f8f9fb;
+      --table-hover: #f4f6f9;
+      --input-bg: #ffffff;
+      --code-bg: #fafbfc;
+      --badge-bg: #f3f4f6;
+      --badge-border: #e5e7eb;
+      --ok: #059669;
+      --warn: #d97706;
+      --err: #e11d48;
+      --accent: #6366f1;
+      --claude: #c96442;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+      --shadow-lg: 0 24px 48px -20px rgba(16, 24, 40, 0.25);
+    }
+    html.dark {
+      --bg: #08090a;
+      --card: #0f1012;
+      --card-inner: #16171a;
+      --border: #24262b;
+      --border-hover: #363940;
+      --text-primary: #f4f5f7;
+      --text-secondary: #b1b6c3;
+      --text-muted: #7d838f;
+      --table-head: #121316;
+      --table-hover: #15171a;
+      --input-bg: #111214;
+      --code-bg: #0b0c0e;
+      --badge-bg: #1a1b1f;
+      --badge-border: #2e3036;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --err: #fb7185;
+      --accent: #8b8cf8;
+      --claude: #e8916f;
+      --shadow: 0 1px 0 rgba(255, 255, 255, 0.02) inset, 0 1px 2px rgba(0, 0, 0, 0.4);
+      --shadow-lg: 0 24px 48px -20px rgba(0, 0, 0, 0.7);
+    }
+    body {
+      background-color: var(--bg);
+      color: var(--text-primary);
+      font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      transition: background-color 0.15s ease, color 0.15s ease;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; }
+    .mono { font-family: "Geist Mono", ui-monospace, Menlo, monospace; }
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+    .brand-img { object-fit: contain; }
+    /* The icon is dark-on-transparent: invert only on the dark theme, or it vanishes on white. */
+    html.dark .brand-img { filter: invert(1); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-hover); border-radius: 3px; }
+
+    /* ---------- Login Screen & Ghost Animation ---------- */
+    .login-wrapper { min-height: 100dvh; display: flex; flex-direction: column; position: relative; overflow: hidden; background: var(--bg); }
+    /* Tailwind v4 utilities live in a cascade layer, so unlayered display rules beat .hidden. */
+    .login-wrapper.hidden { display: none; }
+    .ghost-bg { position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+    .ghost-bg .ghost { position: absolute; color: var(--text-primary); opacity: 0.04; animation: ghostFloat 16s ease-in-out infinite; }
+    html.dark .ghost-bg .ghost { opacity: 0.06; }
+    .ghost-bg .ghost-1 { top: 8%; left: 5%; font-size: 2.5rem; animation-delay: 0s; animation-duration: 14s; }
+    .ghost-bg .ghost-2 { top: 20%; left: 16%; font-size: 1.6rem; animation-delay: -2s; animation-duration: 18s; }
+    .ghost-bg .ghost-3 { top: 72%; left: 8%; font-size: 2.8rem; animation-delay: -4s; animation-duration: 20s; }
+    .ghost-bg .ghost-4 { top: 52%; left: 22%; font-size: 1.8rem; animation-delay: -6s; animation-duration: 16s; }
+    .ghost-bg .ghost-5 { top: 12%; right: 7%; font-size: 2.6rem; animation-delay: -1s; animation-duration: 15s; }
+    .ghost-bg .ghost-6 { top: 35%; right: 18%; font-size: 1.7rem; animation-delay: -5s; animation-duration: 19s; }
+    .ghost-bg .ghost-7 { top: 65%; right: 9%; font-size: 2.3rem; animation-delay: -3s; animation-duration: 17s; }
+    .ghost-bg .ghost-8 { top: 84%; right: 24%; font-size: 1.5rem; animation-delay: -7s; animation-duration: 13s; }
+    .ghost-bg .ghost-9 { top: 5%; left: 45%; font-size: 2rem; animation-delay: -8s; animation-duration: 21s; }
+    .ghost-bg .ghost-10 { top: 86%; left: 46%; font-size: 2.1rem; animation-delay: -9s; animation-duration: 15s; }
+    .ghost-bg .ghost-11 { top: 40%; left: 3%; font-size: 1.7rem; animation-delay: -11s; animation-duration: 17s; }
+    .ghost-bg .ghost-12 { top: 45%; right: 4%; font-size: 1.8rem; animation-delay: -10s; animation-duration: 16s; }
+    @keyframes ghostFloat {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      25% { transform: translateY(-16px) rotate(4deg); }
+      50% { transform: translateY(-6px) rotate(-3deg); }
+      75% { transform: translateY(-22px) rotate(2deg); }
+    }
+    .login-topbar {
+      position: absolute; top: 0; left: 0; right: 0; z-index: 10; width: 100%; height: 3.75rem; padding: 0 1.75rem;
+      display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--bg);
+    }
+    .login-main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 100dvh; padding: 5rem 1.25rem 3rem; position: relative; z-index: 2; }
+    .login-box {
+      width: 100%; max-width: 520px; padding: 2.75rem 2.25rem; background: var(--card); border: 1px solid var(--border);
+      border-radius: 1.25rem; box-shadow: var(--shadow-lg); animation: cardIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    @keyframes cardIn { from { transform: translateY(18px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    .input-affix { position: relative; display: flex; align-items: center; }
+    .input-affix input { padding-left: 2.85rem !important; padding-right: 2.85rem !important; width: 100%; }
+    .input-affix .affix-icon { position: absolute; left: 1rem; color: var(--text-muted); pointer-events: none; font-size: 1rem; }
+    .input-affix .affix-btn {
+      position: absolute; right: 0.65rem; display: inline-flex; align-items: center; justify-content: center; width: 2.25rem; height: 2.25rem;
+      border-radius: 0.5rem; background: transparent; border: none; color: var(--text-muted); cursor: pointer;
+    }
+    .input-affix .affix-btn:hover { color: var(--text-primary); }
+    .shake { animation: shake 0.4s cubic-bezier(0.36, 0.07, 0.19, 0.97) both; }
+    @keyframes shake {
+      10%, 90% { transform: translate3d(-1px, 0, 0); }
+      20%, 80% { transform: translate3d(2px, 0, 0); }
+      30%, 50%, 70% { transform: translate3d(-3px, 0, 0); }
+      40%, 60% { transform: translate3d(3px, 0, 0); }
+    }
+
+    /* ---------- Dashboard ---------- */
+    .dash-glow {
+      position: fixed; inset: 0 0 auto 0; height: 420px; pointer-events: none; z-index: 0;
+      background: radial-gradient(900px 320px at 50% -120px, color-mix(in srgb, var(--accent) 13%, transparent), transparent 70%);
+    }
+    .dash-topbar {
+      position: sticky; top: 0; z-index: 30; border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter: saturate(160%) blur(12px); -webkit-backdrop-filter: saturate(160%) blur(12px);
+    }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); }
+    .card-title { font-size: 14px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
+    .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+    .t-ok { color: var(--ok); } .t-warn { color: var(--warn); } .t-err { color: var(--err); } .t-muted { color: var(--text-muted); }
+    .t-accent { color: var(--accent); } .t-primary { color: var(--text-primary); } .t-secondary { color: var(--text-secondary); }
+
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 11px; border-radius: 999px; font-size: 12px; font-weight: 500;
+      border: 1px solid var(--border); background: var(--card-inner); color: var(--text-secondary); white-space: nowrap;
+    }
+    .pill-sm { height: 22px; padding: 0 8px; font-size: 11px; gap: 5px; }
+    .pill-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); border-color: color-mix(in srgb, var(--ok) 28%, transparent); }
+    .pill-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); border-color: color-mix(in srgb, var(--warn) 28%, transparent); }
+    .pill-err { color: var(--err); background: color-mix(in srgb, var(--err) 10%, transparent); border-color: color-mix(in srgb, var(--err) 28%, transparent); }
+    .pill-claude { color: var(--claude); background: color-mix(in srgb, var(--claude) 10%, transparent); border-color: color-mix(in srgb, var(--claude) 26%, transparent); }
+    .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; flex: none; }
+    .dot-pulse { animation: dotPulse 1.8s ease-out infinite; }
+    @keyframes dotPulse {
+      0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+      100% { box-shadow: 0 0 0 6px transparent; }
+    }
+
+    .icon-btn {
+      width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border-radius: 9px; font-size: 13px;
+      border: 1px solid var(--border); background: var(--card); color: var(--text-secondary); transition: all 0.15s ease; flex: none;
+    }
+    .icon-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--card-inner); }
+    .icon-btn-sm { width: 28px; height: 28px; font-size: 12px; border-radius: 7px; }
+    .btn-ghost {
+      height: 34px; padding: 0 12px; display: inline-flex; align-items: center; gap: 8px; border-radius: 9px; font-size: 13px; font-weight: 500;
+      border: 1px solid var(--border); background: var(--card); color: var(--text-secondary); transition: all 0.15s ease; white-space: nowrap;
+    }
+    .btn-ghost:hover:not(:disabled) { color: var(--text-primary); border-color: var(--border-hover); background: var(--card-inner); }
+    .btn-ghost:disabled { opacity: 0.35; }
+    .btn-sm { height: 30px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+
+    /* Balance hero */
+    .hero { position: relative; overflow: hidden; padding: 24px; }
+    .hero::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      background: radial-gradient(560px 200px at 0% 0%, color-mix(in srgb, var(--hero-tone, var(--ok)) 13%, transparent), transparent 72%);
+    }
+    .hero > * { position: relative; }
+    .hero-value { font-family: "Geist Mono", ui-monospace, monospace; font-size: 46px; font-weight: 600; letter-spacing: -0.035em; line-height: 1; font-variant-numeric: tabular-nums; }
+    .hero-unit { font-size: 18px; font-weight: 500; color: var(--text-muted); letter-spacing: 0; }
+    .bar-track { height: 10px; border-radius: 999px; background: var(--card-inner); border: 1px solid var(--border); overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; transition: width 0.7s cubic-bezier(0.16, 1, 0.3, 1); background: linear-gradient(90deg, color-mix(in srgb, var(--ok) 65%, transparent), var(--ok)); }
+    .bar-fill[data-tone="warn"] { background: linear-gradient(90deg, color-mix(in srgb, var(--warn) 65%, transparent), var(--warn)); }
+    .bar-fill[data-tone="err"] { background: linear-gradient(90deg, color-mix(in srgb, var(--err) 65%, transparent), var(--err)); }
+    .bar-fill[data-tone="muted"] { background: var(--text-muted); opacity: 0.5; }
+    .hero-foot { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .hero-foot > div { padding: 10px 12px; border-radius: 10px; background: var(--card-inner); border: 1px solid var(--border); min-width: 0; }
+    .hero-foot .v { font-family: "Geist Mono", ui-monospace, monospace; font-size: 14px; font-weight: 600; color: var(--text-primary); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Key info card */
+    .key-chip {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 6px 6px 12px; border-radius: 10px;
+      background: var(--card-inner); border: 1px solid var(--border); font-family: "Geist Mono", ui-monospace, monospace; font-size: 13px;
+    }
+    .kv { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 0; border-top: 1px dashed var(--border); font-size: 13px; }
+    .kv .k { color: var(--text-muted); display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+    .kv .k i { width: 14px; text-align: center; font-size: 12px; }
+    .kv .v { color: var(--text-primary); font-weight: 500; text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Stat cards */
+    .stat { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; min-height: 138px; transition: border-color 0.15s ease; }
+    .stat:hover { border-color: var(--border-hover); }
+    .stat-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .stat-label { display: flex; align-items: center; gap: 10px; font-size: 12.5px; font-weight: 500; color: var(--text-secondary); }
+    .stat-ico { width: 28px; height: 28px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; flex: none; }
+    .ico-accent { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+    .ico-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 13%, transparent); }
+    .ico-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent); }
+    .ico-claude { color: var(--claude); background: color-mix(in srgb, var(--claude) 13%, transparent); }
+    .stat-value { font-family: "Geist Mono", ui-monospace, monospace; font-size: 26px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stat-unit { font-size: 14px; font-weight: 500; color: var(--text-muted); margin-left: 4px; letter-spacing: 0; }
+    .stat-sub { font-size: 12px; color: var(--text-muted); margin-top: auto; }
+    .tag { font-size: 11px; font-family: "Geist Mono", ui-monospace, monospace; color: var(--text-muted); padding: 2px 7px; border-radius: 6px; background: var(--card-inner); border: 1px solid var(--border); white-space: nowrap; }
+    .split { display: flex; height: 6px; border-radius: 999px; overflow: hidden; background: var(--card-inner); gap: 2px; margin-bottom: 7px; }
+    .split > span { display: block; height: 100%; border-radius: 999px; min-width: 3px; }
+    .split-in { background: var(--accent); }
+    .split-out { background: var(--ok); }
+    .legend-dot { width: 7px; height: 7px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: 1px; }
+
+    /* Logs table */
+    .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+    .tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+    .tbl th {
+      background: var(--table-head); font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+      color: var(--text-muted); padding: 11px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; text-align: left;
+    }
+    .tbl td { padding: 12px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: middle; }
+    .tbl tbody tr:last-child td { border-bottom: 0; }
+    .tbl tbody tr { transition: background-color 0.12s ease; }
+    .tbl tbody tr:hover td { background: var(--table-hover); }
+    .tbl tr.row-err td { background: color-mix(in srgb, var(--err) 4%, transparent); }
+    .tbl .num { font-family: "Geist Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; text-align: right; }
+    .tbl th.num { font-family: inherit; text-align: right; }
+    .tbl .center { text-align: center; }
+    .cell-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+    .cell-sub.t-err { color: var(--err); }
+    .model-cell { display: flex; align-items: center; gap: 10px; }
+    .model-ico { width: 24px; height: 24px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; flex: none; }
+    .model-ico.claude { color: var(--claude); background: color-mix(in srgb, var(--claude) 14%, transparent); }
+    .model-ico.openai { color: var(--text-primary); background: var(--card-inner); border: 1px solid var(--border); }
+    .model-ico.other { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+    .select {
+      height: 30px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-inner);
+      color: var(--text-primary); font-size: 12px; outline: none; cursor: pointer;
+    }
+    .select:focus { border-color: var(--border-hover); }
+
+    /* Quick setup */
+    .seg { display: inline-flex; padding: 3px; gap: 2px; border-radius: 10px; background: var(--card-inner); border: 1px solid var(--border); flex-wrap: wrap; }
+    .seg .tab-btn { height: 28px; padding: 0 12px; border-radius: 7px; font-size: 12px; font-weight: 500; color: var(--text-secondary); border: 1px solid transparent; transition: all 0.12s ease; }
+    .seg .tab-btn:hover { color: var(--text-primary); }
+    .seg .tab-btn.active { background: var(--card); color: var(--text-primary); border-color: var(--border); box-shadow: var(--shadow); }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+    .code { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--code-bg); }
+    .code-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-muted); }
+    .code-dots { display: inline-flex; gap: 6px; margin-right: 10px; }
+    .code-dots span { width: 9px; height: 9px; border-radius: 999px; background: var(--border-hover); }
+    .code pre { padding: 14px 16px; font-size: 12.5px; line-height: 1.7; overflow-x: auto; margin: 0; color: var(--text-primary); }
+
+    .fade-in { animation: cardIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) both; }
+    @media (max-width: 640px) {
+      .hero-value { font-size: 36px; }
+      .hero-foot { grid-template-columns: 1fr; }
+      .hide-sm { display: none !important; }
+    }
+  </style>
+</head>
+<body class="min-h-screen">
+
+  <!-- ==================== VIEW 1: KEY LOGIN BOX ==================== -->
+  <div id="loginView" class="login-wrapper">
+    <!-- Ambient Floating Ghosts on Login Screen -->
+    <div class="ghost-bg" aria-hidden="true">
+      <i class="fa-solid fa-ghost ghost ghost-1"></i>
+      <i class="fa-solid fa-ghost ghost ghost-2"></i>
+      <i class="fa-solid fa-ghost ghost ghost-3"></i>
+      <i class="fa-solid fa-ghost ghost ghost-4"></i>
+      <i class="fa-solid fa-ghost ghost ghost-5"></i>
+      <i class="fa-solid fa-ghost ghost ghost-6"></i>
+      <i class="fa-solid fa-ghost ghost ghost-7"></i>
+      <i class="fa-solid fa-ghost ghost ghost-8"></i>
+      <i class="fa-solid fa-ghost ghost ghost-9"></i>
+      <i class="fa-solid fa-ghost ghost ghost-10"></i>
+      <i class="fa-solid fa-ghost ghost ghost-11"></i>
+      <i class="fa-solid fa-ghost ghost ghost-12"></i>
+    </div>
+
+    <header class="login-topbar">
+      <div class="flex items-center gap-3">
+        <img src="/admin/icon.png" alt="Kiro-Go" class="brand-img w-8 h-8 rounded-md" />
+        <span class="font-bold text-base text-[var(--text-primary)] tracking-tight">Kiro-Go</span>
+      </div>
+      <div class="flex items-center gap-3">
+        <!-- Language Switcher -->
+        <div class="inline-flex rounded-lg border border-[var(--border)] bg-[var(--card-inner)] p-1 text-xs">
+          <button type="button" onclick="setLang('vi')" id="langBtnVi" class="px-2.5 py-1 rounded-md font-semibold text-[var(--text-primary)] bg-[var(--badge-bg)] cursor-pointer">VI</button>
+          <button type="button" onclick="setLang('en')" id="langBtnEn" class="px-2.5 py-1 rounded-md font-semibold text-[var(--text-secondary)] hover:bg-[var(--badge-bg)] cursor-pointer">EN</button>
+          <button type="button" onclick="setLang('zh')" id="langBtnZh" class="px-2.5 py-1 rounded-md font-semibold text-[var(--text-secondary)] hover:bg-[var(--badge-bg)] cursor-pointer">ZH</button>
+        </div>
+        <!-- Theme Switcher -->
+        <button type="button" onclick="toggleTheme()" id="themeBtn" title="Chuyển đổi giao diện Sáng / Tối" class="icon-btn">
+          <i id="loginThemeIcon" class="fa-solid fa-moon"></i>
+        </button>
+      </div>
+    </header>
+
+    <main class="login-main">
+      <div class="login-box" id="loginCard">
+        <div class="text-center mb-6">
+          <div class="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-[var(--card-inner)] border border-[var(--border)] mb-3">
+            <i class="fa-solid fa-key text-xl text-[var(--text-primary)]"></i>
+          </div>
+          <h1 class="text-2xl font-bold tracking-tight text-[var(--text-primary)] mb-1.5" id="t_title">Tra cứu API Key</h1>
+          <p class="text-xs text-[var(--text-muted)] max-w-sm mx-auto leading-relaxed" id="t_subtitle">Kiểm tra hạn mức Quota, số lượng requests, token và lịch sử gọi API theo thời gian thực.</p>
+        </div>
+
+        <form id="keyLoginForm" onsubmit="handleKeyLogin(event)" class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-[var(--text-secondary)] mb-2" id="t_labelKey">API Key Khách hàng</label>
+            <div class="input-affix">
+              <i class="fa-solid fa-key affix-icon"></i>
+              <input
+                type="password"
+                id="loginKeyInput"
+                value=""
+                placeholder="kpp_... hoặc sk-..."
+                required
+                autocomplete="off"
+                class="w-full bg-[var(--input-bg)] border border-[var(--border)] rounded-xl py-3 text-sm text-[var(--text-primary)] mono outline-none focus:border-[var(--text-primary)] focus:ring-1 focus:ring-[var(--text-primary)] transition"
+              />
+              <button type="button" class="affix-btn" id="loginKeyToggle" onclick="toggleKeyVisibility()" title="Hiển thị / Ẩn Key">
+                <i class="fa-solid fa-eye text-sm" id="loginKeyEyeIcon"></i>
+              </button>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between text-xs pt-1">
+            <label class="inline-flex items-center gap-2 cursor-pointer text-[var(--text-secondary)] select-none">
+              <input type="checkbox" id="rememberKeyCheck" checked class="w-4 h-4 rounded accent-[var(--text-primary)] cursor-pointer" />
+              <span id="t_remember">Ghi nhớ key trên trình duyệt</span>
+            </label>
+          </div>
+
+          <button
+            type="submit"
+            id="loginSubmitBtn"
+            class="w-full py-3 rounded-xl bg-[var(--text-primary)] text-[var(--bg)] font-semibold text-sm hover:opacity-90 transition cursor-pointer flex items-center justify-center gap-2 shadow-md"
+          >
+            <span id="loginSpinner" class="hidden animate-spin text-sm">↻</span>
+            <span id="loginBtnText"><i class="fa-solid fa-magnifying-glass"></i> Kiểm tra hạn mức</span>
+          </button>
+        </form>
+
+        <div id="loginErrorBox" class="mt-4 hidden">
+          <div class="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center gap-2.5">
+            <i class="fa-solid fa-circle-exclamation text-sm"></i>
+            <span id="loginErrorText" class="font-medium">API Key không tồn tại hoặc không hợp lệ</span>
+          </div>
+        </div>
+
+        <div class="mt-6 pt-5 border-t border-[var(--border)] flex items-center justify-center gap-5 text-xs text-[var(--text-muted)]">
+          <span class="inline-flex items-center gap-1.5 font-medium"><i class="fa-solid fa-bolt text-[11px] text-amber-500"></i> Realtime Quota</span>
+          <span>•</span>
+          <span class="inline-flex items-center gap-1.5 font-medium"><i class="fa-solid fa-shield-halved text-[11px] text-emerald-400"></i> Zero-Log</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+
+  <!-- ==================== VIEW 2: KEY DASHBOARD & STATS ==================== -->
+  <div id="dashboardView" class="min-h-screen relative hidden">
+    <div class="dash-glow" aria-hidden="true"></div>
+
+    <!-- Sticky top bar -->
+    <header class="dash-topbar">
+      <div class="max-w-7xl mx-auto px-4 md:px-8 h-16 flex items-center justify-between gap-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <button type="button" onclick="showLoginView()" class="btn-ghost">
+            <i class="fa-solid fa-arrow-left text-xs"></i>
+            <span id="t_back" class="hide-sm">Tra cứu Key khác</span>
+          </button>
+          <div class="flex items-center gap-2 min-w-0">
+            <img src="/admin/icon.png" alt="Kiro-Go" class="brand-img w-6 h-6 rounded" />
+            <span class="text-sm font-semibold text-[var(--text-primary)] hide-sm">Kiro-Go</span>
+            <span class="text-[var(--text-muted)] text-sm hide-sm">/</span>
+            <span id="dashKeyName" class="text-sm font-medium text-[var(--text-primary)] truncate">API Key</span>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <span id="livePill" class="pill hide-sm" title="Tự động cập nhật mỗi 5 giây">
+            <span class="dot"></span><span id="liveSyncLabel" class="mono">Đang đồng bộ…</span>
+          </span>
+          <span id="dashStatusBadge" class="pill">Chưa kết nối</span>
+          <button type="button" onclick="refreshDashboard(true)" id="refreshBtn" title="Tải lại dữ liệu" class="icon-btn">
+            <i class="fa-solid fa-rotate-right" id="refreshIcon"></i>
+          </button>
+          <button type="button" onclick="toggleTheme()" title="Chuyển đổi giao diện Sáng / Tối" class="icon-btn">
+            <i id="dashThemeIcon" class="fa-solid fa-moon"></i>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="relative z-10 max-w-7xl mx-auto px-4 md:px-8 py-6 md:py-8 space-y-5 fade-in">
+
+      <!-- Row 1: Balance hero + Key info -->
+      <section class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+        <!-- Balance -->
+        <div id="balanceCard" class="card hero lg:col-span-2 flex flex-col justify-between gap-5">
+          <div class="flex items-start justify-between gap-3 flex-wrap">
+            <div>
+              <div class="eyebrow flex items-center gap-2" id="balLabelWrap">
+                <i class="fa-solid fa-wallet t-ok" id="balIcon"></i>
+                <span id="balLabel">Credits còn lại</span>
+              </div>
+              <div class="mt-3 flex items-baseline gap-2 flex-wrap">
+                <span class="hero-value" id="balValue">—</span>
+                <span class="hero-unit" id="balUnit"></span>
+              </div>
+            </div>
+            <span id="balPct" class="pill pill-ok mono">—</span>
+          </div>
+
+          <div class="space-y-2.5">
+            <div class="bar-track"><div id="balBar" class="bar-fill" style="width: 0%;"></div></div>
+            <div id="balHint" class="text-[13px] font-medium flex items-center gap-2 t-ok">
+              <i class="fa-solid fa-circle-check"></i><span>Hạn mức khả dụng</span>
+            </div>
+          </div>
+
+          <div class="hero-foot">
+            <div>
+              <div class="eyebrow">Đã dùng</div>
+              <div class="v" id="balUsed">—</div>
+            </div>
+            <div>
+              <div class="eyebrow">Hạn mức</div>
+              <div class="v" id="balLimit">—</div>
+            </div>
+            <div>
+              <div class="eyebrow">Hạn dùng key</div>
+              <div class="v" id="balExpiry">—</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Key info -->
+        <div class="card p-6 flex flex-col">
+          <div class="flex items-center justify-between gap-2 mb-4">
+            <div class="card-title"><i class="fa-solid fa-key text-xs t-muted"></i><span>Thông tin Key</span></div>
+          </div>
+          <div class="key-chip mb-2">
+            <span id="dashMaskedKey" class="truncate text-[var(--text-primary)]"></span>
+            <button type="button" onclick="copySnippetText(activeKey, this)" data-icon-only="1" class="icon-btn icon-btn-sm" title="Sao chép API key đầy đủ">
+              <i class="fa-regular fa-copy"></i>
+            </button>
+          </div>
+          <div class="kv">
+            <span class="k"><i class="fa-regular fa-hourglass-half"></i>Hạn dùng</span>
+            <span class="v" id="m_expiryText">Vĩnh viễn</span>
+          </div>
+          <div class="kv">
+            <span class="k"><i class="fa-regular fa-calendar"></i>Hết hạn lúc</span>
+            <span class="v mono text-[12px]" id="m_expiryDate">Không giới hạn ngày</span>
+          </div>
+          <div class="kv">
+            <span class="k"><i class="fa-solid fa-bolt"></i>Hoạt động gần nhất</span>
+            <span class="v" id="m_lastUsed">Chưa có request</span>
+          </div>
+          <div class="kv">
+            <span class="k"><i class="fa-regular fa-clock"></i>Ngày tạo</span>
+            <span class="v mono text-[12px]" id="m_created">—</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 2: Stat cards -->
+      <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        <div class="card stat">
+          <div class="stat-head">
+            <span class="stat-label"><span class="stat-ico ico-accent"><i class="fa-solid fa-arrow-right-arrow-left"></i></span>Requests</span>
+          </div>
+          <div class="stat-value" id="m_requests">0</div>
+          <div class="stat-sub" id="m_requestsSub">Tổng lượt gọi</div>
+        </div>
+
+        <div class="card stat">
+          <div class="stat-head">
+            <span class="stat-label"><span class="stat-ico ico-ok"><i class="fa-solid fa-layer-group"></i></span>Tổng Tokens</span>
+            <span class="tag" id="m_tokenTag">∞</span>
+          </div>
+          <div class="stat-value" id="m_tokensUsed">0</div>
+          <div class="stat-sub" id="m_tokensSub">Không giới hạn</div>
+        </div>
+
+        <div class="card stat">
+          <div class="stat-head">
+            <span class="stat-label"><span class="stat-ico ico-claude"><i class="fa-solid fa-coins"></i></span>Credits đã dùng</span>
+            <span class="tag" id="m_creditTag">∞</span>
+          </div>
+          <div class="stat-value" id="m_creditsUsed">0</div>
+          <div class="stat-sub" id="m_creditsSub">—</div>
+        </div>
+
+        <div class="card stat">
+          <div class="stat-head">
+            <span class="stat-label"><span class="stat-ico ico-warn"><i class="fa-solid fa-stopwatch"></i></span>Độ trễ TB</span>
+          </div>
+          <div class="stat-value" id="m_latency">—</div>
+          <div class="stat-sub" id="m_latencySub">Chưa có dữ liệu</div>
+        </div>
+      </section>
+
+      <!-- Row 3: Recent requests -->
+      <section class="card p-5 md:p-6 space-y-4">
+        <div class="flex items-center justify-between flex-wrap gap-3">
+          <div class="flex items-center gap-2.5 flex-wrap">
+            <h3 class="card-title"><i class="fa-solid fa-list-ul text-xs t-muted"></i><span>Lịch sử requests gần nhất</span></h3>
+            <span class="tag" id="logsCountBadge">0 reqs</span>
+          </div>
+          <label class="text-xs text-[var(--text-muted)] flex items-center gap-2">
+            <span>Hiển thị</span>
+            <select id="logsPageSize" onchange="changeLogsPageSize(this.value)" class="select">
+              <option value="10">10 / trang</option>
+              <option value="20" selected>20 / trang</option>
+              <option value="50">50 / trang</option>
+              <option value="100">100 / trang</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th>Thời gian</th>
+                <th>Model</th>
+                <th class="center">Giao thức</th>
+                <th class="num">Input</th>
+                <th class="num">Output</th>
+                <th class="num">Tổng tokens</th>
+                <th class="num" title="Input tokens served from Kiro's prompt cache (share of input)">Cache hit</th>
+                <th class="num">Credits</th>
+                <th class="num">Độ trễ</th>
+                <th class="center">Trạng thái</th>
+              </tr>
+            </thead>
+            <tbody id="dashLogsTableBody"></tbody>
+          </table>
+        </div>
+
+        <!-- Pagination Controls -->
+        <div id="logsPaginationBar" class="flex items-center justify-between text-xs text-[var(--text-secondary)] flex-wrap gap-2">
+          <span id="logsPaginationInfo" class="text-[12px] text-[var(--text-muted)]">Hiển thị 0 - 0 trên tổng số 0</span>
+          <div class="flex items-center gap-1.5">
+            <button type="button" id="btnPrevPage" onclick="prevLogsPage()" class="btn-ghost btn-sm">
+              <i class="fa-solid fa-chevron-left text-[10px]"></i> Trước
+            </button>
+            <span id="logsPageIndicator" class="tag" style="font-size:12px;padding:4px 10px">1 / 1</span>
+            <button type="button" id="btnNextPage" onclick="nextLogsPage()" class="btn-ghost btn-sm">
+              Sau <i class="fa-solid fa-chevron-right text-[10px]"></i>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 4: Quick integration snippets -->
+      <section class="card p-5 md:p-6 space-y-4">
+        <div class="flex items-center justify-between flex-wrap gap-3">
+          <h3 class="card-title"><i class="fa-solid fa-code text-xs t-muted"></i><span>Hướng dẫn kết nối nhanh</span></h3>
+          <div class="seg">
+            <button type="button" onclick="switchTab('curl')" class="tab-btn active" data-tab="curl">cURL</button>
+            <button type="button" onclick="switchTab('claude')" class="tab-btn" data-tab="claude">Claude Code</button>
+            <button type="button" onclick="switchTab('cursor')" class="tab-btn" data-tab="cursor">Cursor</button>
+            <button type="button" onclick="switchTab('hermes')" class="tab-btn" data-tab="hermes">Hermes Agent</button>
+            <button type="button" onclick="switchTab('openai')" class="tab-btn" data-tab="openai">OpenAI SDK</button>
+          </div>
+        </div>
+
+        <div id="tab-curl" class="tab-pane active">
+          <div class="code">
+            <div class="code-head"><span><span class="code-dots"><span></span><span></span><span></span></span>Terminal · cURL</span>
+              <button type="button" onclick="copySnippetById('snippet-curl', this)" class="btn-ghost btn-sm"><i class="fa-regular fa-copy"></i> Copy</button></div>
+            <pre id="snippet-curl" class="mono"></pre>
+          </div>
+        </div>
+
+        <div id="tab-claude" class="tab-pane">
+          <div class="code">
+            <div class="code-head"><span><span class="code-dots"><span></span><span></span><span></span></span>Claude Code CLI · Environment</span>
+              <button type="button" onclick="copySnippetById('snippet-claude', this)" class="btn-ghost btn-sm"><i class="fa-regular fa-copy"></i> Copy</button></div>
+            <pre id="snippet-claude" class="mono"></pre>
+          </div>
+        </div>
+
+        <div id="tab-cursor" class="tab-pane">
+          <div class="code">
+            <div class="code-head"><span><span class="code-dots"><span></span><span></span><span></span></span>Cursor IDE · OpenAI-compatible</span>
+              <button type="button" onclick="copySnippetById('snippet-cursor', this)" class="btn-ghost btn-sm"><i class="fa-regular fa-copy"></i> Copy</button></div>
+            <pre id="snippet-cursor" class="mono"></pre>
+          </div>
+        </div>
+
+        <div id="tab-hermes" class="tab-pane">
+          <div class="code">
+            <div class="code-head"><span><span class="code-dots"><span></span><span></span><span></span></span>Hermes Agent · config.yaml</span>
+              <button type="button" onclick="copySnippetById('snippet-hermes', this)" class="btn-ghost btn-sm"><i class="fa-regular fa-copy"></i> Copy</button></div>
+            <pre id="snippet-hermes" class="mono"></pre>
+          </div>
+        </div>
+
+        <div id="tab-openai" class="tab-pane">
+          <div class="code">
+            <div class="code-head"><span><span class="code-dots"><span></span><span></span><span></span></span>Python · OpenAI SDK</span>
+              <button type="button" onclick="copySnippetById('snippet-openai', this)" class="btn-ghost btn-sm"><i class="fa-regular fa-copy"></i> Copy</button></div>
+            <pre id="snippet-openai" class="mono"></pre>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <script>
+    var serverOrigin = "__KIRO_ORIGIN__";
+    var activeKey = "";
+    var initialData = null;
+    var initialLogs = [];
+    var currentLogsList = [];
+    var autoRefreshTimer = null;
+
+    // Pagination State
+    var logsCurrentPage = 1;
+    var logsPageSize = 20;
+    var AUTO_REFRESH_MS = 5000;
+    var SNIPPET_MODEL = "claude-opus-4.8";
+
+    var I18N = {
+      vi: {
+        title: "Tra cứu API Key",
+        subtitle: "Kiểm tra hạn mức Quota, số lượng requests, token và lịch sử gọi API.",
+        labelKey: "API Key Khách hàng",
+        remember: "Ghi nhớ key trên trình duyệt",
+        btnInspect: "Kiểm tra hạn mức",
+        btnChecking: "Đang kiểm tra...",
+        back: "Tra cứu Key khác",
+        errNotFound: "API Key không tồn tại hoặc không hợp lệ. Vui lòng kiểm tra lại."
+      },
+      en: {
+        title: "Tra cứu API Key",
+        subtitle: "Check quota balance, request counts, tokens, and live API history.",
+        labelKey: "Client API Key",
+        remember: "Remember key on this browser",
+        btnInspect: "Inspect Key",
+        btnChecking: "Checking...",
+        back: "Check Another Key",
+        errNotFound: "API Key not found or unrecognized. Please check and try again."
+      },
+      zh: {
+        title: "API Key 额度查询",
+        subtitle: "实时查询 API Key 余额额度、请求次数、Token 消耗及调用日志。",
+        labelKey: "客户端 API Key",
+        remember: "在此浏览器上记住 Key",
+        btnInspect: "查询额度",
+        btnChecking: "正在查询...",
+        back: "查询其他 Key",
+        errNotFound: "API Key 不存在或无效，请核对后重试。"
+      }
+    };
+    var currentLang = localStorage.getItem("kiro_lang") || "vi";
+
+    function safeSetText(id, text) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = text;
+    }
+
+    function safeSetHtml(id, html) {
+      var el = document.getElementById(id);
+      if (el) el.innerHTML = html;
+    }
+
+    function formatTokenExpiry(ts) {
+      if (!ts || ts <= 0) return "Vĩnh viễn";
+      var now = Math.floor(Date.now() / 1000);
+      var diff = ts - now;
+      if (diff <= 0) return "Đã hết hạn";
+      if (diff < 3600) return "Còn " + Math.floor(diff / 60) + " phút";
+      if (diff < 86400) return "Còn " + Math.floor(diff / 3600) + " giờ";
+      var days = Math.floor(diff / 86400);
+      var hours = Math.floor((diff % 86400) / 3600);
+      return "Còn " + days + " ngày" + (hours > 0 ? (" " + hours + "h") : "");
+    }
+
+    function formatDateTime(unixSeconds) {
+      if (!unixSeconds || unixSeconds <= 0) return "Không giới hạn ngày";
+      return new Date(unixSeconds * 1000).toLocaleString("vi-VN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour12: false
+      });
+    }
+
+    // Clock time for today's rows, "dd/mm hh:mm:ss" for older ones.
+    function formatClock(unix) {
+      var d = new Date(unix * 1000);
+      var hms = d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+      if (d.toDateString() === new Date().toDateString()) return hms;
+      return d.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit" }) + " " + hms;
+    }
+
+    document.addEventListener("DOMContentLoaded", function() {
+      setLang(currentLang);
+      var isDark = document.documentElement.classList.contains("dark");
+      updateThemeIcons(isDark);
+
+      if (initialData && activeKey) {
+        showDashboardView(initialData, initialLogs);
+      } else {
+        var saved = localStorage.getItem("kiro_client_key");
+        if (saved) {
+          var inp = document.getElementById("loginKeyInput");
+          if (inp) inp.value = saved;
+        }
+      }
+
+      // Coming back to the tab should show current numbers without an F5.
+      document.addEventListener("visibilitychange", function() {
+        if (!document.hidden && activeKey) refreshDashboard(false);
+      });
+      window.addEventListener("focus", function() {
+        if (activeKey) refreshDashboard(false);
+      });
+    });
+
+    function setLang(lang) {
+      if (!I18N[lang]) lang = "vi";
+      currentLang = lang;
+      localStorage.setItem("kiro_lang", lang);
+      var t = I18N[lang];
+      safeSetText("t_title", t.title);
+      safeSetText("t_subtitle", t.subtitle);
+      safeSetText("t_labelKey", t.labelKey);
+      safeSetText("t_remember", t.remember);
+      safeSetHtml("loginBtnText", '<i class="fa-solid fa-magnifying-glass"></i> ' + t.btnInspect);
+      safeSetText("t_back", t.back);
+
+      ["vi", "en", "zh"].forEach(function(l) {
+        var btn = document.getElementById("langBtn" + l.charAt(0).toUpperCase() + l.slice(1));
+        if (btn) {
+          if (l === lang) {
+            btn.className = "px-2.5 py-1 rounded-md font-semibold text-[var(--text-primary)] bg-[var(--badge-bg)] cursor-pointer";
+          } else {
+            btn.className = "px-2.5 py-1 rounded-md font-semibold text-[var(--text-secondary)] hover:bg-[var(--badge-bg)] cursor-pointer";
+          }
+        }
+      });
+    }
+
+    function toggleTheme() {
+      var isDark = document.documentElement.classList.contains("dark");
+      document.documentElement.classList.toggle("dark", !isDark);
+      document.documentElement.classList.toggle("light", isDark);
+      localStorage.setItem("kiro_theme", isDark ? "light" : "dark");
+      updateThemeIcons(!isDark);
+    }
+
+    function updateThemeIcons(isDark) {
+      ["loginThemeIcon", "dashThemeIcon"].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.className = "fa-solid " + (isDark ? "fa-moon" : "fa-sun");
+      });
+    }
+
+    function toggleKeyVisibility() {
+      var input = document.getElementById("loginKeyInput");
+      var icon = document.getElementById("loginKeyEyeIcon");
+      if (!input || !icon) return;
+      if (input.type === "password") {
+        input.type = "text";
+        icon.className = "fa-solid fa-eye-slash text-sm";
+      } else {
+        input.type = "password";
+        icon.className = "fa-solid fa-eye text-sm";
+      }
+    }
+
+    async function handleKeyLogin(e) {
+      e.preventDefault();
+      var input = document.getElementById("loginKeyInput");
+      var key = input ? input.value.trim() : "";
+      if (!key) return;
+
+      var btn = document.getElementById("loginSubmitBtn");
+      var spinner = document.getElementById("loginSpinner");
+      var btnText = document.getElementById("loginBtnText");
+      var errBox = document.getElementById("loginErrorBox");
+      var card = document.getElementById("loginCard");
+
+      if (btn) btn.disabled = true;
+      if (spinner) spinner.classList.remove("hidden");
+      if (btnText) btnText.textContent = I18N[currentLang].btnChecking;
+      if (errBox) errBox.classList.add("hidden");
+
+      try {
+        var res = await fetch("/check?key=" + encodeURIComponent(key) + "&format=json&_ts=" + Date.now(), {
+          headers: { "Accept": "application/json", "Cache-Control": "no-cache" },
+          cache: "no-store"
+        });
+        var data = await res.json();
+
+        if (!res.ok || !data.success) {
+          if (errBox) errBox.classList.remove("hidden");
+          safeSetText("loginErrorText", data.message || data.error || I18N[currentLang].errNotFound);
+          if (card) {
+            card.classList.remove("shake");
+            void card.offsetWidth;
+            card.classList.add("shake");
+          }
+          return;
+        }
+
+        activeKey = key;
+        var rememberEl = document.getElementById("rememberKeyCheck");
+        if (rememberEl && rememberEl.checked) {
+          localStorage.setItem("kiro_client_key", key);
+        } else {
+          localStorage.removeItem("kiro_client_key");
+        }
+
+        showDashboardView(data, data.recent_logs || []);
+        showToast("Đã tải dữ liệu API Key thành công!", "success");
+      } catch (err) {
+        if (errBox) errBox.classList.remove("hidden");
+        safeSetText("loginErrorText", "Lỗi kết nối mạng. Vui lòng thử lại.");
+        if (card) {
+          card.classList.remove("shake");
+          void card.offsetWidth;
+          card.classList.add("shake");
+        }
+      } finally {
+        if (btn) btn.disabled = false;
+        if (spinner) spinner.classList.add("hidden");
+        if (btnText) btnText.innerHTML = '<i class="fa-solid fa-magnifying-glass"></i> ' + I18N[currentLang].btnInspect;
+      }
+    }
+
+    function showLoginView() {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+      document.getElementById("dashboardView").classList.add("hidden");
+      document.getElementById("loginView").classList.remove("hidden");
+      document.title = "Kiro-Go";
+    }
+
+    // ---------- number formatting ----------
+    function fmtFixed(n, d) {
+      return (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+    }
+
+    // Precision scales with magnitude so sub-credit charges never read as "0".
+    function fmtCredits(n) {
+      n = Number(n) || 0;
+      if (n <= 0) return "0";
+      if (n >= 100) return Math.round(n).toLocaleString();
+      if (n >= 10) return n.toFixed(1);
+      if (n >= 1) return n.toFixed(2);
+      if (n >= 0.001) return n.toFixed(3);
+      return n >= 0.0001 ? n.toFixed(4) : "<0.0001";
+    }
+
+    function fmtCompact(n) {
+      n = Number(n) || 0;
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+      return String(n);
+    }
+
+    function fmtPct(r) {
+      if (r > 0 && r < 0.1) return "<0.1%";
+      return r.toFixed(r < 10 ? 1 : 0) + "%";
+    }
+
+    function fmtLatency(ms) {
+      return ms >= 1000 ? (ms / 1000).toFixed(ms >= 10000 ? 1 : 2) + "s" : Math.round(ms) + "ms";
+    }
+
+    // ---------- log helpers ----------
+    // Every field used to fall through to a success default, so an entry
+    // recorded as an error still rendered "200 OK". Trust the explicit
+    // status/statusCode the gateway writes, and only guess when both absent.
+    function isLogSuccess(l) {
+      var code = Number(l.statusCode) || 0;
+      if (l.success === false || l.status === "error") return false;
+      if (code) return code === 200;
+      return l.status === "success" || l.status === 200 || l.success === true;
+    }
+
+    function logLatencyMs(l) {
+      return Number(l.latencyMs || l.duration || l.latency || 0);
+    }
+
+    function logStats(logs) {
+      var s = { n: logs.length, ok: 0, inTok: 0, outTok: 0, latSum: 0, latN: 0, latMin: 0, latMax: 0 };
+      logs.forEach(function(l) {
+        var ok = isLogSuccess(l);
+        if (ok) s.ok++;
+        s.inTok += firstFiniteNum(l.inputTokens, l.tokensIn, 0);
+        s.outTok += firstFiniteNum(l.outputTokens, l.tokensOut, 0);
+        var ms = logLatencyMs(l);
+        if (ok && ms > 0) {
+          s.latSum += ms;
+          s.latN++;
+          s.latMin = s.latN === 1 ? ms : Math.min(s.latMin, ms);
+          s.latMax = Math.max(s.latMax, ms);
+        }
+      });
+      return s;
+    }
+
+    function statusPill(tone, icon, text) {
+      var lead = icon ? '<i class="fa-solid ' + icon + ' text-[11px]"></i>' : '<span class="dot' + (tone === "ok" ? " dot-pulse" : "") + '"></span>';
+      return '<span class="pill pill-' + tone + '">' + lead + escapeHtmlVal(text) + '</span>';
+    }
+
+    function showDashboardView(data, logs, isRefresh) {
+      document.getElementById("loginView").classList.add("hidden");
+      document.getElementById("dashboardView").classList.remove("hidden");
+      document.title = (data.name || "API Key") + " · Kiro-Go";
+
+      currentLogsList = logs || [];
+      // A background refresh must not yank the reader back to page 1.
+      if (!isRefresh) {
+        logsCurrentPage = 1;
+        setLiveIndicator(true);
+      }
+
+      var now = Math.floor(Date.now() / 1000);
+      var keyExpiresAt = Number(data.expires_at || data.expiresAt || 0);
+      var isKeyExpired = keyExpiresAt > 0 && now >= keyExpiresAt;
+      var isDisabled = data.status === "disabled" || data.enabled === false;
+
+      var reqs = Number(data.requests_count) || 0;
+      var tokIn = Number(data.tokens_in) || 0;
+      var tokOut = Number(data.tokens_out) || 0;
+      var tokUsed = Number(data.tokens_used) || (tokIn + tokOut);
+      var tokLim = Number(data.token_limit) || 0;
+      var credUsed = Number(data.credits_used) || 0;
+      var credLim = Number(data.credit_limit) || 0;
+      var isExceeded = !isDisabled && ((data.status === "quota_exceeded") || isKeyExpired ||
+        (credLim > 0 && credUsed >= credLim) || (tokLim > 0 && tokUsed >= tokLim));
+      var st = logStats(currentLogsList);
+
+      // ---- Header + key card ----
+      safeSetText("dashKeyName", data.name || "API Key");
+      safeSetText("dashMaskedKey", data.key_masked || maskApiKey(activeKey));
+      var badge;
+      if (isDisabled) badge = statusPill("err", "fa-ban", "Đã khóa");
+      else if (isKeyExpired) badge = statusPill("err", "fa-clock", "Hết hạn dùng");
+      else if (isExceeded) badge = statusPill("err", "fa-triangle-exclamation", "Vượt Quota");
+      else badge = statusPill("ok", "", "Hoạt động");
+      var badgeEl = document.getElementById("dashStatusBadge");
+      if (badgeEl) {
+        badgeEl.className = "contents";
+        badgeEl.innerHTML = badge;
+      }
+
+      var expiryFormatted = formatTokenExpiry(keyExpiresAt);
+      var expiryLeft = keyExpiresAt > 0 ? keyExpiresAt - now : Infinity;
+      var expiryTone = isKeyExpired ? "t-err" : (expiryLeft < 3 * 86400 ? "t-warn" : (keyExpiresAt > 0 ? "t-primary" : "t-ok"));
+      safeSetText("m_expiryText", expiryFormatted);
+      document.getElementById("m_expiryText").className = "v " + expiryTone;
+      safeSetText("m_expiryDate", keyExpiresAt > 0 ? formatDateTime(keyExpiresAt) : "Không giới hạn ngày");
+      safeSetText("balExpiry", expiryFormatted);
+      document.getElementById("balExpiry").className = "v " + expiryTone;
+
+      var lastEl = document.getElementById("m_lastUsed");
+      if (data.last_used_at) {
+        safeSetText("m_lastUsed", formatRelativeTime(data.last_used_at));
+        if (lastEl) lastEl.title = new Date(data.last_used_at * 1000).toLocaleString();
+      } else {
+        safeSetText("m_lastUsed", "Chưa có request");
+      }
+      safeSetText("m_created", data.created_at ? formatDateTime(data.created_at) : "—");
+
+      // ---- Balance hero ----
+      var limited = credLim > 0 || tokLim > 0;
+      var ratio = 0;
+      if (credLim > 0) {
+        ratio = Math.min(100, (credUsed / credLim) * 100);
+        safeSetText("balLabel", "Credits còn lại");
+        safeSetText("balValue", fmtFixed(Math.max(0, credLim - credUsed), 2));
+        safeSetText("balUnit", "Cr");
+        safeSetText("balUsed", fmtFixed(credUsed, 2) + " Cr");
+        safeSetText("balLimit", credLim.toLocaleString() + " Cr");
+      } else if (tokLim > 0) {
+        ratio = Math.min(100, (tokUsed / tokLim) * 100);
+        safeSetText("balLabel", "Tokens còn lại");
+        safeSetText("balValue", Math.max(0, tokLim - tokUsed).toLocaleString());
+        safeSetText("balUnit", "tokens");
+        safeSetText("balUsed", tokUsed.toLocaleString());
+        safeSetText("balLimit", tokLim.toLocaleString());
+      } else {
+        safeSetText("balLabel", "Hạn mức");
+        safeSetText("balValue", "Không giới hạn");
+        safeSetText("balUnit", "");
+        safeSetText("balUsed", fmtFixed(credUsed, 2) + " Cr");
+        safeSetText("balLimit", "∞");
+      }
+      var balUsedEl = document.getElementById("balUsed");
+      if (balUsedEl) balUsedEl.title = credUsed.toFixed(4) + " Cr";
+
+      var tone = ratio >= 90 ? "err" : (ratio >= 70 ? "warn" : "ok");
+      var hintIcon = "fa-circle-check";
+      var hint = limited ? "Hạn mức khả dụng" : "Không giới hạn hạn mức";
+      if (ratio >= 90) { hintIcon = "fa-triangle-exclamation"; hint = "Sắp hết hạn mức — hãy nạp thêm để tránh gián đoạn"; }
+      else if (ratio >= 70) { hintIcon = "fa-bolt"; hint = "Đã dùng " + fmtPct(ratio) + " hạn mức"; }
+      var barWidth = limited ? Math.max(ratio > 0 ? 1.5 : 0, ratio) : 100;
+      if (isDisabled) { tone = "muted"; hintIcon = "fa-ban"; hint = "Key đã bị tạm khóa / vô hiệu hóa"; barWidth = 100; }
+      else if (isKeyExpired) { tone = "err"; hintIcon = "fa-clock"; hint = "API Key đã hết hạn sử dụng — request sẽ bị từ chối"; barWidth = 100; }
+      else if (isExceeded) { tone = "err"; hintIcon = "fa-triangle-exclamation"; hint = "Đã dùng hết hạn mức — request sẽ bị từ chối (429)"; barWidth = 100; }
+
+      var toneVar = tone === "muted" ? "var(--text-muted)" : "var(--" + tone + ")";
+      var toneText = tone === "muted" ? "t-muted" : "t-" + tone;
+      var balCard = document.getElementById("balanceCard");
+      if (balCard) balCard.style.setProperty("--hero-tone", toneVar);
+      var bar = document.getElementById("balBar");
+      if (bar) {
+        bar.style.width = barWidth + "%";
+        bar.dataset.tone = tone;
+      }
+      document.getElementById("balIcon").className = "fa-solid fa-wallet " + toneText;
+      var pctEl = document.getElementById("balPct");
+      if (pctEl) {
+        pctEl.className = "pill mono " + (tone === "muted" ? "" : "pill-" + tone);
+        pctEl.textContent = isDisabled ? "Disabled" : (limited ? fmtPct(ratio) + " đã dùng" : "Unlimited");
+      }
+      safeSetHtml("balHint", '<i class="fa-solid ' + hintIcon + '"></i><span>' + escapeHtmlVal(hint) + '</span>');
+      document.getElementById("balHint").className = "text-[13px] font-medium flex items-center gap-2 " + toneText;
+
+      // ---- Stat cards ----
+      safeSetText("m_requests", reqs.toLocaleString());
+      if (st.n > 0) {
+        var rate = (st.ok / st.n) * 100;
+        var rateTone = rate >= 95 ? "t-ok" : (rate >= 80 ? "t-warn" : "t-err");
+        safeSetHtml("m_requestsSub", '<span class="' + rateTone + ' font-medium">' + fmtPct(rate) + ' thành công</span> · ' + st.n.toLocaleString() + ' gần nhất');
+      } else {
+        safeSetText("m_requestsSub", "Tổng lượt gọi");
+      }
+
+      safeSetText("m_tokensUsed", tokUsed.toLocaleString());
+      safeSetText("m_tokenTag", tokLim > 0 ? fmtPct(Math.min(100, (tokUsed / tokLim) * 100)) : "∞");
+      // The Go server only tracks a lifetime total per key; the in/out split comes
+      // from the recent request log unless the payload carries real lifetime counters.
+      var lifetimeSplit = tokIn + tokOut > 0;
+      var sIn = lifetimeSplit ? tokIn : st.inTok;
+      var sOut = lifetimeSplit ? tokOut : st.outTok;
+      var tokSubEl = document.getElementById("m_tokensSub");
+      if (sIn + sOut > 0) {
+        var inPct = (sIn / (sIn + sOut)) * 100;
+        safeSetHtml("m_tokensSub",
+          '<div class="split"><span class="split-in" style="width:' + inPct + '%"></span><span class="split-out" style="width:' + (100 - inPct) + '%"></span></div>' +
+          '<div class="flex items-center justify-between gap-2"><span><i class="legend-dot split-in"></i>In ' + fmtCompact(sIn) + '</span>' +
+          '<span><i class="legend-dot split-out"></i>Out ' + fmtCompact(sOut) + '</span></div>');
+        if (tokSubEl) tokSubEl.title = lifetimeSplit ? "Tổng từ trước đến nay" : ("Tỉ lệ In/Out theo " + st.n + " request gần nhất");
+      } else {
+        safeSetText("m_tokensSub", tokLim > 0 ? ("Còn " + Math.max(0, tokLim - tokUsed).toLocaleString()) : "Không giới hạn");
+        if (tokSubEl) tokSubEl.title = "";
+      }
+
+      safeSetHtml("m_creditsUsed", fmtFixed(credUsed, 2) + '<span class="stat-unit">Cr</span>');
+      safeSetText("m_creditTag", credLim > 0 ? fmtPct(Math.min(100, (credUsed / credLim) * 100)) : "∞");
+      safeSetText("m_creditsSub", reqs > 0 ? ("TB " + fmtCredits(credUsed / reqs) + " Cr / request") : "Chưa phát sinh chi phí");
+
+      if (st.latN > 0) {
+        safeSetText("m_latency", fmtLatency(st.latSum / st.latN));
+        safeSetText("m_latencySub", "Min " + fmtLatency(st.latMin) + " · Max " + fmtLatency(st.latMax));
+      } else {
+        safeSetText("m_latency", "—");
+        safeSetText("m_latencySub", "Chưa có dữ liệu");
+      }
+
+      updateSnippets(activeKey);
+      renderPaginatedLogs();
+
+      if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+      autoRefreshTimer = setInterval(function() {
+        refreshDashboard(false);
+      }, AUTO_REFRESH_MS);
+    }
+
+    async function refreshDashboard(showSpinner) {
+      if (!activeKey) return;
+      var icon = document.getElementById("refreshIcon");
+      if (showSpinner && icon) icon.classList.add("fa-spin");
+
+      try {
+        // The cache buster plus no-store matters: without them the polled JSON
+        // could be answered from the browser/edge cache and the balance would
+        // only ever move when the user pressed F5.
+        var res = await fetch("/check?key=" + encodeURIComponent(activeKey) + "&format=json&_ts=" + Date.now(), {
+          headers: { "Accept": "application/json", "Cache-Control": "no-cache" },
+          cache: "no-store"
+        });
+        var data = await res.json();
+        if (res.ok && data.success) {
+          currentLogsList = data.recent_logs || [];
+          showDashboardView(data, currentLogsList, true);
+          setLiveIndicator(true);
+        } else {
+          setLiveIndicator(false);
+        }
+      } catch (_) {
+        setLiveIndicator(false);
+      } finally {
+        if (showSpinner && icon) icon.classList.remove("fa-spin");
+      }
+    }
+
+    function setLiveIndicator(ok) {
+      var pill = document.getElementById("livePill");
+      var stamp = new Date().toLocaleTimeString("vi-VN", { hour12: false });
+      safeSetText("liveSyncLabel", ok ? ("Live · " + stamp) : ("Mất kết nối · " + stamp));
+      if (pill) {
+        pill.className = "pill hide-sm " + (ok ? "pill-ok" : "pill-err");
+        var dot = pill.querySelector(".dot");
+        if (dot) dot.className = "dot" + (ok ? " dot-pulse" : "");
+      }
+    }
+
+    function changeLogsPageSize(val) {
+      logsPageSize = parseInt(val, 10) || 20;
+      logsCurrentPage = 1;
+      renderPaginatedLogs();
+    }
+
+    function prevLogsPage() {
+      if (logsCurrentPage > 1) {
+        logsCurrentPage--;
+        renderPaginatedLogs();
+      }
+    }
+
+    function nextLogsPage() {
+      var totalPages = Math.ceil((currentLogsList || []).length / logsPageSize) || 1;
+      if (logsCurrentPage < totalPages) {
+        logsCurrentPage++;
+        renderPaginatedLogs();
+      }
+    }
+
+    function modelIcon(model) {
+      var m = String(model || "").toLowerCase();
+      if (m.indexOf("claude") === 0) return '<span class="model-ico claude"><i class="fa-solid fa-asterisk"></i></span>';
+      if (m.indexOf("gpt") === 0 || /^o\d/.test(m)) return '<span class="model-ico openai"><i class="fa-brands fa-openai"></i></span>';
+      return '<span class="model-ico other"><i class="fa-solid fa-cube"></i></span>';
+    }
+
+    function renderPaginatedLogs() {
+      var logs = currentLogsList || [];
+      var total = logs.length;
+      var tbody = document.getElementById("dashLogsTableBody");
+      var info = document.getElementById("logsPaginationInfo");
+      var indicator = document.getElementById("logsPageIndicator");
+      var btnPrev = document.getElementById("btnPrevPage");
+      var btnNext = document.getElementById("btnNextPage");
+
+      safeSetText("logsCountBadge", total.toLocaleString() + " reqs");
+
+      if (!tbody) return;
+      if (total === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="center" style="padding:48px 16px">' +
+          '<div class="t-muted"><i class="fa-regular fa-folder-open text-2xl mb-3 block"></i>' +
+          '<div class="text-[13px] font-medium t-secondary">Chưa có request nào</div>' +
+          '<div class="text-xs mt-1">Lịch sử sẽ xuất hiện ở đây ngay khi API key này được sử dụng.</div></div></td></tr>';
+        if (info) info.textContent = "Hiển thị 0 - 0 trên tổng số 0";
+        if (indicator) indicator.textContent = "1 / 1";
+        if (btnPrev) btnPrev.disabled = true;
+        if (btnNext) btnNext.disabled = true;
+        return;
+      }
+
+      var totalPages = Math.ceil(total / logsPageSize) || 1;
+      if (logsCurrentPage > totalPages) logsCurrentPage = totalPages;
+      if (logsCurrentPage < 1) logsCurrentPage = 1;
+
+      var startIdx = (logsCurrentPage - 1) * logsPageSize;
+      var endIdx = Math.min(startIdx + logsPageSize, total);
+      var pageLogs = logs.slice(startIdx, endIdx);
+
+      tbody.innerHTML = pageLogs.map(function(l) {
+        var isSuccess = isLogSuccess(l);
+        var code = Number(l.statusCode) || 0;
+        var codeLabel = isSuccess ? ((code || 200) + " OK") : (code ? String(code) : (l.status === "error" ? "Lỗi" : String(l.status || "ERR")));
+        var statusHtml = isSuccess
+          ? '<span class="pill pill-sm pill-ok"><span class="dot"></span>' + escapeHtmlVal(codeLabel) + '</span>'
+          : '<span class="pill pill-sm pill-err" title="' + escapeAttrVal(l.error || "") + '"><i class="fa-solid fa-circle-exclamation text-[10px]"></i>' + escapeHtmlVal(codeLabel) + '</span>';
+
+        var timeUnix = l.timeUnix || l.time || 0;
+        var timeHtml = timeUnix
+          ? '<div class="t-primary">' + escapeHtmlVal(formatRelativeTime(timeUnix)) + '</div><div class="cell-sub mono">' + escapeHtmlVal(formatClock(timeUnix)) + '</div>'
+          : '<span class="t-muted">—</span>';
+
+        var modelStr = l.model || "—";
+        var isAnthropic = l.kind === "anthropic" || l.type === "claude";
+        var protoHtml = isAnthropic
+          ? '<span class="pill pill-sm pill-claude">Anthropic</span>'
+          : '<span class="pill pill-sm"><i class="fa-brands fa-openai text-[10px]"></i>OpenAI</span>';
+
+        // The old fallback to l.tokens kicked in whenever output was
+        // legitimately 0 and displayed the in+out total in the output column.
+        var inTok = firstFiniteNum(l.inputTokens, l.tokensIn, 0);
+        var outTok = firstFiniteNum(l.outputTokens, l.tokensOut, 0);
+        var totTok = firstFiniteNum(l.totalTokens, inTok + outTok);
+        var estMark = l.tokensEstimated === true ? "~" : "";
+        var estTitle = l.tokensEstimated === true ? "Upstream reported no usage; these counts are a local estimate" : "";
+
+        var latMs = logLatencyMs(l);
+        var latTone = (latMs <= 0 || !isSuccess) ? "t-muted" : (latMs < 10000 ? "t-ok" : (latMs < 30000 ? "t-warn" : "t-err"));
+        var cred = Number(l.credits) || 0;
+        var cacheRead = Number(l.cacheReadTokens) || 0;
+        var cacheWrite = Number(l.cacheWriteTokens) || 0;
+        var cachePct = (cacheRead && inTok) ? Math.min(100, Math.round(cacheRead * 100 / inTok)) : 0;
+        var cacheHtml = cacheRead
+          ? '<span class="t-ok">' + cacheRead.toLocaleString() + '</span> <span class="t-muted">(' + cachePct + '%)</span>'
+          : (cacheWrite ? '<span class="t-muted" title="Written to prompt cache">+' + cacheWrite.toLocaleString() + '</span>' : '<span class="t-muted">—</span>');
+
+        return '<tr class="' + (isSuccess ? "" : "row-err") + '">' +
+          '<td title="' + escapeAttrVal(timeUnix ? new Date(timeUnix * 1000).toLocaleString() : "") + '">' + timeHtml + '</td>' +
+          '<td><div class="model-cell">' + modelIcon(modelStr) + '<span class="mono font-medium t-primary">' + escapeHtmlVal(modelStr) + '</span></div>' +
+            (isSuccess || !l.error ? '' : '<div class="cell-sub t-err truncate" style="max-width:220px;margin-left:34px" title="' + escapeAttrVal(l.error) + '">' + escapeHtmlVal(l.error) + '</div>') + '</td>' +
+          '<td class="center">' + protoHtml + '</td>' +
+          '<td class="num t-secondary" title="' + escapeAttrVal(estTitle) + '">' + (inTok ? estMark + inTok.toLocaleString() : '<span class="t-muted">—</span>') + '</td>' +
+          '<td class="num t-secondary" title="' + escapeAttrVal(estTitle) + '">' + (outTok ? estMark + outTok.toLocaleString() : '<span class="t-muted">—</span>') + '</td>' +
+          '<td class="num t-primary font-semibold">' + (totTok ? estMark + totTok.toLocaleString() : '<span class="t-muted font-normal">—</span>') + '</td>' +
+          '<td class="num">' + cacheHtml + '</td>' +
+          '<td class="num t-primary" title="' + (cred > 0 ? cred.toFixed(4) + ' Cr' : '') + '">' + (cred > 0 ? fmtCredits(cred) + ' <span class="t-muted">Cr</span>' : '<span class="t-muted">—</span>') + '</td>' +
+          '<td class="num ' + latTone + '">' + (latMs > 0 ? fmtLatency(latMs) : '—') + '</td>' +
+          '<td class="center">' + statusHtml + '</td>' +
+          '</tr>';
+      }).join("");
+
+      if (info) info.textContent = "Hiển thị " + (startIdx + 1) + " - " + endIdx + " trên tổng số " + total;
+      if (indicator) indicator.textContent = logsCurrentPage + " / " + totalPages;
+      if (btnPrev) btnPrev.disabled = (logsCurrentPage <= 1);
+      if (btnNext) btnNext.disabled = (logsCurrentPage >= totalPages);
+    }
+
+    function switchTab(tabId) {
+      document.querySelectorAll(".tab-btn").forEach(function(b) { b.classList.toggle("active", b.dataset.tab === tabId); });
+      document.querySelectorAll(".tab-pane").forEach(function(p) { p.classList.toggle("active", p.id === "tab-" + tabId); });
+    }
+
+    function updateSnippets(key) {
+      var k = key || "kpp_...";
+      var sq = String.fromCharCode(39);
+      var bs = String.fromCharCode(92);
+      var nl = String.fromCharCode(10);
+      var modelName = SNIPPET_MODEL;
+
+      var curl = document.getElementById("snippet-curl");
+      if (curl) {
+        curl.textContent = [
+          'curl -X POST "' + serverOrigin + '/v1/messages" ' + bs,
+          '  -H "Content-Type: application/json" ' + bs,
+          '  -H "x-api-key: ' + k + '" ' + bs,
+          '  -H "anthropic-version: 2023-06-01" ' + bs,
+          '  -d ' + sq + '{"model": "' + modelName + '", "max_tokens": 1024, "messages": [{"role": "user", "content": "Hello!"}]}' + sq
+        ].join(nl);
+      }
+
+      // Anthropic clients append /v1 themselves, so the base URL must not include it.
+      var claude = document.getElementById("snippet-claude");
+      if (claude) {
+        claude.textContent = [
+          'export ANTHROPIC_BASE_URL="' + serverOrigin + '"',
+          'export ANTHROPIC_API_KEY="' + k + '"',
+          'claude'
+        ].join(nl);
+      }
+
+      var cursor = document.getElementById("snippet-cursor");
+      if (cursor) {
+        cursor.textContent = [
+          'Base URL: ' + serverOrigin + '/v1',
+          'API Key:  ' + k,
+          'Models:   claude-opus-5.5, claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-sonnet-5.5, claude-sonnet-5'
+        ].join(nl);
+      }
+
+      var hermes = document.getElementById("snippet-hermes");
+      if (hermes) {
+        hermes.textContent = [
+          'model: custom/' + modelName,
+          'providers:',
+          '  custom:',
+          '    base_url: "' + serverOrigin + '/v1"',
+          '    api_key: "' + k + '"',
+          '    api_mode: "chat_completions"'
+        ].join(nl);
+      }
+
+      var openai = document.getElementById("snippet-openai");
+      if (openai) {
+        openai.textContent = [
+          'from openai import OpenAI',
+          '',
+          'client = OpenAI(',
+          '    base_url="' + serverOrigin + '/v1",',
+          '    api_key="' + k + '"',
+          ')',
+          '',
+          'response = client.chat.completions.create(',
+          '    model="' + modelName + '",',
+          '    messages=[{"role": "user", "content": "Hello!"}]',
+          ')',
+          'print(response.choices[0].message.content)'
+        ].join(nl);
+      }
+    }
+
+    function copySnippetById(elementId, btn) {
+      var el = document.getElementById(elementId);
+      if (el) copySnippetText(el.innerText || el.textContent, btn);
+    }
+
+    async function copySnippetText(text, btn) {
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        if (btn) {
+          var oldHtml = btn.innerHTML;
+          btn.innerHTML = '<i class="fa-solid fa-check t-ok"></i>' + (btn.dataset.iconOnly ? "" : " Đã chép");
+          setTimeout(function() { btn.innerHTML = oldHtml; }, 1800);
+        }
+        showToast("Đã sao chép vào clipboard!", "success");
+      } catch (_) {
+        showToast("Không thể sao chép tự động", "error");
+      }
+    }
+
+    function showToast(msg, type) {
+      if (!type) type = "info";
+      var container = document.getElementById("toastContainer");
+      if (!container) return;
+      var toast = document.createElement("div");
+      var icon = type === "success" ? "fa-circle-check t-ok" : (type === "error" ? "fa-circle-exclamation t-err" : "fa-circle-info t-accent");
+      toast.className = "px-4 py-2.5 rounded-xl text-xs font-medium border transition-all duration-300 translate-y-2 opacity-0 flex items-center gap-2.5 pointer-events-auto";
+      toast.style.cssText = "background:var(--card);color:var(--text-primary);border-color:var(--border);box-shadow:var(--shadow-lg)";
+      toast.innerHTML = '<i class="fa-solid ' + icon + '"></i><span>' + escapeHtmlVal(msg) + '</span>';
+      container.appendChild(toast);
+      setTimeout(function() { toast.classList.remove("translate-y-2", "opacity-0"); }, 10);
+      setTimeout(function() {
+        toast.classList.add("opacity-0", "translate-y-2");
+        setTimeout(function() { toast.remove(); }, 300);
+      }, 2500);
+    }
+
+    function formatRelativeTime(unix) {
+      if (!unix || unix <= 0) return "Chưa hoạt động";
+      var now = Math.floor(Date.now() / 1000);
+      var diff = now - unix;
+      if (diff < 10) return "Vừa xong";
+      if (diff < 60) return diff + " giây trước";
+      if (diff < 3600) return Math.floor(diff / 60) + " phút trước";
+      if (diff < 86400) return Math.floor(diff / 3600) + " giờ trước";
+      return new Date(unix * 1000).toLocaleDateString("vi-VN");
+    }
+
+    function maskApiKey(key) {
+      if (!key) return "—";
+      var s = String(key).trim();
+      if (s.length <= 12) return s.slice(0, 4) + "••••" + s.slice(-2);
+      return s.slice(0, 8) + "••••••••" + s.slice(-4);
+    }
+
+    function escapeHtmlVal(s) {
+      return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function escapeAttrVal(s) {
+      return String(s || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // Picks the first argument that is an actual number, treating 0 as a real
+    // value. The old "a || b || 0" chain silently skipped legitimate zeros.
+    function firstFiniteNum() {
+      for (var i = 0; i < arguments.length; i++) {
+        var n = Number(arguments[i]);
+        if (arguments[i] !== null && arguments[i] !== undefined && arguments[i] !== "" && isFinite(n)) return n;
+      }
+      return 0;
+    }
+  </script>
+</body>
+</html>

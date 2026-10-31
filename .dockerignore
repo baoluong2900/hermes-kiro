@@ -18,4 +18,5 @@ kiro-go*
 *.patch
 *.py
 *.sh
+!deploy/docker/entrypoint.sh
 cloudflare

@@ -9,11 +9,11 @@ import (
 )
 
 func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
-	p := &AccountPool{}
+	p := NewTestPool()
 	normal := config.Account{ID: "normal"}
 	overLimit := config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10}
 
-	p.accounts = []config.Account{normal, overLimit}
+	p.rebuild([]config.Account{normal, overLimit}, true)
 
 	for i := 0; i < 5; i++ {
 		acc := p.GetNext()
@@ -27,7 +27,7 @@ func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
 }
 
 func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) {
-	p := &AccountPool{}
+	p := NewTestPool()
 	overLimit := config.Account{
 		ID:            "over",
 		UsageCurrent:  10,
@@ -35,7 +35,7 @@ func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) 
 		OverageStatus: "ENABLED",
 	}
 
-	p.accounts = []config.Account{overLimit}
+	p.rebuild([]config.Account{overLimit}, true)
 
 	acc := p.GetNext()
 	if acc == nil {
@@ -47,7 +47,7 @@ func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) 
 }
 
 func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T) {
-	p := &AccountPool{}
+	p := NewTestPool()
 	overLimit := config.Account{
 		ID:            "over",
 		UsageCurrent:  10,
@@ -55,7 +55,7 @@ func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T)
 		OverageStatus: "DISABLED",
 	}
 
-	p.accounts = []config.Account{overLimit}
+	p.rebuild([]config.Account{overLimit}, true)
 
 	if acc := p.GetNext(); acc != nil {
 		t.Fatalf("expected nil when upstream OverageStatus=DISABLED, got %q", acc.ID)
@@ -63,14 +63,14 @@ func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T)
 }
 
 func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
-	p := &AccountPool{}
+	p := NewTestPool()
 	account := config.Account{
 		ID:          "acct-1",
 		AccessToken: "access-token",
 		ExpiresAt:   time.Now().Unix() + 300,
 	}
 
-	p.accounts = []config.Account{account}
+	p.rebuild([]config.Account{account}, true)
 
 	got := p.GetNext()
 	if got == nil {
@@ -172,7 +172,7 @@ func newTestPool(accounts ...config.Account) *AccountPool {
 		errorCounts: make(map[string]int),
 		modelLists:  make(map[string]map[string]bool),
 	}
-	p.accounts = accounts
+	p.rebuild(accounts, true)
 	return p
 }
 
@@ -238,16 +238,7 @@ func TestDisableAccountSetsCooldown(t *testing.T) {
 }
 
 func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
-	p := &AccountPool{
-		accounts: []config.Account{
-			{ID: "a", Enabled: true},
-			{ID: "b", Enabled: true},
-		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
-	}
+	p := NewTestPool(config.Account{ID: "a", Enabled: true}, config.Account{ID: "b", Enabled: true})
 
 	acc := p.GetNextExcluding(map[string]bool{"a": true})
 	if acc == nil || acc.ID != "b" {
@@ -256,16 +247,7 @@ func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
 }
 
 func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
-	p := &AccountPool{
-		accounts: []config.Account{
-			{ID: "a", Enabled: true},
-			{ID: "b", Enabled: true},
-		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
-	}
+	p := NewTestPool(config.Account{ID: "a", Enabled: true}, config.Account{ID: "b", Enabled: true})
 	p.SetModelList("a", []string{"claude-sonnet-4.5"})
 	p.SetModelList("b", []string{"claude-sonnet-4.5"})
 

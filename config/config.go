@@ -90,8 +90,11 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
-	// Priority weight for load balancing (higher = more requests)
-	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
+	// Weight balances traffic within a priority tier (higher = more requests)
+	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = larger share
+	// Priority selects the tier: the pool only routes to lower tiers once the
+	// higher tier has no routable account left (0 = default tier).
+	Priority int `json:"priority,omitempty"`
 
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
 	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
@@ -227,6 +230,21 @@ type Config struct {
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
+
+	// ThinkingNativeMode controls the native (Kiro adaptive) thinking directive.
+	// Native thinking is what makes the upstream emit genuine reasoning events
+	// AND the cryptographic signature Anthropic clients must replay, so it is on
+	// by default:
+	//   "auto"  (default) attach when the client asked for thinking on a model
+	//           whose upstream schema advertises it
+	//   "force" attach on every supported model, using the upstream default effort
+	//   "off"   never attach (falls back to prompt-injected <thinking> tags)
+	ThinkingNativeMode string `json:"thinkingNativeMode,omitempty"`
+
+	// ThinkingNativeDisplay is the adaptive thinking display mode:
+	// "summarized" (default) streams the reasoning summary, "omitted" hides it
+	// while still producing the signature.
+	ThinkingNativeDisplay string `json:"thinkingNativeDisplay,omitempty"`
 
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
@@ -531,6 +549,24 @@ func APIKeyFingerprint(apiKey string) string {
 	}
 	sum := sha256.Sum256([]byte(apiKey))
 	return fmt.Sprintf("%x", sum[:])
+}
+
+// IsRefreshableCredential reports whether an expiring access token can be
+// renewed on demand (mirrors the inputs auth.RefreshToken needs), so the pool
+// keeps such accounts routable instead of benching them until the background
+// sweep runs.
+func (a *Account) IsRefreshableCredential() bool {
+	if a == nil || IsAPIKeyAccount(a) || strings.TrimSpace(a.RefreshToken) == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(a.AuthMethod)) {
+	case "external_idp":
+		return a.ClientID != "" && a.TokenEndpoint != ""
+	case "social":
+		return true
+	default: // idc / builder id
+		return a.ClientID != "" && a.ClientSecret != ""
+	}
 }
 
 // IsAPIKeyAccount reports whether the account authenticates with a Kiro API key.
@@ -1139,9 +1175,11 @@ func GetPromptFilterRules() []PromptFilterRule {
 // ThinkingConfig holds settings for AI thinking/reasoning mode.
 // When enabled, models output their reasoning process alongside the response.
 type ThinkingConfig struct {
-	Suffix       string `json:"suffix"`       // Model name suffix that triggers thinking mode
-	OpenAIFormat string `json:"openaiFormat"` // Output format for OpenAI-compatible responses
-	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
+	Suffix        string `json:"suffix"`        // Model name suffix that triggers thinking mode
+	OpenAIFormat  string `json:"openaiFormat"`  // Output format for OpenAI-compatible responses
+	ClaudeFormat  string `json:"claudeFormat"`  // Output format for Claude-compatible responses
+	NativeMode    string `json:"nativeMode"`    // Native adaptive thinking directive: "off" | "auto" | "force"
+	NativeDisplay string `json:"nativeDisplay"` // Native thinking display: "summarized" | "omitted"
 }
 
 // GetThinkingConfig 获取 thinking 配置
@@ -1161,11 +1199,23 @@ func GetThinkingConfig() ThinkingConfig {
 	if claudeFormat == "" {
 		claudeFormat = "thinking"
 	}
+	nativeMode := strings.ToLower(strings.TrimSpace(cfg.ThinkingNativeMode))
+	switch nativeMode {
+	case "off", "auto", "force":
+	default:
+		nativeMode = "auto"
+	}
+	nativeDisplay := strings.ToLower(strings.TrimSpace(cfg.ThinkingNativeDisplay))
+	if nativeDisplay != "omitted" {
+		nativeDisplay = "summarized"
+	}
 
 	return ThinkingConfig{
-		Suffix:       suffix,
-		OpenAIFormat: openaiFormat,
-		ClaudeFormat: claudeFormat,
+		Suffix:        suffix,
+		OpenAIFormat:  openaiFormat,
+		ClaudeFormat:  claudeFormat,
+		NativeMode:    nativeMode,
+		NativeDisplay: nativeDisplay,
 	}
 }
 
@@ -1176,6 +1226,16 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	return Save()
+}
+
+// UpdateThinkingNativeConfig 更新原生 adaptive thinking 配置。
+// mode: "off" | "auto" | "force"；display: "summarized" | "omitted"。
+func UpdateThinkingNativeConfig(mode, display string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ThinkingNativeMode = strings.ToLower(strings.TrimSpace(mode))
+	cfg.ThinkingNativeDisplay = strings.ToLower(strings.TrimSpace(display))
 	return Save()
 }
 

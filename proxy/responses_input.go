@@ -46,6 +46,37 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 	messages := make([]OpenAIMessage, 0, len(items))
 	pendingUserParts := []interface{}{}
 
+	// pendingReasoning holds the encrypted_content of a `reasoning` input item
+	// until the assistant turn it belongs to is emitted. OpenAI orders a
+	// reasoning item immediately before the assistant message/function_call it
+	// produced, so the opaque blob is attached to the next assistant message and
+	// forwarded to Kiro for continuity. Dropping it loses the model's reasoning
+	// state — and for signed Claude reasoning, makes the turn unverifiable.
+	pendingReasoning := ""
+	takeReasoning := func() string {
+		r := pendingReasoning
+		pendingReasoning = ""
+		return r
+	}
+
+	// settleTrailingReasoning attaches a still-pending blob to the PRECEDING
+	// assistant turn once that turn is closed by a user/tool item or by the end
+	// of the input. Our own streaming responses emit the reasoning item last
+	// (the upstream only reveals the blob after the text, and a streamed item
+	// cannot be back-dated to index 0), so a client replaying `response.output`
+	// verbatim sends reasoning AFTER its assistant turn. Without this the blob
+	// would leak onto the next assistant turn — or be dropped entirely.
+	settleTrailingReasoning := func() {
+		if pendingReasoning == "" {
+			return
+		}
+		if n := len(messages); n > 0 && messages[n-1].Role == "assistant" &&
+			messages[n-1].RedactedReasoning == "" {
+			messages[n-1].RedactedReasoning = pendingReasoning
+		}
+		pendingReasoning = ""
+	}
+
 	flushPendingUser := func() {
 		if len(pendingUserParts) == 0 {
 			return
@@ -67,14 +98,28 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 		role, _ := obj["role"].(string)
 
 		switch {
+		case typ == "reasoning":
+			// Opaque or signed reasoning emitted on a prior turn and replayed
+			// back verbatim. Hold it until the assistant turn it precedes.
+			if enc, _ := obj["encrypted_content"].(string); enc != "" {
+				pendingReasoning = enc
+			}
+
 		case typ == "message" || (typ == "" && role != ""):
+			if role != "assistant" {
+				settleTrailingReasoning()
+			}
 			flushPendingUser()
 			msg := buildMessageFromInputItem(obj, role)
 			if msg != nil {
+				if msg.Role == "assistant" {
+					msg.RedactedReasoning = takeReasoning()
+				}
 				messages = append(messages, *msg)
 			}
 
 		case typ == "function_call_output" || typ == "tool_result":
+			settleTrailingReasoning()
 			flushPendingUser()
 			callID, _ := obj["call_id"].(string)
 			if callID == "" {
@@ -108,11 +153,15 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				len(messages[n-1].ToolCalls) > 0 &&
 				strings.TrimSpace(extractOpenAIMessageText(messages[n-1].Content)) == "" {
 				messages[n-1].ToolCalls = append(messages[n-1].ToolCalls, tc)
+				if messages[n-1].RedactedReasoning == "" {
+					messages[n-1].RedactedReasoning = takeReasoning()
+				}
 			} else {
 				messages = append(messages, OpenAIMessage{
-					Role:      "assistant",
-					Content:   "",
-					ToolCalls: []ToolCall{tc},
+					Role:              "assistant",
+					Content:           "",
+					ToolCalls:         []ToolCall{tc},
+					RedactedReasoning: takeReasoning(),
 				})
 			}
 
@@ -132,7 +181,11 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			flushPendingUser()
 			text, _ := obj["text"].(string)
 			if text != "" {
-				messages = append(messages, OpenAIMessage{Role: "assistant", Content: text})
+				messages = append(messages, OpenAIMessage{
+					Role:              "assistant",
+					Content:           text,
+					RedactedReasoning: takeReasoning(),
+				})
 			}
 
 		default:
@@ -146,6 +199,7 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 		}
 	}
 
+	settleTrailingReasoning()
 	flushPendingUser()
 	return messages, nil
 }
