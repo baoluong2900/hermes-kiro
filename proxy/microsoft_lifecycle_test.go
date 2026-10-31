@@ -593,6 +593,7 @@ func TestExternalIdpImportReturnsRotatedRefreshTokenWhenPersistFails(t *testing.
 
 	// Force Save to fail after refresh by replacing the config path with a directory.
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	drainStatSavesOnCleanup(t)
 	// config.Init was already called by newMicrosoftHandlerForTest on another path;
 	// reopen against a path we can sabotage after first successful seed isn't needed.
 	// Instead sabotage the active config file by making it unwritable via a directory

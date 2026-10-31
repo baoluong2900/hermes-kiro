@@ -29,7 +29,7 @@ func TestClaudeHistoryToolNamesMatchTheSpecsSent(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 
 	specs := map[string]bool{}
 	if ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext; ctx != nil {

@@ -33,7 +33,7 @@ type webSearchRoundOutcome struct {
 }
 
 // runWebSearchLoop is the mixed-tools entry point.
-func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string) {
 	// Working copy of messages we will mutate as we feed search results back.
 	working := *req
 	working.Messages = append([]ClaudeMessage(nil), req.Messages...)
@@ -50,7 +50,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 	// Allow one extra iteration so a terminal flush can run after the last
 	// search-only round (same pattern as 0..=MAX_WEB_SEARCH_ROUNDS in kiro-rs).
 	for roundIdx := 0; roundIdx <= maxUses; roundIdx++ {
-		round, account, err := h.callUpstreamForWebSearch(&working, thinking, fallbackInput)
+		round, account, err := h.callUpstreamForWebSearch(&working, fallbackInput)
 		if err != nil {
 			logger.Warnf("[WebSearchLoop] upstream round %d failed: %v", roundIdx, err)
 			accountID := ""
@@ -144,8 +144,8 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 }
 
 // callUpstreamForWebSearch converts the Claude request and buffers one Kiro stream.
-func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, estimatedInputTokens int) (*webSearchRoundOutcome, *config.Account, error) {
-	payload := ClaudeToKiro(req, thinking)
+func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, estimatedInputTokens int) (*webSearchRoundOutcome, *config.Account, error) {
+	payload := ClaudeToKiro(req)
 	excluded := make(map[string]bool)
 	var lastErr error
 

@@ -113,14 +113,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	// Prefer the upstream's native reasoning directive over the prompt-injected
-	// <thinking> block, so the model reasons for real instead of being asked to
-	// emit tags in its answer.
+	// Reasoning comes only from the native directive; no thinking prompt is
+	// injected into the system prompt.
 	reasoning := resolveReasoningDirectives(MapModel(actualModel), resolveOpenAIReasoningRequest(openaiReq, suffixThinking), thinkingCfg)
-	promptThinking := thinking && !reasoning.Native.Enabled
 	thinking = thinking || reasoning.ProducesReasoning()
 
-	kiroPayload := OpenAIToKiro(openaiReq, promptThinking)
+	kiroPayload := OpenAIToKiro(openaiReq)
 	applyReasoningDecision(kiroPayload, reasoning)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -199,12 +197,15 @@ func (h *Handler) handleResponsesNonStream(
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
+			if markInputTooLong(err, model, estimatedInputTokens) {
+				break
+			}
 			h.handleAccountModelFailure(account, model, err)
 			continue
 		}
 
 		items := out.Finish()
-		finalContent, _ := extractThinkingFromContent(out.AnswerText())
+		finalContent := out.AnswerText()
 		reasoningContent := out.ReasoningOutput()
 		toolUses := out.ToolUses()
 
@@ -243,7 +244,7 @@ func (h *Handler) handleResponsesNonStream(
 	}
 	h.recordFailureWithDuration(w, "responses", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
-	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
+	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), clientErrorType(lastErr, "server_error"), lastErr.Error())
 }
 
 // newResponsesObject assembles the terminal response object from an already
@@ -402,6 +403,9 @@ func (h *Handler) handleResponsesStream(
 				lastErr = err
 				excluded[account.ID] = true
 				lastAccountID = account.ID
+				if markInputTooLong(err, model, estimatedInputTokens) {
+					break
+				}
 				h.handleAccountModelFailure(account, model, err)
 				continue
 			}
@@ -414,7 +418,7 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		items := out.Finish()
-		finalContent, _ := extractThinkingFromContent(out.AnswerText())
+		finalContent := out.AnswerText()
 		reasoning := out.ReasoningOutput()
 		toolUses := out.ToolUses()
 

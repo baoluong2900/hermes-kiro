@@ -22,7 +22,7 @@ func TestOpenAIToKiroDoesNotDuplicateToolResultText(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 
 	if got := countToolOutput(payload, "UNIQUE_OUTPUT_MARKER_12345"); got != 1 {
 		t.Fatalf("expected tool result output to appear exactly once in history, got %d", got)

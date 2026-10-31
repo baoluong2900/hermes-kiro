@@ -106,7 +106,7 @@ func TestClaudeToKiroEchoesSignedThinking(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 
 	var asst *KiroAssistantResponseMessage
 	for _, h := range payload.ConversationState.History {
@@ -144,7 +144,7 @@ func TestClaudeToKiroDropsUnsignedThinking(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 	for _, h := range payload.ConversationState.History {
 		if h.AssistantResponseMessage != nil && h.AssistantResponseMessage.ReasoningContent != nil {
 			t.Fatalf("unsigned thinking was forwarded upstream: %+v", h.AssistantResponseMessage.ReasoningContent)
@@ -182,7 +182,7 @@ func TestClaudeToKiroEchoesRedactedThinking(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 	found := false
 	for _, h := range payload.ConversationState.History {
 		rc := (*KiroReasoningContent)(nil)
@@ -288,7 +288,7 @@ func TestOpenAIToKiroEchoesSignedReasoning(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 	found := false
 	for _, h := range payload.ConversationState.History {
 		if h.AssistantResponseMessage == nil || h.AssistantResponseMessage.ReasoningContent == nil {
@@ -314,7 +314,7 @@ func TestOpenAIToKiroDropsUnsignedReasoning(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 	for _, h := range payload.ConversationState.History {
 		if h.AssistantResponseMessage != nil && h.AssistantResponseMessage.ReasoningContent != nil {
 			t.Fatalf("unsigned reasoning_content was forwarded: %+v", h.AssistantResponseMessage.ReasoningContent)

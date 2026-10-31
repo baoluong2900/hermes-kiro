@@ -34,6 +34,7 @@ func installCleanAuthClient(t *testing.T) func() {
 // must provide a refreshToken that actually works.
 func TestApiImportCredentialsRejectsWhenRefreshFails(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -82,6 +83,7 @@ func TestApiImportCredentialsRejectsWhenRefreshFails(t *testing.T) {
 // not a hard-coded 300s.
 func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -140,6 +142,7 @@ func authOidcURL() func(string) string { return auth.GetOIDCTokenURLForTest() }
 
 func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -192,6 +195,7 @@ func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
 
 func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}

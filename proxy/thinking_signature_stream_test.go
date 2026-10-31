@@ -75,7 +75,7 @@ func runClaudeStream(t *testing.T, req *ClaudeRequest, thinking bool, opts claud
 		sticky:      newStickyRouter(),
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 	rec := httptest.NewRecorder()
 	httpReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte("{}")))
 

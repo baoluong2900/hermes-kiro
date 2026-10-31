@@ -125,32 +125,6 @@ type microsoftProfileDiscovery struct {
 	cancel context.CancelFunc
 }
 
-type thinkingStreamSource int
-
-const (
-	thinkingSourceUnknown thinkingStreamSource = iota
-	thinkingSourceReasoningEvent
-	thinkingSourceTagBlock
-)
-
-func allowReasoningSource(source *thinkingStreamSource) bool {
-	if *source == thinkingSourceTagBlock {
-		return false
-	}
-	*source = thinkingSourceReasoningEvent
-	return true
-}
-
-func allowTagSource(source *thinkingStreamSource) bool {
-	if *source == thinkingSourceReasoningEvent {
-		return false
-	}
-	if *source == thinkingSourceUnknown {
-		*source = thinkingSourceTagBlock
-	}
-	return *source == thinkingSourceTagBlock
-}
-
 func validateClaudeRequestShape(req *ClaudeRequest) string {
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
@@ -986,11 +960,10 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, _ := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
-	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
-	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
+	estimatedTokens := estimateClaudeRequestInputTokens(&req)
 	if estimatedTokens < 1 {
 		estimatedTokens = 1
 	}
@@ -1069,18 +1042,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
 
-	// Native adaptive thinking is what makes the upstream emit a signature, so
-	// resolve it before the payload is built: when it is on, the prompt-injected
-	// <thinking_mode> block is skipped (the directive replaces it) and reasoning
-	// rendering is switched on even if nothing else asked for it.
+	// Native reasoning is the only thinking path on /v1/messages (as in
+	// Kiro-Go): the structured directive is what makes the upstream emit
+	// reasoningContentEvent chunks plus the signature Anthropic clients must
+	// replay. The old prompt-injected <thinking_mode> path produced <thinking>
+	// prose with no signature, so every such turn reached the client as an
+	// unsigned thinking block and broke the next turn.
 	reasoningIntent := resolveClaudeReasoningRequest(&req, suffixThinking)
 	reasoning := resolveReasoningDirectives(MapModel(req.Model), reasoningIntent, thinkingCfg)
-	promptThinking := thinking && !reasoning.Native.Enabled
-	// clientThinking is what the client itself asked for, before native
-	// thinking widened it. The web_search agentic loop discards reasoning
-	// output, so it keeps the narrower value and never pays for reasoning
-	// nobody reads.
-	clientThinking := thinking
 	thinking = thinking || reasoning.ProducesReasoning()
 	if blocks, signed := countClaudeThinkingSignals(&req); blocks > 0 {
 		logger.Debugf("[Thinking] %s native=%v effort=%q display=%q | incoming assistant thinking blocks=%d with-signature=%d",
@@ -1088,10 +1057,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	req.CacheReasoning = &reasoning
-	effectiveReq := cloneClaudeRequestForThinking(&req, promptThinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
-	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
-	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
+	cacheProfile := h.promptCache.BuildClaudeProfile(&req, estimatedInputTokens)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
@@ -1105,12 +1073,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// and returns client tool_use blocks as-is.
 	if hasWebSearchAmongTools(&req) {
 		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
-		h.runWebSearchLoop(w, &req, clientThinking, estimatedInputTokens, apiKeyID)
+		h.runWebSearchLoop(w, &req, estimatedInputTokens, apiKeyID)
 		return
 	}
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, promptThinking)
+	kiroPayload := ClaudeToKiro(&req)
 	applyReasoningDecision(kiroPayload, reasoning)
 
 	// Stream or non-stream
@@ -1553,9 +1521,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 
-	// 获取 thinking 输出格式配置
-	thinkingFormat := thinkingOpts.Format
-
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
@@ -1619,6 +1584,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		// before that block's content_block_stop, which is where Anthropic's
 		// wire contract puts it.
 		var pendingSignature string
+		// blockThinking accumulates the text of the thinking block open right
+		// now; unsignedThinking keeps the text of the last thinking block that
+		// was closed without a signature, so a signature that arrives after it
+		// can still be paired with the text it signs.
+		var blockThinking strings.Builder
+		var unsignedThinking string
 		// redactedReasoning holds every opaque reasoning blob the upstream sent,
 		// in order. Each is emitted as its own redacted_thinking block: the block
 		// is the unit clients echo back verbatim, so blobs must not collapse.
@@ -1644,7 +1615,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 					"delta": map[string]string{"type": "signature_delta", "signature": pendingSignature},
 				})
 				pendingSignature = ""
+				unsignedThinking = ""
+			} else if activeBlockType == "thinking" {
+				unsignedThinking = blockThinking.String()
 			}
+			blockThinking.Reset()
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": activeBlockIndex,
@@ -1689,9 +1664,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		}
 
 		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
-		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 
@@ -1716,69 +1688,50 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 				return
 			}
 
-			switch thinkingFormat {
-			case "think":
-				var outputText string
-				switch thinkingState {
-				case 1:
-					outputText = "<think>" + text
-				case 2:
-					outputText = text
-				case 3:
-					outputText = text + "</think>"
-				}
-				if outputText == "" {
-					return
-				}
-				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": activeBlockIndex,
-					"delta": map[string]string{"type": "text_delta", "text": outputText},
-				})
-			case "reasoning_content":
-				if text == "" {
-					return
-				}
-				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": activeBlockIndex,
-					"delta": map[string]string{"type": "text_delta", "text": text},
-				})
-			default:
-				if thinkingOpts.OmitDisplay {
-					if thinkingState == 1 {
-						startContentBlock("thinking")
-						return
-					}
-					if thinkingState == 3 {
-						if activeBlockType != "thinking" {
-							startContentBlock("thinking")
-						}
-						closeActiveBlock()
-					}
-					return
-				}
-				if thinkingState == 3 && text == "" {
-					if activeBlockType == "thinking" {
-						closeActiveBlock()
-					}
-					return
-				}
-				if text != "" {
+			// Native reasoning always maps onto Anthropic's `thinking` content
+			// block: it is the only shape that can carry the signature the
+			// client must replay. display=omitted keeps the block but no text.
+			if thinkingOpts.OmitDisplay {
+				if thinkingState == 1 {
 					startContentBlock("thinking")
-					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": activeBlockIndex,
-						"delta": map[string]string{"type": "thinking_delta", "thinking": text},
-					})
+					return
 				}
-				if thinkingState == 3 && activeBlockType == "thinking" {
+				if thinkingState == 3 {
+					if activeBlockType != "thinking" {
+						startContentBlock("thinking")
+					}
 					closeActiveBlock()
 				}
+				return
+			}
+			if thinkingState == 3 && text == "" {
+				if activeBlockType == "thinking" {
+					closeActiveBlock()
+				}
+				return
+			}
+			if text != "" {
+				startContentBlock("thinking")
+				blockThinking.WriteString(text)
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{"type": "thinking_delta", "thinking": text},
+				})
+			}
+			if thinkingState == 3 && activeBlockType == "thinking" {
+				closeActiveBlock()
 			}
 		}
+
+		// textStarted flips once visible answer text has been produced. Some
+		// upstreams emit a trailing reasoningContentEvent after the answer has
+		// started; opening a thinking block between two text blocks would split
+		// the answer. Late reasoning is held in lateThinking instead and emitted
+		// as one complete thinking block if the upstream signs it.
+		var textStarted bool
+		var lateThinking strings.Builder
+		var lateThinkingSeen bool
 
 		processClaudeText := func(text string, isThinking bool, forceFlush bool) {
 			if isThinking && !thinking {
@@ -1786,7 +1739,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			}
 
 			if isThinking {
-				if !allowReasoningSource(&thinkingSource) {
+				if textStarted {
+					lateThinking.WriteString(text)
+					lateThinkingSeen = true
 					return
 				}
 				if !thinkingStarted {
@@ -1805,85 +1760,57 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 				thinkingStarted = false
 			}
 
+			if text != "" {
+				textStarted = true
+			}
 			textBuffer += text
 
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendText(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendText(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendText(content, 1)
-								sendText("", 3)
-							} else {
-								sendText(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendText(textBuffer, 1)
-									sendText("", 3)
-								} else {
-									sendText(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendText(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendText(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
+			if forceFlush || len([]rune(textBuffer)) > 50 {
+				runes := []rune(textBuffer)
+				safeLen := len(runes)
+				if !forceFlush {
+					safeLen = max(0, len(runes)-15)
+				}
+				if safeLen > 0 {
+					sendText(string(runes[:safeLen]), 0)
+					textBuffer = string(runes[safeLen:])
 				}
 			}
+		}
+
+		// emitStandaloneThinking writes one complete thinking block carrying
+		// sig. It is used when a signature arrives with no thinking block open:
+		// reasoning that came after the answer started, or display=omitted
+		// (signature without text). Anthropic has no wire slot for a detached
+		// signature, and dropping it makes the client replay unsigned reasoning
+		// that the upstream rejects on the next turn.
+		emitStandaloneThinking := func(text, sig string) {
+			processClaudeText("", false, true)
+			ensureMessageStart()
+			closeActiveBlock()
+			idx := nextContentIndex
+			nextContentIndex++
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]string{"type": "thinking", "thinking": "", "signature": ""},
+			})
+			if text != "" && !thinkingOpts.OmitDisplay {
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]string{"type": "thinking_delta", "thinking": text},
+				})
+			}
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]string{"type": "signature_delta", "signature": sig},
+			})
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
 		}
 
 		callback := &KiroStreamCallback{
@@ -1968,13 +1895,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 				if sig == "" || normalizeStopHookJSON {
 					return
 				}
+				if !thinking {
+					logger.Warnf("[Thinking] upstream sent a signature but reasoning rendering is off; it cannot be forwarded")
+					return
+				}
 				// A signature belongs to the reasoning block that is open right
 				// now, and it terminates that block: Anthropic's stream contract
 				// is signature_delta followed by content_block_stop, one
-				// signature per thinking block. Flushing here (rather than
-				// waiting for answer text to close the block) keeps the pair
-				// together and lets further reasoning open a fresh block with
-				// its own signature.
+				// signature per thinking block. Flushing here keeps the pair
+				// together and lets further reasoning open a fresh block.
 				if activeBlockType == "thinking" {
 					pendingSignature = sig
 					closeActiveBlock() // emits the signature_delta, then stops the block
@@ -1982,43 +1911,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 					thinkingStarted = false
 					return
 				}
-				// No reasoning block is open. That happens when the upstream
-				// runs with display=omitted (signature, no reasoning text) or
-				// signs after the answer already started. Anthropic has no wire
-				// slot for a detached signature, so wrap it in a thinking block
-				// of its own rather than dropping it — dropping it would make
-				// the client replay unsigned reasoning on the next turn, which
-				// the upstream rejects outright.
-				if !thinking {
-					logger.Warnf("[Thinking] upstream sent a signature but reasoning rendering is off; it cannot be forwarded")
+				// Signed reasoning that arrived after the answer started: emit
+				// it whole, after the text written so far.
+				if lateThinkingSeen {
+					emitStandaloneThinking(lateThinking.String(), sig)
+					lateThinking.Reset()
+					lateThinkingSeen = false
 					return
 				}
-				// The <think>/reasoning_content formats fold reasoning into the
-				// answer text, so there is no thinking block for a signature to
-				// belong to; inventing one would contradict the chosen format.
-				if thinkingFormat == "think" || thinkingFormat == "reasoning_content" {
-					logger.Warnf("[Thinking] upstream signature dropped: claudeFormat=%q renders reasoning as text, which cannot carry a signature", thinkingFormat)
-					return
-				}
-				processClaudeText("", false, true)
-				ensureMessageStart()
-				closeActiveBlock()
-				idx := nextContentIndex
-				nextContentIndex++
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":          "content_block_start",
-					"index":         idx,
-					"content_block": map[string]string{"type": "thinking", "thinking": "", "signature": ""},
-				})
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]string{"type": "signature_delta", "signature": sig},
-				})
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": idx,
-				})
+				// The reasoning block was already closed by answer text before
+				// its signature arrived. A closed block cannot take a signature,
+				// so re-emit that reasoning with it: the signature only verifies
+				// against the text it signs, never against an empty block.
+				emitStandaloneThinking(unsignedThinking, sig)
+				unsignedThinking = ""
 			},
 			OnRedactedReasoning: func(data string) {
 				if data != "" && !normalizeStopHookJSON {
@@ -2032,6 +1938,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
+			if markInputTooLong(err, model, estimatedInputTokens) {
+				break
+			}
 			h.handleAccountModelFailure(account, model, err)
 			if !messageStarted {
 				// The next attempt gets a fresh accounting scope, so anything this
@@ -2101,11 +2010,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent := rawContentBuilder.String()
 		thinkingOutput := rawThinkingBuilder.String()
-		if thinking && thinkingOutput == "" && extractedReasoning != "" {
-			thinkingOutput = extractedReasoning
-		}
 		if !thinking {
 			thinkingOutput = ""
 		}
@@ -2163,7 +2069,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 	setRetryAfterHeader(w, lastErr)
-	h.sendClaudeError(w, upstreamErrorHTTPStatus(lastErr), "api_error", lastErr.Error())
+	h.sendClaudeError(w, upstreamErrorHTTPStatus(lastErr), clientErrorType(lastErr, "api_error"), lastErr.Error())
 }
 
 // closeClaudeStreamAfterError terminates an in-progress Claude SSE stream after
@@ -2566,16 +2472,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
+			if markInputTooLong(err, model, estimatedInputTokens) {
+				break
+			}
 			h.handleAccountModelFailure(account, model, err)
 			continue
 		}
 
-		thinkingFormat := thinkingOpts.Format
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		finalContent := content
 		rawThinkingContent := thinkingContent
-		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
-			rawThinkingContent = extractedReasoning
-		}
 		if !thinking {
 			rawThinkingContent = ""
 		}
@@ -2607,21 +2512,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			responseThinkingContent = ""
 		}
 
-		if thinking && responseThinkingContent != "" {
-			switch thinkingFormat {
-			case "think":
-				finalContent = "<think>" + responseThinkingContent + "</think>" + finalContent
-				responseThinkingContent = ""
-				// The reasoning is now prose inside the answer; there is no
-				// thinking block left for the signature to sign.
-				thinkingSignature = ""
-			case "reasoning_content":
-				finalContent = responseThinkingContent + finalContent
-				responseThinkingContent = ""
-				thinkingSignature = ""
-			default:
-			}
-		}
 		if !thinking {
 			thinkingSignature = ""
 		}
@@ -2660,7 +2550,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	setRetryAfterHeader(w, lastErr)
-	h.sendClaudeError(w, upstreamErrorHTTPStatus(lastErr), "api_error", lastErr.Error())
+	h.sendClaudeError(w, upstreamErrorHTTPStatus(lastErr), clientErrorType(lastErr, "api_error"), lastErr.Error())
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -2843,14 +2733,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	// Prefer the native reasoning directive when the model advertises one: it
-	// is what makes the upstream emit real reasoning (and a signature) instead
-	// of prompt-driven <thinking> text.
+	// Reasoning comes only from the native directive (adaptive thinking with
+	// an effort level, or the GPT reasoning effort). No thinking prompt is
+	// injected: prompt-driven <thinking> text carries no signature.
 	reasoning := resolveReasoningDirectives(MapModel(req.Model), resolveOpenAIReasoningRequest(&req, suffixThinking), thinkingCfg)
-	promptThinking := thinking && !reasoning.Native.Enabled
 	thinking = thinking || reasoning.ProducesReasoning()
 
-	kiroPayload := OpenAIToKiro(&req, promptThinking)
+	kiroPayload := OpenAIToKiro(&req)
 	applyReasoningDecision(kiroPayload, reasoning)
 	cacheProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens)
 
@@ -2913,9 +2802,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
-		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 		// thinkingSignature is the upstream signature for this turn's native
@@ -3031,9 +2917,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			}
 
 			if isThinking {
-				if !allowReasoningSource(&thinkingSource) {
-					return
-				}
 				if !thinkingStarted {
 					sendChunk(text, 1)
 					thinkingStarted = true
@@ -3050,83 +2933,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				thinkingStarted = false
 			}
 
+			// Answer text passes through verbatim. Reasoning only ever arrives
+			// as reasoningContentEvent, so <thinking> in the text is the
+			// model's own output and is not parsed out.
 			textBuffer += text
-
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendChunk(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendChunk(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendChunk(content, 1)
-								sendChunk("", 3)
-							} else {
-								sendChunk(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendChunk(textBuffer, 1)
-									sendChunk("", 3)
-								} else {
-									sendChunk(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendChunk(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendChunk(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
+			if forceFlush || len([]rune(textBuffer)) > 50 {
+				runes := []rune(textBuffer)
+				safeLen := len(runes)
+				if !forceFlush {
+					safeLen = max(0, len(runes)-15)
+				}
+				if safeLen > 0 {
+					sendChunk(string(runes[:safeLen]), 0)
+					textBuffer = string(runes[safeLen:])
 				}
 			}
 		}
@@ -3210,6 +3029,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
+			if markInputTooLong(err, model, estimatedInputTokens) {
+				break
+			}
 			h.handleAccountModelFailure(account, model, err)
 			if !responseStarted {
 				// Same reason as the Claude stream: book what upstream already
@@ -3282,11 +3104,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent := rawContentBuilder.String()
 		reasoningOutput := rawReasoningBuilder.String()
-		if thinking && reasoningOutput == "" && extractedReasoning != "" {
-			reasoningOutput = extractedReasoning
-		}
 		if !thinking {
 			reasoningOutput = ""
 		}
@@ -3335,7 +3154,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 	h.recordFailureWithDuration(w, "openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
-	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
+	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), clientErrorType(lastErr, "server_error"), lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
@@ -3409,14 +3228,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			lastAccountID = account.ID
+			if markInputTooLong(err, model, estimatedInputTokens) {
+				break
+			}
 			h.handleAccountModelFailure(account, model, err)
 			continue
 		}
 
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
-		if thinking && reasoningContent == "" && extractedReasoning != "" {
-			reasoningContent = extractedReasoning
-		} else if !thinking {
+		finalContent := content
+		if !thinking {
 			reasoningContent = ""
 		}
 
@@ -3458,7 +3278,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 	h.recordFailureWithDuration(w, "openai", model, lastAccountID, lastErr, time.Since(reqStart).Milliseconds())
 	setRetryAfterHeader(w, lastErr)
-	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), "server_error", lastErr.Error())
+	h.sendOpenAIError(w, upstreamErrorHTTPStatus(lastErr), clientErrorType(lastErr, "server_error"), lastErr.Error())
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
@@ -5816,7 +5636,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	// Build a minimal chat payload
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 
 	openaiReq := &OpenAIRequest{
 		Model:     actualModel,
@@ -5824,7 +5644,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		MaxTokens: 5,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq)
 
 	var content string
 	callback := &KiroStreamCallback{

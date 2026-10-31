@@ -22,6 +22,7 @@ func newAuthTestRequest(t *testing.T, header, value string) *http.Request {
 func mustInitConfig(t *testing.T) {
 	t.Helper()
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}

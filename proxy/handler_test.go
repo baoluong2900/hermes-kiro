@@ -12,22 +12,9 @@ import (
 	"time"
 )
 
-func TestThinkingSourceReasoningFirst(t *testing.T) {
-	var source thinkingStreamSource
-
-	if !allowReasoningSource(&source) {
-		t.Fatalf("expected reasoning source to be accepted first")
-	}
-	if source != thinkingSourceReasoningEvent {
-		t.Fatalf("expected source to be reasoning, got %v", source)
-	}
-	if allowTagSource(&source) {
-		t.Fatalf("expected tag source to be rejected after reasoning source selected")
-	}
-}
-
 func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -127,6 +114,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 func TestExternalClaudeRoutingMapsDefaultOpusToOpus5(t *testing.T) {
 	t.Setenv("KIRO_GO_EXTERNAL_API_ENABLED", "true")
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -341,6 +329,7 @@ func TestExternalClaudeRetryableFailureAndSuccessShareCircuitKey(t *testing.T) {
 func TestExternalClaudeStopHookNormalizationForcesCleanJSONStream(t *testing.T) {
 	t.Setenv("KIRO_GO_EXTERNAL_API_ENABLED", "true")
 	cfgFile := t.TempDir() + "/config.json"
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -423,39 +412,6 @@ func TestCopyExternalClaudeHeadersDoesNotForwardLocalAuth(t *testing.T) {
 	}
 	if got := dst.Get("X-Trace-Id"); got != "" {
 		t.Fatalf("local X-* header leaked to external upstream")
-	}
-}
-
-func TestThinkingSourceTagFirst(t *testing.T) {
-	var source thinkingStreamSource
-
-	if !allowTagSource(&source) {
-		t.Fatalf("expected tag source to be accepted first")
-	}
-	if source != thinkingSourceTagBlock {
-		t.Fatalf("expected source to be tag, got %v", source)
-	}
-	if allowReasoningSource(&source) {
-		t.Fatalf("expected reasoning source to be rejected after tag source selected")
-	}
-}
-
-func TestThinkingSourceSameSourceRemainsAllowed(t *testing.T) {
-	var source thinkingStreamSource
-
-	if !allowTagSource(&source) {
-		t.Fatalf("expected initial tag source selection to succeed")
-	}
-	if !allowTagSource(&source) {
-		t.Fatalf("expected repeated tag source selection to stay allowed")
-	}
-
-	source = thinkingSourceUnknown
-	if !allowReasoningSource(&source) {
-		t.Fatalf("expected initial reasoning source selection to succeed")
-	}
-	if !allowReasoningSource(&source) {
-		t.Fatalf("expected repeated reasoning source selection to stay allowed")
 	}
 }
 
@@ -560,81 +516,6 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 				t.Fatalf("expected thinking=%v, got %v", tc.wantThinking, gotThinking)
 			}
 		})
-	}
-}
-
-func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *testing.T) {
-	req := &ClaudeRequest{
-		Model:  "claude-sonnet-4.6",
-		System: "Follow the user instructions.",
-	}
-
-	cloned := cloneClaudeRequestForThinking(req, true)
-	blocks, ok := cloned.System.([]interface{})
-	if !ok {
-		t.Fatalf("expected cloned system prompt to be structured blocks, got %T", cloned.System)
-	}
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
-	}
-	gotPrompt := extractSystemPrompt(cloned.System)
-	expected := ThinkingModePrompt + "\n\nFollow the user instructions."
-	if gotPrompt != expected {
-		t.Fatalf("expected injected system prompt %q, got %q", expected, gotPrompt)
-	}
-	if original, ok := req.System.(string); !ok || original != "Follow the user instructions." {
-		t.Fatalf("expected original request system prompt to stay unchanged, got %#v", req.System)
-	}
-}
-
-func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing.T) {
-	req := &ClaudeRequest{
-		Model: "claude-sonnet-4.6",
-		System: []interface{}{
-			map[string]interface{}{
-				"type": "text",
-				"text": "cached system",
-				"cache_control": map[string]interface{}{
-					"type": "ephemeral",
-					"ttl":  "5m",
-				},
-			},
-		},
-	}
-
-	cloned := cloneClaudeRequestForThinking(req, true)
-	blocks, ok := cloned.System.([]interface{})
-	if !ok {
-		t.Fatalf("expected structured system blocks, got %T", cloned.System)
-	}
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
-	}
-	first, ok := blocks[0].(map[string]interface{})
-	if !ok || first["text"] != ThinkingModePrompt+"\n" {
-		t.Fatalf("expected first block to be thinking prompt, got %#v", blocks[0])
-	}
-	second, ok := blocks[1].(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected original system block to remain a map, got %T", blocks[1])
-	}
-	cacheControl, ok := second["cache_control"].(map[string]interface{})
-	if !ok || cacheControl["type"] != "ephemeral" {
-		t.Fatalf("expected original cache_control to be preserved, got %#v", second["cache_control"])
-	}
-}
-
-func TestThinkingPromptAffectsClaudeTokenEstimate(t *testing.T) {
-	req := &ClaudeRequest{
-		Model:    "claude-sonnet-4.6",
-		Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
-	}
-
-	baseTokens := estimateClaudeRequestInputTokens(req)
-	thinkingTokens := estimateClaudeRequestInputTokens(cloneClaudeRequestForThinking(req, true))
-
-	if thinkingTokens <= baseTokens {
-		t.Fatalf("expected thinking tokens (%d) to exceed base tokens (%d)", thinkingTokens, baseTokens)
 	}
 }
 

@@ -493,6 +493,7 @@ func TestExternalIdpJSONImportRefreshesAndRoundTripsCompleteFields(t *testing.T)
 func newMicrosoftHandlerForTest(t *testing.T) *Handler {
 	t.Helper()
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}

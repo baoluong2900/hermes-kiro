@@ -166,6 +166,7 @@ func TestRefreshAccountTokenDoesNotPublishWhenPersistenceFails(t *testing.T) {
 func newRotatingExternalIDPHandler(t *testing.T) (*Handler, config.Account, string) {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "config.json")
+	drainStatSavesOnCleanup(t)
 	if err := config.Init(configPath); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}

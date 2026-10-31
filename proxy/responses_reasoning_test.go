@@ -262,7 +262,7 @@ func TestResponsesReasoningItemRoundTripsToKiro(t *testing.T) {
 		t.Fatalf("reasoning item did not attach to its assistant turn: %+v", msgs)
 	}
 
-	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-sonnet-5", Messages: msgs}, false)
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-sonnet-5", Messages: msgs})
 	found := false
 	for _, hmsg := range payload.ConversationState.History {
 		if hmsg.AssistantResponseMessage == nil || hmsg.AssistantResponseMessage.ReasoningContent == nil {

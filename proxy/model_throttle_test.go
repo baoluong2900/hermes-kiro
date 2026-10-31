@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -64,9 +63,7 @@ func redirectKiroTrafficTo(t *testing.T, server *httptest.Server) {
 	modelThrottleBackoffs = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 	t.Cleanup(func() { modelThrottleBackoffs = originalBackoffs })
 
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("init config: %v", err)
-	}
+	initTestConfigFile(t)
 }
 
 func apiKeyTestAccount() *config.Account {

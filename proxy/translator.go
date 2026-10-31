@@ -5,13 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -110,83 +108,9 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
-// Thinking 模式提示
-const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
-
-// thinkingModePromptForEffort maps an OpenAI-style reasoning_effort level to the
-// declared max_thinking_length. Kiro's only upstream lever is this integer inside
-// the thinking prompt (there is no structured budget field on the OpenAI path), so
-// effort is expressed by scaling it. Empty/unknown/"high" keep the default 200000,
-// so the model-name "-thinking" suffix path and existing tests are unchanged.
-func thinkingModePromptForEffort(effort string) string {
-	budget := 200000
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "low":
-		budget = 16000
-	case "medium":
-		budget = 48000
-	case "high", "xhigh", "":
-		budget = 200000
-	}
-	if budget == 200000 {
-		return ThinkingModePrompt
-	}
-	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
-}
-
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
-
-// maxPayloadBytes is the request-body budget for a 200K-token model.
-// Kiro's upstream rejects oversized requests with HTTP 400
-// "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
-// payload exceeds its budget we drop the oldest history turns (keeping the
-// system priming, the most recent turns, the active tool turn, and the current
-// message) and insert a placeholder note so the model knows context was elided.
-// The limit is kept conservatively below the observed upstream threshold to
-// leave room for headers and minor serialization overhead.
-//
-// Larger context windows get a proportionally larger budget — see
-// payloadByteLimitForModel. Applying this 200K-sized budget to a 1M-token model
-// would silently discard roughly 80% of the context the model can accept.
-const maxPayloadBytes = 900 * 1024
-
-// baseContextWindowTokens is the context window that maxPayloadBytes was sized
-// for. The ratio between the two yields the bytes-per-token budget reused for
-// larger windows.
-const baseContextWindowTokens = 200_000
-
-// maxPayloadBytesCeiling caps the derived budget so a bogus upstream limit can
-// never let a single request grow without bound. A 1M-token window lands at
-// 4.5 MiB, comfortably below this ceiling.
-const maxPayloadBytesCeiling = 8 * 1024 * 1024
-
-// payloadByteLimitForModel returns the serialized-body budget for a model,
-// scaled from maxPayloadBytes by the model's context window. Models at or below
-// the 200K baseline keep the original budget; a 1M-token model gets 5x, so the
-// full window is usable instead of being truncated at the 200K-sized cap.
-func payloadByteLimitForModel(model string) int {
-	window := getContextWindowSize(model)
-	if window <= baseContextWindowTokens {
-		return maxPayloadBytes
-	}
-
-	scaled := int(float64(maxPayloadBytes) * (float64(window) / float64(baseContextWindowTokens)))
-	if scaled > maxPayloadBytesCeiling {
-		return maxPayloadBytesCeiling
-	}
-	return scaled
-}
-
-// truncationPlaceholder is inserted in history where older turns were dropped to
-// fit within maxPayloadBytes.
-const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
-
-// minRecentHistoryTurns is the number of most-recent history entries always kept
-// (in addition to system priming and the active tool turn) when truncating.
-const minRecentHistoryTurns = 4
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
@@ -352,14 +276,12 @@ type ClaudeUsage struct {
 
 // ==================== Claude -> Kiro 转换 ====================
 
-const maxToolDescLen = 10237
-
-func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+func ClaudeToKiro(req *ClaudeRequest) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -510,21 +432,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
-
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
-	systemPrompt := extractSystemPrompt(system)
-	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
-		return systemPrompt
-	}
-	if systemPrompt == "" {
-		return ThinkingModePrompt
-	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+func buildClaudeSystemPrompt(system interface{}) string {
+	return applyPromptFilters(extractSystemPrompt(system))
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -694,62 +606,6 @@ func collapseBlankLines(s string) string {
 		out = append(out, l)
 	}
 	return strings.Join(out, "\n")
-}
-
-func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeRequest {
-	if req == nil {
-		return nil
-	}
-
-	cloned := *req
-	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
-	}
-	return &cloned
-}
-
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
-	if hasClaudeSystemContent(system) {
-		thinkingText += "\n"
-	}
-	thinkingBlock := map[string]interface{}{
-		"type": "text",
-		"text": thinkingText,
-	}
-
-	switch v := system.(type) {
-	case nil:
-		return []interface{}{thinkingBlock}
-	case string:
-		if v == "" {
-			return []interface{}{thinkingBlock}
-		}
-		return []interface{}{
-			thinkingBlock,
-			map[string]interface{}{
-				"type": "text",
-				"text": v,
-			},
-		}
-	case []interface{}:
-		blocks := make([]interface{}, 0, len(v)+1)
-		blocks = append(blocks, thinkingBlock)
-		blocks = append(blocks, v...)
-		return blocks
-	case []string:
-		blocks := make([]interface{}, 0, len(v)+1)
-		blocks = append(blocks, thinkingBlock)
-		for _, block := range v {
-			blocks = append(blocks, map[string]interface{}{
-				"type": "text",
-				"text": block,
-			})
-		}
-		return blocks
-	default:
-		return []interface{}{thinkingBlock}
-	}
 }
 
 func hasClaudeSystemContent(system interface{}) bool {
@@ -1091,9 +947,6 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 			continue
 		}
 		desc := tool.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
-		}
 		sanitized := shortenToolName(sanitizeToolName(tool.Name))
 		if sanitized != tool.Name {
 			nameMap[sanitized] = tool.Name
@@ -1614,7 +1467,7 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
-func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+func OpenAIToKiro(req *OpenAIRequest) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -1630,13 +1483,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		} else {
 			nonSystemMessages = append(nonSystemMessages, msg)
 		}
-	}
-
-	// 如果启用 thinking 模式，注入 thinking 提示。
-	// reasoning_effort (OpenAI-style) scales the declared thinking budget;
-	// empty/high keep the default so the "-thinking" suffix path is unchanged.
-	if thinking {
-		systemPrompt = thinkingModePromptForEffort(req.ReasoningEffort) + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息
@@ -1835,8 +1681,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
-
 	return payload
 }
 
@@ -1940,199 +1784,6 @@ func normalizeToolUseID(id string) string {
 	}
 	sum := sha256.Sum256([]byte(id))
 	return "tooluse_" + hex.EncodeToString(sum[:16])
-}
-
-// truncatePayloadToLimit drops the oldest conversation history turns until the
-// serialized payload fits the budget for the payload's model
-// (payloadByteLimitForModel). It preserves, in order:
-//   - the system priming pair (if present) at the front of history,
-//   - the most recent turns (at least minRecentHistoryTurns, and always the
-//     active tool turn that pairs with the current message),
-//   - the current message itself.
-//
-// A single placeholder note (truncationPlaceholder) is inserted where older
-// turns were removed so the model is aware context was elided. hasPriming
-// indicates whether history begins with the 2-entry system priming pair.
-func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
-	if payload == nil {
-		return
-	}
-	limit := payloadByteLimitForModel(currentMessageModelID(payload))
-	if payloadByteSize(payload) <= limit {
-		return
-	}
-
-	history := payload.ConversationState.History
-	primingCount := 0
-	if hasPriming && len(history) >= 2 {
-		primingCount = 2
-	}
-
-	priming := history[:primingCount]
-	conversation := history[primingCount:]
-
-	// Compute the fixed overhead (everything except the trimmable conversation):
-	// priming, current message, inference config, profileArn, etc. We estimate by
-	// measuring the payload with an empty conversation tail, then add a budget for
-	// the placeholder and retained tail turns.
-	placeholderEntry := KiroHistoryMessage{
-		UserInputMessage: &KiroUserInputMessage{
-			Content: truncationPlaceholder,
-			ModelID: currentMessageModelID(payload),
-			Origin:  "AI_EDITOR",
-		},
-	}
-
-	// Precompute byte size of each conversation entry once (O(n)).
-	entrySizes := make([]int, len(conversation))
-	for i := range conversation {
-		entrySizes[i] = historyEntryByteSize(conversation[i])
-	}
-
-	// Base size: payload with priming only (no conversation), plus placeholder.
-	payload.ConversationState.History = priming
-	baseSize := payloadByteSize(payload) + historyEntryByteSize(placeholderEntry)
-
-	// Keep the largest suffix of the conversation that fits, but never fewer than
-	// minRecentHistoryTurns entries (so recent context is preserved).
-	keepFrom := len(conversation)
-	running := baseSize
-	for i := len(conversation) - 1; i >= 0; i-- {
-		running += entrySizes[i]
-		kept := len(conversation) - i
-		if running > limit && kept > minRecentHistoryTurns {
-			break
-		}
-		keepFrom = i
-	}
-
-	tail := conversation[keepFrom:]
-	tail = dropLeadingAssistant(tail)
-
-	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
-	rebuilt = append(rebuilt, priming...)
-	if keepFrom > 0 { // older turns were dropped → note the elision
-		rebuilt = append(rebuilt, placeholderEntry)
-	}
-	rebuilt = append(rebuilt, tail...)
-	payload.ConversationState.History = rebuilt
-
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > limit {
-		truncateCurrentMessage(payload, limit)
-	}
-}
-
-// historyEntryByteSize returns the serialized size of a single history entry,
-// including the surrounding JSON array delimiter overhead (1 byte for the comma).
-func historyEntryByteSize(entry KiroHistoryMessage) int {
-	raw, err := json.Marshal(entry)
-	if err != nil {
-		return 0
-	}
-	return len(raw) + 1
-}
-
-// dropLeadingAssistant removes a leading assistant message from a history tail so
-// it does not directly follow the placeholder user turn with a broken pairing.
-func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {
-	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
-		tail = tail[1:]
-	}
-	return tail
-}
-
-// payloadByteSize returns the serialized size of the payload in bytes.
-func payloadByteSize(payload *KiroPayload) int {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return 0
-	}
-	return len(raw)
-}
-
-func currentMessageModelID(payload *KiroPayload) string {
-	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
-}
-
-// truncateCurrentMessage hard-truncates the current message content as a last
-// resort when even the minimal retained history plus current message exceeds the
-// given byte limit.
-func truncateCurrentMessage(payload *KiroPayload, limit int) {
-	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	// payloadByteSize measures the JSON-encoded payload, in which cur.Content is
-	// ESCAPED, but len(cur.Content) is its RAW length. Subtracting the raw length
-	// from an escaped size over-estimates the remaining budget by exactly the
-	// escaping overhead — a message full of quotes, backslashes or newlines can
-	// be off by 30-40%, so the "truncated" payload still exceeded the limit it
-	// was supposed to honour. Measure the encoded length instead.
-	encodedLen := len(mustMarshalJSONString(cur.Content))
-	overhead := payloadByteSize(payload) - encodedLen
-	budget := limit - overhead
-	if budget < 0 {
-		budget = 0
-	}
-	if encodedLen > budget {
-		if budget == 0 {
-			cur.Content = minimalFallbackUserContent
-			return
-		}
-		cur.Content = truncateJSONStringToEncodedLength(cur.Content, budget)
-	}
-}
-
-// mustMarshalJSONString returns the JSON encoding of s, quotes included, or "" if
-// s cannot be encoded (it cannot: encoding/json always succeeds for a string).
-func mustMarshalJSONString(s string) string {
-	raw, err := json.Marshal(s)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
-}
-
-// truncateJSONStringToEncodedLength shortens s so its JSON encoding fits within
-// budget bytes, including the two quote characters.
-//
-// The previous implementation sliced the raw string at a byte offset
-// (`cur.Content[:budget]`). A Go string is UTF-8, and an arbitrary byte offset
-// lands in the middle of a multi-byte rune about three times in four for
-// Vietnamese, Chinese or emoji text. json.Valid reports the result as invalid
-// and encoding/json then silently rewrites the dangling byte to U+FFFD, so the
-// prompt the model actually received ended in a corrupted character — confirmed
-// at five separate offsets on a Vietnamese prompt. Trimming to a rune boundary
-// keeps the content intact.
-func truncateJSONStringToEncodedLength(s string, budget int) string {
-	// Reserve the surrounding quotes.
-	if budget <= 2 {
-		return ""
-	}
-	room := budget - 2
-	if room >= len(mustMarshalJSONString(s))-2 {
-		return s
-	}
-
-	// Walk back from the byte budget to the nearest rune boundary, then re-check
-	// the encoded length because escaping can inflate it well beyond len(s).
-	for end := room; end > 0; {
-		cut := s[:end]
-		if len(mustMarshalJSONString(cut))-2 <= room {
-			return cut
-		}
-		// Step back by whole runes; halving converges quickly on heavily escaped
-		// content while staying correct for plain ASCII.
-		next := end / 2
-		if next >= end {
-			next = end - 1
-		}
-		// Snap to a rune boundary so we never split a multi-byte character.
-		for next > 0 && !utf8.RuneStart(s[next]) {
-			next--
-		}
-		end = next
-	}
-	return ""
 }
 
 func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
@@ -2355,9 +2006,6 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 			continue
 		}
 		desc := tool.Function.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
-		}
 		name := shortenToolName(tool.Function.Name)
 		if strings.TrimSpace(name) == "" {
 			// Kiro rejects tools with empty names; skip unusable specs.
@@ -2414,33 +2062,6 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 			TotalTokens:      inputTokens + outputTokens,
 		},
 	}
-}
-
-// extractThinkingFromContent 从内容中提取 <thinking> 标签内的内容
-func extractThinkingFromContent(content string) (string, string) {
-	var reasoning string
-	result := content
-
-	for {
-		start := strings.Index(result, "<thinking>")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(result[start:], "</thinking>")
-		if end == -1 {
-			break
-		}
-		end += start
-
-		// 提取 thinking 内容
-		thinkingContent := result[start+10 : end]
-		reasoning += thinkingContent
-
-		// 从结果中移除 thinking 标签
-		result = result[:start] + result[end+11:]
-	}
-
-	return strings.TrimSpace(result), reasoning
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应

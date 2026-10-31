@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -144,7 +143,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
-	current := handleToolUseEvent(map[string]interface{}{
+	current, _ := handleToolUseEvent(map[string]interface{}{
 		"name":  "mcpIdaProMcpStatus",
 		"input": `{"server":"ida-pro-mcp"}`,
 		"stop":  true,
@@ -176,11 +175,11 @@ func TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives(t *testing.T) {
 		},
 	}
 
-	current := handleToolUseEvent(map[string]interface{}{
+	current, _ := handleToolUseEvent(map[string]interface{}{
 		"name":  "mcpIdaProMcpStatus",
 		"input": `{"server":`,
 	}, nil, callback)
-	current = handleToolUseEvent(map[string]interface{}{
+	current, _ = handleToolUseEvent(map[string]interface{}{
 		"toolUseId": "toolu_real",
 		"name":      "mcpIdaProMcpStatus",
 		"input":     `"ida-pro-mcp"}`,
@@ -322,9 +321,7 @@ func TestCallKiroAPI429CarriesRetryAfter(t *testing.T) {
 		base:   server.Client().Transport,
 	}})
 	t.Cleanup(func() { kiroHttpStore.Store(originalClient) })
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("init config: %v", err)
-	}
+	initTestConfigFile(t)
 
 	account := &config.Account{AuthMethod: "api_key", KiroApiKey: "ksk_test", Region: "us-east-1"}
 	callErr := CallKiroAPI(account, &KiroPayload{}, nil)
@@ -339,9 +336,7 @@ func TestCallKiroAPI429CarriesRetryAfter(t *testing.T) {
 }
 
 func TestCallKiroAPIPreservesLongestRetryAfterAcrossEndpoints(t *testing.T) {
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
+	initTestConfigFile(t)
 	serverLong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "3600")
 		w.WriteHeader(http.StatusTooManyRequests)

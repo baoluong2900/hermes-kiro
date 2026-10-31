@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -96,7 +95,7 @@ func TestParseFrameHeadersStillFindsEventType(t *testing.T) {
 func TestParseEventStreamSurfacesExceptionFrame(t *testing.T) {
 	var stream bytes.Buffer
 	stream.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"}))
-	stream.Write(awsExceptionFrame(t, "ValidationException", "Input is too long for requested model"))
+	stream.Write(awsExceptionFrame(t, "ValidationException", "Improperly formed request: tool use format is invalid"))
 
 	var got string
 	err := parseEventStream(bytes.NewReader(stream.Bytes()), &KiroStreamCallback{
@@ -112,7 +111,7 @@ func TestParseEventStreamSurfacesExceptionFrame(t *testing.T) {
 	if ue.ExceptionType != "ValidationException" {
 		t.Fatalf("exception type lost: %q", ue.ExceptionType)
 	}
-	if !strings.Contains(ue.Message, "too long") {
+	if !strings.Contains(ue.Message, "tool use format") {
 		t.Fatalf("upstream message lost: %q", ue.Message)
 	}
 	if got != "partial" {
@@ -309,9 +308,7 @@ func TestCallKiroAPILogsEmptyUpstreamResponseHeaders(t *testing.T) {
 		base:   server.Client().Transport,
 	}})
 	t.Cleanup(func() { kiroHttpStore.Store(originalClient) })
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("init config: %v", err)
-	}
+	initTestConfigFile(t)
 
 	account := &config.Account{AuthMethod: "api_key", KiroApiKey: "test-key", Region: "us-east-1"}
 	callErr := CallKiroAPI(account, &KiroPayload{}, nil)
@@ -409,9 +406,7 @@ func TestCallKiroAPITypesModeledHTTPException(t *testing.T) {
 		base:   server.Client().Transport,
 	}})
 	t.Cleanup(func() { kiroHttpStore.Store(originalClient) })
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("init config: %v", err)
-	}
+	initTestConfigFile(t)
 
 	account := &config.Account{AuthMethod: "api_key", KiroApiKey: "ksk_test", Region: "us-east-1"}
 	callErr := CallKiroAPI(account, &KiroPayload{}, nil)
@@ -453,9 +448,7 @@ func TestCallKiroAPILeavesUnmodeledHTTPErrorUntyped(t *testing.T) {
 		base:   server.Client().Transport,
 	}})
 	t.Cleanup(func() { kiroHttpStore.Store(originalClient) })
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("init config: %v", err)
-	}
+	initTestConfigFile(t)
 
 	account := &config.Account{AuthMethod: "api_key", KiroApiKey: "ksk_test", Region: "us-east-1"}
 	callErr := CallKiroAPI(account, &KiroPayload{}, nil)

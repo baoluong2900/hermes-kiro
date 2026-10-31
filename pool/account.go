@@ -53,6 +53,17 @@ var (
 	poolOnce sync.Once
 )
 
+// statSaveWG tracks the fire-and-forget goroutines that persist account stats
+// to the config file. UpdateStats writes are async to keep them off the request
+// hot path, but they outlive the request that triggered them. WaitForStatSaves
+// lets tests drain them before swapping the global config path or removing a
+// temp dir, so a late config.json rewrite cannot race t.TempDir() cleanup.
+var statSaveWG sync.WaitGroup
+
+// WaitForStatSaves blocks until all in-flight async stat saves have finished
+// writing the config file. Intended for tests.
+func WaitForStatSaves() { statSaveWG.Wait() }
+
 // GetPool 获取全局账号池单例
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
@@ -703,7 +714,11 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 		}
 	}
 	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		statSaveWG.Add(1)
+		go func() {
+			defer statSaveWG.Done()
+			config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		}()
 	}
 }
 

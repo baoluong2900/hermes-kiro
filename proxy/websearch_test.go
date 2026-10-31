@@ -499,7 +499,7 @@ func TestAppendSearchRound_ContentSurvivesClaudeToKiro(t *testing.T) {
 	}
 
 	// Full ClaudeToKiro must keep the active tool turn (history tool_use ↔ current toolResults).
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 	if payload == nil {
 		t.Fatal("nil payload")
 	}

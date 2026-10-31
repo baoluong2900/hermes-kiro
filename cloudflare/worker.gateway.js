@@ -7116,11 +7116,6 @@ function flattenClaudeContent(content) {
   return "";
 }
 
-// Kiro rejects tool descriptions longer than this. Mirrors Go maxToolDescLen
-// (proxy/translator.go). Over-long descriptions are truncated then suffixed
-// with "..." so the model still sees intent without tripping the 400.
-const MAX_TOOL_DESC_LEN = 10237;
-
 // Deep-clones a JSON-schema value so the caller's object is never mutated.
 // Mirrors Go cloneSchemaValue (proxy/translator.go).
 function cloneSchemaValue(v) {
@@ -7303,8 +7298,7 @@ function convertTools(tools) {
     const name = shortenToolName(String(fn.name || ""));
     // Kiro rejects tools with empty names; skip unusable specs (Go convertOpenAITools).
     if (name.trim() === "") continue;
-    let desc = fn.description || "";
-    if (desc.length > MAX_TOOL_DESC_LEN) desc = desc.slice(0, MAX_TOOL_DESC_LEN) + "...";
+    const desc = fn.description || "";
     result.push({
       toolSpecification: {
         name,
@@ -7326,8 +7320,7 @@ function convertClaudeTools(tools) {
     const original = String(t.name || "");
     // Skip blank names — Kiro rejects them, and there is nothing to sanitize.
     if (original.trim() === "") continue;
-    let desc = t.description || "";
-    if (desc.length > MAX_TOOL_DESC_LEN) desc = desc.slice(0, MAX_TOOL_DESC_LEN) + "...";
+    const desc = t.description || "";
     const sanitized = shortenToolName(sanitizeToolName(original));
     result.push({
       toolSpecification: {
@@ -8570,6 +8563,15 @@ async function dispatchEvent(eventType, payload, hooks) {
       }
       if (rSig && hooks.onReasoningSignature) {
         await hooks.onReasoningSignature(rSig);
+      }
+      break;
+    }
+    case "reasoningContentSignatureEvent":
+    case "signatureEvent":
+    case "thinkingSignatureEvent": {
+      const sig = typeof payload.signature === "string" ? payload.signature : "";
+      if (sig && hooks.onReasoningSignature) {
+        await hooks.onReasoningSignature(sig);
       }
       break;
     }

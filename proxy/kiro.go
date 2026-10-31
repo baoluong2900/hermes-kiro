@@ -708,7 +708,11 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 				longestRetryAfter = cooldown
 				longestRetryAfterValue = retryAfter
 			}
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
+			if isInputTooLongBody(string(errBody)) {
+				return &InputTooLongError{Endpoint: ep.Name, Body: strings.TrimSpace(string(errBody))}
+			}
 			if len(endpoints) > 1 {
 				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next endpoint...", ep.Name)
 			}
@@ -719,6 +723,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			// The input exceeds the model's context window. Every endpoint and
+			// every account rejects the same bytes, so stop here; the handler
+			// reports it as a 400 the client can compact and retry on.
+			if isInputTooLongBody(string(errBody)) {
+				return &InputTooLongError{Endpoint: ep.Name, Body: strings.TrimSpace(string(errBody))}
+			}
 			text := fmt.Sprintf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 			// A modeled exception in the body carries its own meaning. Typing it here
 			// means "your request was invalid" reaches the client as 400 instead of
@@ -1048,6 +1058,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				}
 			}
 			logger.Warnf("[KiroAPI] upstream exception frame: %s: %s (headers: %v, payload: %s)", name, msg, frameHeaders, string(payloadBytes))
+			if isInputTooLongBody(msg) || isInputTooLongBody(string(payloadBytes)) {
+				return &InputTooLongError{Endpoint: "stream", Body: msg}
+			}
 			return &KiroUpstreamError{ExceptionType: name, Message: msg}
 		}
 
@@ -1115,7 +1128,11 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 		case "toolUseEvent":
 			producedOutput = true
-			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
+			var toolErr error
+			currentToolUse, toolErr = handleToolUseEvent(event, currentToolUse, callback)
+			if toolErr != nil {
+				return toolErr
+			}
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
@@ -1140,7 +1157,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	}
 
 	if currentToolUse != nil {
-		finishToolUse(currentToolUse, callback)
+		if err := finishToolUse(currentToolUse, callback); err != nil {
+			return err
+		}
 	}
 
 	flushUsage()
@@ -1338,7 +1357,7 @@ type toolUseState struct {
 	GeneratedID bool
 }
 
-func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) *toolUseState {
+func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) (*toolUseState, error) {
 	toolUseID := firstStringField(event, "toolUseId", "toolUseID", "tool_use_id", "id")
 	name := firstStringField(event, "name", "toolName", "tool_name")
 	isStop := firstBoolField(event, "stop", "isStop", "done")
@@ -1351,14 +1370,18 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 				current.ToolUseID = toolUseID
 				current.GeneratedID = false
 			} else {
-				finishToolUse(current, callback)
+				if err := finishToolUse(current, callback); err != nil {
+					return nil, err
+				}
 				current = &toolUseState{ToolUseID: toolUseID, Name: name}
 			}
 		}
 	} else if name != "" && current == nil {
 		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
 	} else if name != "" && current != nil && current.Name != name {
-		finishToolUse(current, callback)
+		if err := finishToolUse(current, callback); err != nil {
+			return nil, err
+		}
 		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
 	}
 
@@ -1373,23 +1396,45 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 	}
 
 	if isStop && current != nil {
-		finishToolUse(current, callback)
-		return nil
+		if err := finishToolUse(current, callback); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 
-	return current
+	return current, nil
 }
 
-func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
+// MalformedToolUseError reports a tool call whose streamed arguments did not
+// form valid JSON. It is a property of that one generation, not of the account
+// that served it, so failover must not count it against the account.
+type MalformedToolUseError struct {
+	Name      string
+	ToolUseID string
+	Err       error
+}
+
+func (e *MalformedToolUseError) Error() string {
+	return fmt.Sprintf("upstream returned invalid JSON arguments for tool %s (%s): %v", e.Name, e.ToolUseID, e.Err)
+}
+
+func (e *MalformedToolUseError) Unwrap() error { return e.Err }
+
+func finishToolUse(state *toolUseState, callback *KiroStreamCallback) error {
 	if state == nil || state.Name == "" || callback == nil || callback.OnToolUse == nil {
-		return
+		return nil
 	}
 	if state.ToolUseID == "" {
 		state.ToolUseID = "toolu_" + uuid.New().String()
 	}
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {
-		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
+		// A tool call whose accumulated arguments are not valid JSON must not be
+		// emitted as an empty-input tool_use: the client would run the tool with
+		// no arguments. Fail the turn instead (same as Kiro-Go).
+		if err := json.Unmarshal([]byte(state.InputBuffer.String()), &input); err != nil {
+			return &MalformedToolUseError{Name: state.Name, ToolUseID: state.ToolUseID, Err: err}
+		}
 	}
 	if input == nil {
 		input = make(map[string]interface{})
@@ -1399,6 +1444,7 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 		Name:      state.Name,
 		Input:     input,
 	})
+	return nil
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {

@@ -43,7 +43,7 @@ func TestClaudeToKiroKeepsCompleteHistoryToolCycles(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 
 	calls, results, stamped := 0, 0, 0
 	for _, h := range payload.ConversationState.History {
@@ -126,7 +126,7 @@ func TestClaudeToKiroFlattensBrokenToolPairs(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 
 	for i, h := range payload.ConversationState.History {
 		if u := h.UserInputMessage; u != nil && u.UserInputMessageContext != nil {

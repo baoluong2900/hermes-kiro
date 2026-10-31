@@ -51,7 +51,7 @@ func TestOpenAIToKiroPreservesStructuredAssistantAndToolContent(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 
 	// History starts with a priming pair.
 	if len(payload.ConversationState.History) != 4 {
@@ -121,7 +121,7 @@ func TestOpenAIToKiroAssistantMapContentInHistory(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 
 	if len(payload.ConversationState.History) != 2 {
 		t.Fatalf("expected 2 history entries, got %d", len(payload.ConversationState.History))
@@ -156,7 +156,7 @@ func TestOpenAIToKiroAssistantToolCallsDoNotInjectPlaceholder(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 
 	// The mid-history assistant turn carried ONLY a tool call (no text) and is
 	// not the active tool turn, so its structured toolUses are cleared. That
@@ -191,8 +191,8 @@ func TestOpenAIConversationIDStableFromAnchor(t *testing.T) {
 	reqA := &OpenAIRequest{Model: "claude-sonnet-4.5", Messages: baseMessages}
 	reqB := &OpenAIRequest{Model: "claude-sonnet-4.5", Messages: append(baseMessages, OpenAIMessage{Role: "assistant", Content: "Next step"})}
 
-	payloadA := OpenAIToKiro(reqA, false)
-	payloadB := OpenAIToKiro(reqB, false)
+	payloadA := OpenAIToKiro(reqA)
+	payloadB := OpenAIToKiro(reqB)
 
 	if payloadA.ConversationState.ConversationID == "" || payloadB.ConversationState.ConversationID == "" {
 		t.Fatalf("expected non-empty conversation IDs")
@@ -220,8 +220,8 @@ func TestClaudeConversationIDStableFromAnchor(t *testing.T) {
 		},
 	}
 
-	payloadA := ClaudeToKiro(reqA, false)
-	payloadB := ClaudeToKiro(reqB, false)
+	payloadA := ClaudeToKiro(reqA)
+	payloadB := ClaudeToKiro(reqB)
 
 	if payloadA.ConversationState.ConversationID == "" || payloadB.ConversationState.ConversationID == "" {
 		t.Fatalf("expected non-empty conversation IDs")
@@ -239,8 +239,8 @@ func TestOpenAIConversationIDRandomForSyntheticAnchor(t *testing.T) {
 		},
 	}
 
-	payloadA := OpenAIToKiro(req, false)
-	payloadB := OpenAIToKiro(req, false)
+	payloadA := OpenAIToKiro(req)
+	payloadB := OpenAIToKiro(req)
 
 	if payloadA.ConversationState.ConversationID == payloadB.ConversationState.ConversationID {
 		t.Fatalf("expected synthetic anchor to generate non-deterministic conversation IDs")
@@ -256,7 +256,7 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 
 	if len(payload.ConversationState.History) != 0 {
 		t.Fatalf("expected leading assistant-only history to be dropped, got %d entries", len(payload.ConversationState.History))
@@ -301,7 +301,7 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
 
 	if !strings.Contains(content, toolResultsContinuationPrefix) {
@@ -536,7 +536,7 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected tool_result image attached to current message, got %d images", len(cur.Images))
@@ -587,7 +587,7 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
@@ -620,7 +620,7 @@ func TestOpenAIToolResultImageAttachedToCurrentMessage(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected tool image attached to current message, got %d", len(cur.Images))
@@ -660,7 +660,7 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req)
 
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {

@@ -113,6 +113,9 @@ func upstreamErrorHTTPStatus(err error) int {
 	if err == nil {
 		return http.StatusServiceUnavailable
 	}
+	if IsInputTooLong(err) {
+		return http.StatusBadRequest
+	}
 	// A modeled exception frame already knows its own status. Checked before the
 	// string heuristics below so throttling does not fall through to a blanket
 	// 502, which clients treat as transient and retry immediately.
@@ -221,6 +224,13 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 
 func (h *Handler) handleAccountModelFailure(account *config.Account, model string, err error) {
 	if account == nil || err == nil {
+		return
+	}
+
+	// Malformed tool arguments and an oversized input are about the request or
+	// this one generation, not the account's health.
+	var malformed *MalformedToolUseError
+	if errors.As(err, &malformed) || IsInputTooLong(err) {
 		return
 	}
 

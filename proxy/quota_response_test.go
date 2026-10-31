@@ -6,7 +6,6 @@ import (
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -18,9 +17,7 @@ func (f quotaRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 func TestClaudeQuotaFailureReturns429AndRetryAfter(t *testing.T) {
-	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
+	initTestConfigFile(t)
 
 	account := config.Account{
 		ID: "quota", Enabled: true, AuthMethod: "api_key",

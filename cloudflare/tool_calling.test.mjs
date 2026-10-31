@@ -13,7 +13,8 @@
 //      forces type:object and deep-clones. Worker only deletes top-level $schema.
 //   2. Empty tool description: Go normalizeToolDesc() returns "Tool: <name>";
 //      worker sends "".
-//   3. Description length: Go truncates at 10237 + "..."; worker does not.
+//   3. Description length: descriptions travel verbatim (the live upstream
+//      accepts a 205K-char description; the old 10237-char cap is gone).
 //   4. Tool name handling: Go shortenToolName() collapses mcp__server__tool to
 //      mcp__tool (else hard 64-cut); Claude path camelCases via sanitizeToolName()
 //      and keeps a reverse map to RESTORE the original name on responses; blank
@@ -207,13 +208,14 @@ test("convertTools normalizes a blank description to 'Tool: <name>' (bug 2)", ()
   assert.equal(out[0].toolSpecification.description, "Tool: get_weather");
 });
 
-test("convertTools truncates an over-long description to 10237 + '...' (bug 3)", () => {
+// Symptom guarded: long tool descriptions were clipped to 10237 chars + "...",
+// so the model never saw the end of the tool's contract.
+test("convertTools and convertClaudeTools keep an over-long description verbatim (bug 3)", () => {
   const long = "x".repeat(20000);
   const out = W.convertTools([{ function: { name: "a", description: long, parameters: { type: "object" } } }]);
-  const desc = out[0].toolSpecification.description;
-  assert.equal(desc.length, 10237 + 3, "must be truncated to 10237 then '...' appended");
-  assert.ok(desc.endsWith("..."));
-  assert.equal(desc.slice(0, 10237), "x".repeat(10237));
+  assert.equal(out[0].toolSpecification.description, long);
+  const claude = W.convertClaudeTools([{ name: "a", description: long, input_schema: { type: "object" } }]);
+  assert.equal(claude[0].toolSpecification.description, long);
 });
 
 test("convertTools skips a tool with a blank name (bug 4)", () => {
