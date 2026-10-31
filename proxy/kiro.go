@@ -370,7 +370,14 @@ type KiroHistoryMessage struct {
 }
 
 type KiroAssistantResponseMessage struct {
-	Content          string                `json:"content"`
+	Content string `json:"content"`
+	// MessageID mirrors the messageId the Kiro CLI stamps on assistant history
+	// turns that carry structured tool calls. It is derived deterministically
+	// from the turn's tool-use IDs (see deriveToolTurnMessageID) so a replayed
+	// history keeps a stable identity across requests — a value that churned
+	// every request would make the same history look different upstream on
+	// every turn.
+	MessageID        string                `json:"messageId,omitempty"`
 	ToolUses         []KiroToolUse         `json:"toolUses,omitempty"`
 	ReasoningContent *KiroReasoningContent `json:"reasoningContent,omitempty"`
 }

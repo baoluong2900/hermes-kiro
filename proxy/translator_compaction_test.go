@@ -5,13 +5,22 @@ import (
 	"testing"
 )
 
-// TestClaudeToKiroFlattensHistoryToolCyclesForCompaction reproduces the context
-// compaction scenario that triggered upstream HTTP 400 "Improperly formed
-// request": a long conversation whose history contains completed tool cycles
+// TestClaudeToKiroKeepsCompleteHistoryToolCycles covers the context compaction
+// scenario: a conversation whose history contains completed tool cycles
 // (assistant tool_use + user tool_result), followed by a plain-text instruction.
-// The generated payload must NOT carry any structured toolUses/toolResults in
-// history, since Kiro's upstream rejects those.
-func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
+//
+// An earlier version flattened every one of those pairs into "Tool results:"
+// prose, on the belief that Kiro rejects structured tool activity in history.
+// That belief is wrong — this exact payload was replayed against the live
+// upstream and answered HTTP 200 — and the flattening caused a real regression:
+// dozens of in-context examples of "tool activity is prose" taught the model to
+// answer with a narrative instead of emitting a real tool call, so the turn came
+// back END_TURN with no toolUseEvent and the client's agent loop halted.
+//
+// Complete pairs must therefore stay structured, in the shape the real Kiro CLI
+// sends: strict user/assistant alternation, tool-result turns carrying empty
+// content, and a messageId stamped on assistant turns that hold tool calls.
+func TestClaudeToKiroKeepsCompleteHistoryToolCycles(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -36,19 +45,40 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 
 	payload := ClaudeToKiro(req, false)
 
-	// No history entry may carry structured tool calls or tool results.
-	for i, h := range payload.ConversationState.History {
-		if h.AssistantResponseMessage != nil && len(h.AssistantResponseMessage.ToolUses) > 0 {
-			t.Fatalf("history[%d] still has structured toolUses; upstream rejects this", i)
-		}
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil {
-			if len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
-				t.Fatalf("history[%d] still has structured toolResults; upstream rejects this", i)
+	calls, results, stamped := 0, 0, 0
+	for _, h := range payload.ConversationState.History {
+		if a := h.AssistantResponseMessage; a != nil {
+			calls += len(a.ToolUses)
+			if len(a.ToolUses) > 0 && a.MessageID != "" {
+				stamped++
 			}
+		}
+		if u := h.UserInputMessage; u != nil && u.UserInputMessageContext != nil {
+			results += len(u.UserInputMessageContext.ToolResults)
+		}
+	}
+	if calls != 2 || results != 2 {
+		t.Fatalf("expected both tool pairs kept structured, got %d calls / %d results", calls, results)
+	}
+	if stamped != 2 {
+		t.Fatalf("assistant turns carrying tool calls must be stamped with a messageId, got %d of 2", stamped)
+	}
+
+	assertStrictAlternation(t, payload)
+
+	// A turn that answers tool calls carries empty content upstream — never a
+	// "." placeholder or narration.
+	for i, h := range payload.ConversationState.History {
+		u := h.UserInputMessage
+		if u == nil || u.UserInputMessageContext == nil || len(u.UserInputMessageContext.ToolResults) == 0 {
+			continue
+		}
+		if strings.TrimSpace(u.Content) != "" {
+			t.Fatalf("history[%d] answers tool calls but carries content %q", i, u.Content)
 		}
 	}
 
-	// Current message is plain text, so it must not carry structured tool results.
+	// The compaction instruction is the current message and carries no results.
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
 		t.Fatalf("current message should not carry structured toolResults for a plain instruction")
@@ -57,77 +87,56 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 		t.Fatalf("expected current content to be the compaction instruction, got %q", cur.Content)
 	}
 
-	// The narrated tool activity should survive somewhere in history as text.
-	var historyText strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.AssistantResponseMessage != nil {
-			historyText.WriteString(h.AssistantResponseMessage.Content)
-			historyText.WriteString("\n")
+	// Tool output must survive exactly once, structurally.
+	for _, marker := range []string{"build ok", "tests pass"} {
+		if got := countToolOutput(payload, marker); got != 1 {
+			t.Fatalf("tool output %q should appear exactly once, got %d", marker, got)
 		}
-		if h.UserInputMessage != nil {
-			historyText.WriteString(h.UserInputMessage.Content)
-			historyText.WriteString("\n")
-		}
-	}
-	combined := historyText.String()
-	if !strings.Contains(combined, "exec_command") {
-		t.Fatalf("expected narrated tool calls to mention exec_command, got:\n%s", combined)
-	}
-	if !strings.Contains(combined, "tests pass") {
-		t.Fatalf("expected narrated tool results to retain output, got:\n%s", combined)
 	}
 
-	// Regression guard: assistant turns must NOT contain tool-invocation-looking
-	// text. Such text trains the model to emit it instead of real tool calls.
+	// Regression guard: assistant turns must never contain tool-invocation prose.
 	for i, h := range payload.ConversationState.History {
-		if a := h.AssistantResponseMessage; a != nil {
-			if strings.Contains(a.Content, "[Called tool") {
-				t.Fatalf("history[%d] assistant content contains mimicable tool-invocation text: %q", i, a.Content)
+		a := h.AssistantResponseMessage
+		if a == nil {
+			continue
+		}
+		for _, bad := range []string{"[Called tool", "with input {"} {
+			if strings.Contains(a.Content, bad) {
+				t.Fatalf("history[%d] assistant content contains mimicable tool text %q", i, bad)
 			}
 		}
 	}
-	// Tool identity must be attributed on the user (result) side, never authored
-	// by the assistant.
-	if !strings.Contains(combined, "[exec_command]") {
-		t.Fatalf("expected tool results to be attributed to exec_command on the user side, got:\n%s", combined)
-	}
 }
 
-// TestClaudeToKiroKeepsActiveToolTurnStructured verifies the in-progress tool
-// case still works: the last assistant turn issues a tool_use and the final user
-// message delivers the matching tool_result. That single active turn must remain
-// structured (last history assistant keeps toolUses, current keeps toolResults).
-func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
+// TestClaudeToKiroFlattensBrokenToolPairs covers the other half of the rule:
+// a tool result whose originating call is gone (client-side compaction dropped
+// it) cannot stay structured — the upstream answers 400 "unexpected tool_use_id
+// found in tool_result blocks" — so it is narrated on the user side instead.
+func TestClaudeToKiroFlattensBrokenToolPairs(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
-		Tools: []ClaudeTool{{Name: "exec_command", Description: "run", InputSchema: map[string]interface{}{"type": "object"}}},
 		Messages: []ClaudeMessage{
-			{Role: "user", Content: "run ls"},
-			{Role: "assistant", Content: []interface{}{
-				map[string]interface{}{"type": "tool_use", "id": "t9", "name": "exec_command", "input": map[string]interface{}{"cmd": "ls"}},
-			}},
+			{Role: "user", Content: "start"},
+			{Role: "assistant", Content: "working on it"},
+			// Result with no preceding call anywhere in history.
 			{Role: "user", Content: []interface{}{
-				map[string]interface{}{"type": "tool_result", "tool_use_id": "t9", "content": "file1 file2"},
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "orphan", "content": "ORPHAN_OUTPUT"},
 			}},
+			{Role: "user", Content: "what happened?"},
 		},
 	}
 
 	payload := ClaudeToKiro(req, false)
 
-	hist := payload.ConversationState.History
-	if len(hist) == 0 {
-		t.Fatalf("expected non-empty history")
+	for i, h := range payload.ConversationState.History {
+		if u := h.UserInputMessage; u != nil && u.UserInputMessageContext != nil {
+			if len(u.UserInputMessageContext.ToolResults) > 0 {
+				t.Fatalf("history[%d] kept an orphaned tool result structured", i)
+			}
+		}
 	}
-	last := hist[len(hist)-1].AssistantResponseMessage
-	if last == nil || len(last.ToolUses) != 1 || last.ToolUses[0].ToolUseID != "t9" {
-		t.Fatalf("expected last history assistant to keep the active structured tool use t9")
-	}
-
-	cur := payload.ConversationState.CurrentMessage.UserInputMessage
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected current message to keep the matching structured tool result")
-	}
-	if cur.UserInputMessageContext.ToolResults[0].ToolUseID != "t9" {
-		t.Fatalf("expected current tool result to answer t9, got %q", cur.UserInputMessageContext.ToolResults[0].ToolUseID)
+	// The output itself must not be lost — it is the only copy left.
+	if countToolOutput(payload, "ORPHAN_OUTPUT") == 0 {
+		t.Fatalf("orphaned tool output was dropped instead of narrated")
 	}
 }

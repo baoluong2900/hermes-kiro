@@ -40,30 +40,32 @@ func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 				t.Fatalf("history[%d] assistant content contains mimicable tool text %q: %q", i, bad, a.Content)
 			}
 		}
-		// No assistant turn may carry structured tool calls (rejected upstream).
-		if len(a.ToolUses) > 0 {
-			t.Fatalf("history[%d] assistant retains %d structured toolUses", i, len(a.ToolUses))
-		}
+		// Structured tool calls are expected here and are NOT scrubbed: a
+		// complete call/result pair is exactly what the real client replays,
+		// and verifying it against live Kiro returns 200. Only the mimicable
+		// prose above is forbidden.
 	}
 
 	// Tool outputs must still be preserved (on the user side) for context.
-	var allText strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			allText.WriteString(h.UserInputMessage.Content)
-			allText.WriteString("\n")
-		}
-	}
-	combined := allText.String()
 	for i := 0; i < 8; i++ {
 		marker := fmt.Sprintf("OUTPUT_%d", i)
-		if !strings.Contains(combined, marker) {
+		if countToolOutput(payload, marker) != 1 {
 			t.Fatalf("tool output %q lost from history", marker)
 		}
 	}
-	// Tool identity should be attributed on the user side.
-	if !strings.Contains(combined, "[exec_command]") {
-		t.Fatalf("expected tool results attributed to exec_command on the user side")
+	// Tool identity survives structurally, on the call itself.
+	named := 0
+	for _, h := range payload.ConversationState.History {
+		if a := h.AssistantResponseMessage; a != nil {
+			for _, tu := range a.ToolUses {
+				if tu.Name == "exec_command" {
+					named++
+				}
+			}
+		}
+	}
+	if named != 8 {
+		t.Fatalf("expected 8 structured exec_command calls preserved, got %d", named)
 	}
 }
 
@@ -74,11 +76,15 @@ func newPollToolCall(id, name, args string) ToolCall {
 	return tc
 }
 
-// TestCollapsesConsecutiveIdenticalToolResults covers a client retry loop that
-// sends the same failing tool result many times. After hollow assistant turns
-// are dropped, those identical user "Tool results" turns become adjacent
-// duplicates; the proxy collapses each run to a single copy.
-func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
+// TestRetryLoopKeepsEveryToolPairStructured covers a client retry loop that
+// sends the same failing tool result many times.
+//
+// An earlier version flattened those pairs into "Tool results:" prose, which
+// made the repeated turns collapse into adjacent duplicates that then had to be
+// de-duplicated. Keeping the pairs structured removes that whole failure mode:
+// each retry stays its own call/result pair, exactly as the client sent it, and
+// history still alternates strictly user/assistant.
+func TestRetryLoopKeepsEveryToolPairStructured(t *testing.T) {
 	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
 	// 5 identical failing cycles in a row (model retrying the same tool).
 	for i := 0; i < 5; i++ {
@@ -93,14 +99,44 @@ func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
 
-	count := 0
+	calls, results := 0, 0
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "SAME_ERROR_OUTPUT") {
-			count++
+		if a := h.AssistantResponseMessage; a != nil {
+			calls += len(a.ToolUses)
+		}
+		if u := h.UserInputMessage; u != nil && u.UserInputMessageContext != nil {
+			results += len(u.UserInputMessageContext.ToolResults)
 		}
 	}
-	if count != 1 {
-		t.Fatalf("expected 5 identical tool-result turns collapsed to 1, got %d", count)
+	if calls != 5 || results != 5 {
+		t.Fatalf("expected 5 structured call/result pairs, got %d calls / %d results", calls, results)
+	}
+	if countToolOutput(payload, "SAME_ERROR_OUTPUT") != 5 {
+		t.Fatalf("every retry's output must survive exactly once, got %d", countToolOutput(payload, "SAME_ERROR_OUTPUT"))
+	}
+	assertStrictAlternation(t, payload)
+}
+
+// assertStrictAlternation checks the shape the real Kiro CLI sends: history
+// starts with a user turn and alternates user/assistant with no gaps. A gap
+// breaks the "results follow their call" adjacency the upstream relies on.
+func assertStrictAlternation(t *testing.T, payload *KiroPayload) {
+	t.Helper()
+	history := payload.ConversationState.History
+	for i, h := range history {
+		wantUser := i%2 == 0
+		isUser := h.UserInputMessage != nil
+		if isUser != wantUser {
+			roles := make([]string, len(history))
+			for j, e := range history {
+				if e.UserInputMessage != nil {
+					roles[j] = "user"
+				} else {
+					roles[j] = "assistant"
+				}
+			}
+			t.Fatalf("history must alternate user/assistant starting with user, got %v", roles)
+		}
 	}
 }
 
