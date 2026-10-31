@@ -296,7 +296,11 @@ func swapKiroEndpointsForTest(t *testing.T, server *httptest.Server) func() {
 		Name:   "test",
 	}}
 	oldClient := kiroHttpStore.Load()
-	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	// A one-second ceiling made these tests fail under load (a concurrent
+	// `go test -race` on the same machine is enough) even though the upstream
+	// is a local httptest server. The timeout exists to stop a hung test, not
+	// to assert latency, so give it room.
+	kiroHttpStore.Store(&http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{}})
 	return func() {
 		kiroEndpoints = oldEndpoints
 		kiroHttpStore.Store(oldClient)

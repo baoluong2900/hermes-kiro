@@ -437,6 +437,14 @@ type KiroStreamCallback struct {
 	// thinking block's signature so verifying clients accept it, and to echo
 	// the text/signature pair back on the next turn.
 	OnSignature func(signature string)
+	// OnStopReason is invoked when the upstream emits its terminal
+	// metadataEvent carrying the authoritative stopReason (e.g. "END_TURN",
+	// "MAX_TOKENS", "TOOL_USE"). Kiro DOES report why generation stopped, so
+	// consumers must prefer this over inferring the reason: a server-side
+	// max-tokens truncation closes the stream cleanly, and only this value
+	// distinguishes it from a complete answer. The raw token is forwarded
+	// verbatim; mapping to the client vocabulary happens downstream.
+	OnStopReason func(reason string)
 	// OnRedactedReasoning is invoked when the upstream emits an opaque,
 	// encrypted reasoning payload (redactedContent) instead of plaintext
 	// thinking — as GPT models do. Mirrors Anthropic's redacted_thinking block.
@@ -1116,6 +1124,16 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				if callback.OnContextUsage != nil {
 					callback.OnContextUsage(pct)
+				}
+			}
+		case "metadataEvent":
+			// The terminal metadataEvent carries the authoritative stop reason.
+			// Without it a response truncated at the output-token cap is
+			// indistinguishable from a complete one: Kiro closes both streams
+			// cleanly, accounting events and all.
+			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(reason)
 				}
 			}
 		}

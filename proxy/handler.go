@@ -1623,6 +1623,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 		// in order. Each is emitted as its own redacted_thinking block: the block
 		// is the unit clients echo back verbatim, so blobs must not collapse.
 		var redactedReasoning []string
+		// upstreamStopReason is Kiro's authoritative reason from the terminal
+		// metadataEvent. streamCompletedNormally records whether the terminal
+		// accounting events arrived, which is the only truncation signal left
+		// when the upstream reason is absent.
+		var upstreamStopReason string
+		var streamCompletedNormally bool
 
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
@@ -1947,9 +1953,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			},
 			OnCredits: func(c float64) {
 				credits = c
+				streamCompletedNormally = true
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				streamCompletedNormally = true
+			},
+			OnStopReason: func(reason string) {
+				if reason != "" {
+					upstreamStopReason = reason
+				}
 			},
 			OnSignature: func(sig string) {
 				if sig == "" || normalizeStopHookJSON {
@@ -2115,10 +2128,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, raw
 			return
 		}
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
-		}
+		// Prefer Kiro's own stop reason. Inferring it reported a response
+		// truncated at the output-token cap as a clean end_turn, so the client
+		// believed a cut-off answer was complete.
+		stopReason := resolveClaudeStopReason(upstreamStopReason, len(toolUses),
+			outputContent != "" || thinkingOutput != "", streamCompletedNormally)
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -2502,6 +2516,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
+		var streamCompletedNormally bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2520,9 +2536,16 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 			},
 			OnCredits: func(c float64) {
 				credits = c
+				streamCompletedNormally = true
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				streamCompletedNormally = true
+			},
+			OnStopReason: func(reason string) {
+				if reason != "" {
+					upstreamStopReason = reason
+				}
 			},
 			OnSignature: func(sig string) {
 				// One reasoningContent slot per turn upstream: the last
@@ -2604,6 +2627,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, 
 		}
 
 		resp := KiroToClaudeResponseWithSignature(finalContent, responseThinkingContent, thinkingSignature, redactedReasoning, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		// The builder infers end_turn/tool_use; Kiro's own metadataEvent knows
+		// better — in particular it is the only thing that reports a response
+		// truncated at the output-token cap.
+		resp.StopReason = resolveClaudeStopReason(upstreamStopReason, len(toolUses),
+			finalContent != "" || rawThinkingContent != "", streamCompletedNormally)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2895,6 +2923,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		// the <think>/<thinking> formats fold reasoning into the answer text,
 		// which leaves nothing for a signature to sign.
 		var thinkingSignature string
+		var upstreamStopReason string
+		var streamCompletedNormally bool
 		responseStarted := false
 
 		sendChunk := func(content string, thinkingState int) {
@@ -3157,9 +3187,16 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnCredits: func(c float64) {
 				credits = c
+				streamCompletedNormally = true
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				streamCompletedNormally = true
+			},
+			OnStopReason: func(reason string) {
+				if reason != "" {
+					upstreamStopReason = reason
+				}
 			},
 			OnSignature: func(sig string) {
 				if sig != "" {
@@ -3266,10 +3303,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.sticky.Remember(payload.ConversationState.ConversationID, account.ID)
 		h.promptCache.Update(account.ID, cacheProfile)
 
-		finishReason := "stop"
-		if len(toolCalls) > 0 {
-			finishReason = "tool_calls"
-		}
+		// Kiro's metadataEvent is authoritative; inference cannot tell a
+		// response truncated at the output-token cap from a complete one.
+		finishReason := resolveOpenAIFinishReason(upstreamStopReason, len(toolCalls),
+			outputContent != "" || reasoningOutput != "", streamCompletedNormally)
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -3337,6 +3374,8 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
+		var streamCompletedNormally bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -3348,13 +3387,19 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:  func(c float64) { credits = c },
+			OnCredits:  func(c float64) { credits = c; streamCompletedNormally = true },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				streamCompletedNormally = true
 			},
 			OnSignature: func(sig string) {
 				if sig != "" {
 					reasoningSignature = sig
+				}
+			},
+			OnStopReason: func(reason string) {
+				if reason != "" {
+					upstreamStopReason = reason
 				}
 			},
 		}
@@ -3394,6 +3439,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			reasoningSignature = ""
 		}
 		resp := KiroToOpenAIResponseWithReasoningSignature(finalContent, reasoningContent, reasoningSignature, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		// Override the builder's inferred finish_reason with Kiro's own.
+		if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+			choices[0]["finish_reason"] = resolveOpenAIFinishReason(upstreamStopReason, len(toolUses),
+				finalContent != "" || reasoningContent != "", streamCompletedNormally)
+		}
 		resp["usage"] = openAIUsageMap(inputTokens, outputTokens, cacheUsage)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)

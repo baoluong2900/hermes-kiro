@@ -819,10 +819,20 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 					resultContent = toolResultImagePlaceholder
 				}
 			}
+			// Kiro carries the tool outcome in `status` ("success" / "error"),
+			// exactly like the Kiro CLI does. Anthropic clients signal failure
+			// with is_error on the tool_result block; map it through so the
+			// model can distinguish a failed call from a successful one without
+			// parsing prose. Hardcoding "success" reported every failed tool as
+			// having worked.
+			status := "success"
+			if isErr, ok := block["is_error"].(bool); ok && isErr {
+				status = "error"
+			}
 			toolResults = append(toolResults, KiroToolResult{
 				ToolUseID: normalizeToolUseID(toolUseID),
 				Content:   []KiroResultContent{{Text: resultContent}},
-				Status:    "success",
+				Status:    status,
 			})
 		}
 	}
@@ -986,7 +996,11 @@ func selectKiroReasoningContent(blocks []claudeReasoningBlock) *KiroReasoningCon
 		logger.Debugf("[Thinking] assistant turn carried %d reasoning blocks; upstream has one reasoningContent slot, keeping the last verifiable block verbatim", len(blocks))
 	}
 	if chosen.Redacted != "" && chosen.Text == "" && chosen.Signature == "" {
-		return &KiroReasoningContent{RedactedContent: chosen.Redacted}
+		// The blob may be one of our own /v1/responses envelopes carrying a
+		// signed text/signature pair. Decoding it restores the pair the
+		// upstream verifies; forwarding it as an opaque redactedContent would
+		// throw the signature away on a cross-protocol replay.
+		return kiroReasoningFromOpaque(chosen.Redacted)
 	}
 	return &KiroReasoningContent{
 		ReasoningText: &KiroReasoningText{
